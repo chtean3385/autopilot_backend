@@ -96,7 +96,7 @@ router.post('/:id/sync-status', async (req, res) => {
 router.post('/sync-all', async (req, res) => {
   try {
     const tplResult = await pool.query(
-      `SELECT * FROM waba_templates WHERE status != 'draft' ORDER BY id`
+      `SELECT * FROM waba_templates ORDER BY id`
     );
     const templates = tplResult.rows;
     const results = [];
