@@ -38,7 +38,7 @@ async function parseInstruction(instruction) {
       messages: [
         {
           role: 'system',
-          content: 'Extract the target city and number of leads from the instruction. Reply with JSON only: {"city": "CityName", "count": 20}. Default count to 20 if not mentioned.'
+          content: 'Extract the target city and number of leads from the instruction. Reply with JSON only: {"city": "CityName", "count": 20}. Use the exact number mentioned by the user — do NOT default to 20 if a number is given.'
         },
         { role: 'user', content: instruction }
       ],
@@ -56,18 +56,54 @@ async function parseInstruction(instruction) {
   }
 }
 
-// Scrape hotels from Google Places
+// Normalize raw phone digits → 12-digit WhatsApp-ready Indian mobile (91XXXXXXXXXX)
+// Returns null if it's a landline or invalid number
+function normalizeMobileNumber(rawPhone) {
+  const digits = rawPhone.replace(/\D/g, '');
+
+  if (digits.length === 12 && digits.startsWith('91')) {
+    const mobile = digits.slice(2);
+    // Indian mobile: starts with 6/7/8/9, exactly 10 digits
+    if (/^[6-9]\d{9}$/.test(mobile)) return digits;
+    return null; // landline or invalid
+  }
+
+  if (digits.length === 10 && /^[6-9]\d{9}$/.test(digits)) {
+    return '91' + digits; // add country code
+  }
+
+  return null; // not a valid Indian mobile
+}
+
+// Scrape hotels from Google Places — paginates to reach requested count
 async function scrapeLeads(city, count) {
   const googleKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!googleKey) throw new Error('GOOGLE_PLACES_API_KEY not set');
 
-  const textQuery = `hotels in ${city}`;
-  const searchResp = await axios.get(
-    'https://maps.googleapis.com/maps/api/place/textsearch/json',
-    { params: { query: textQuery, key: googleKey, language: 'en', region: 'in' } }
-  );
+  const allResults = [];
+  let pageToken = null;
 
-  const rawResults = (searchResp.data.results || []).slice(0, count);
+  // Google Places Text Search returns 20/page max — paginate to reach count
+  do {
+    const params = { query: `hotels in ${city}`, key: googleKey, language: 'en', region: 'in' };
+    if (pageToken) params.pagetoken = pageToken;
+
+    const searchResp = await axios.get(
+      'https://maps.googleapis.com/maps/api/place/textsearch/json',
+      { params }
+    );
+
+    const results = searchResp.data.results || [];
+    allResults.push(...results);
+    pageToken = searchResp.data.next_page_token || null;
+
+    // Google requires a 2s delay before next_page_token becomes valid
+    if (pageToken && allResults.length < count) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  } while (pageToken && allResults.length < count);
+
+  const rawResults = allResults.slice(0, count);
 
   const detailed = await Promise.allSettled(
     rawResults.map(r =>
@@ -91,25 +127,35 @@ async function scrapeLeads(city, count) {
     return fallback || '';
   };
 
-  return rawResults.map((r, i) => {
+  const leads = [];
+  for (let i = 0; i < rawResults.length; i++) {
+    const r = rawResults[i];
     const detail = detailed[i].status === 'fulfilled' ? detailed[i].value.data.result : {};
-    const phone = detail.international_phone_number || detail.formatted_phone_number || '';
-    return {
+    const rawPhone = detail.international_phone_number || detail.formatted_phone_number || '';
+    const mobile = normalizeMobileNumber(rawPhone);
+
+    if (!mobile) {
+      console.log(`[Scraper] Skipping "${r.name}" — not a mobile number: ${rawPhone}`);
+      continue;
+    }
+
+    leads.push({
       hotel_name: r.name || '',
       owner_name: r.name || '',
       email: detail.website || '',
-      whatsapp_number: phone.replace(/\D/g, ''),
-      phone,
+      whatsapp_number: mobile,
+      phone: rawPhone,
       city: extractCity(r.formatted_address, city),
-      address: r.formatted_address || '',
       source: 'agent',
-    };
-  }).filter(p => p.whatsapp_number);
+    });
+  }
+
+  return leads;
 }
 
-// Save leads, skip duplicates by whatsapp_number
+// Save leads, skip duplicates. Returns array of saved lead IDs.
 async function saveLeads(leads) {
-  let saved = 0;
+  const savedIds = [];
   for (const lead of leads) {
     try {
       const existing = await pool.query(
@@ -118,15 +164,39 @@ async function saveLeads(leads) {
       );
       if (existing.rows.length > 0) continue;
 
-      await pool.query(
+      const result = await pool.query(
         `INSERT INTO hotel_leads (hotel_name, owner_name, email, whatsapp_number, city, phone, source, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'new')`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'new') RETURNING id`,
         [lead.hotel_name, lead.owner_name, lead.email, lead.whatsapp_number, lead.city, lead.phone, lead.source]
       );
-      saved++;
+      if (result.rows[0]) savedIds.push(result.rows[0].id);
     } catch { /* skip on error */ }
   }
-  return saved;
+  return savedIds;
+}
+
+// Upsert a city group and add the given lead IDs into it
+async function upsertCityGroup(city, leadIds) {
+  if (!leadIds.length) return null;
+
+  const groupResult = await pool.query(
+    `INSERT INTO lead_groups (name, description)
+     VALUES ($1, $2)
+     ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+     RETURNING id`,
+    [city, `Hotels in ${city}`]
+  );
+  const groupId = groupResult.rows[0].id;
+
+  for (const leadId of leadIds) {
+    await pool.query(
+      `INSERT INTO lead_group_members (group_id, lead_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [groupId, leadId]
+    );
+  }
+
+  console.log(`[Scheduler] City group "${city}" (id=${groupId}) — added ${leadIds.length} leads`);
+  return groupId;
 }
 
 // Run a single agent task end-to-end
@@ -143,7 +213,8 @@ async function runTask(task) {
 
     // 1. Parse city + count from instruction
     const { city, count } = await parseInstruction(task.instruction);
-    const leadCount = task.lead_count || count || 20;
+    // task.lead_count is set from the UI input; count is parsed from the instruction text
+    const leadCount = task.lead_count || count || 50;
 
     console.log(`[Scheduler] Parsed → city="${city}", count=${leadCount}`);
 
@@ -151,9 +222,13 @@ async function runTask(task) {
     const scraped = await scrapeLeads(city, leadCount);
     console.log(`[Scheduler] Scraped ${scraped.length} leads for ${city}`);
 
-    // 3. Save new leads (deduplicated)
-    const saved = await saveLeads(scraped);
+    // 3. Save new leads (deduplicated) — returns saved lead IDs
+    const savedIds = await saveLeads(scraped);
+    const saved = savedIds.length;
     console.log(`[Scheduler] Saved ${saved} new leads`);
+
+    // 3b. Auto-create/update city group and add all saved leads into it
+    await upsertCityGroup(city, savedIds);
 
     // 4. Get approved template
     let template = null;

@@ -36,7 +36,7 @@ router.post('/tasks', async (req, res) => {
     const result = await pool.query(
       `INSERT INTO agent_tasks (instruction, city, lead_count, template_id, status, run_at)
        VALUES ($1, $2, $3, $4, 'pending', $5) RETURNING *`,
-      [instruction.trim(), parsed.city || null, lead_count || parsed.count || 20, template_id || null, runAt]
+      [instruction.trim(), parsed.city || null, lead_count || parsed.count || 50, template_id || null, runAt]
     );
 
     const task = result.rows[0];
