@@ -104,6 +104,29 @@ router.post('/whatsapp', async (req, res) => {
             }
 
             const leadId = leadResult.rows[0].id;
+
+            // Opt-out detection — mark and never contact again
+            const isOptOut = /\bstop\b|not\s+interested|opt.?out|unsubscribe|no\s+thanks|don't\s+contact|do\s+not\s+contact|remove\s+me|hatao|band\s+karo|nahi\s+chahiye/i.test(msgText);
+            if (isOptOut) {
+              await pool.query(
+                `UPDATE hotel_leads SET status='opted_out', updated_at=NOW() WHERE id=$1`,
+                [leadId]
+              );
+              await pool.query(
+                `UPDATE outreach_logs
+                 SET response_received=true, response_text=$1, response_received_at=NOW(), lead_status_after='opted_out'
+                 WHERE id=(SELECT id FROM outreach_logs WHERE lead_id=$2 ORDER BY sent_at DESC LIMIT 1)`,
+                [msgText, leadId]
+              );
+              // Send opt-out confirmation
+              const WABAService = require('../services/wabaService');
+              await WABAService.sendTextMessage(fromPhone,
+                'You have been unsubscribed. We will not contact you again. Thank you.'
+              ).catch(() => {});
+              console.log(`[Webhook] Lead ${leadId} → opted_out`);
+              continue;
+            }
+
             const isDemo = /\bDEMO\b|interested|yes|want|need|sure/i.test(msgText);
             const newLeadStatus = isDemo ? 'demo_qualified' : 'responded';
 

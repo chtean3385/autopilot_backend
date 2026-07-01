@@ -29,16 +29,16 @@ pool.query(`
 `).then(() => console.log('[Scheduler] agent_tasks table ready'))
   .catch(err => console.error('[Scheduler] Table init error:', err.message));
 
-// Parse natural language instruction → { city, count }
+// Parse natural language instruction → { city, count, businessType }
 async function parseInstruction(instruction) {
   try {
     const res = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 100,
+      max_tokens: 150,
       messages: [
         {
           role: 'system',
-          content: 'Extract the target city and number of leads from the instruction. Reply with JSON only: {"city": "CityName", "count": 20}. Use the exact number mentioned by the user — do NOT default to 20 if a number is given.'
+          content: 'Extract the business type, target city, and number of leads from the instruction. Reply with JSON only: {"businessType": "restaurants", "city": "CityName", "count": 20}. Use the exact number mentioned — do NOT default to 20 if a number is given. businessType should be the plural category of business (e.g. "hotels", "restaurants", "gyms", "salons", "pharmacies"). If not clear, use "businesses".'
         },
         { role: 'user', content: instruction }
       ],
@@ -52,7 +52,7 @@ async function parseInstruction(instruction) {
     const words = instruction.split(/\s+/);
     const inIdx = words.findIndex(w => w.toLowerCase() === 'in');
     const city = inIdx !== -1 ? words[inIdx + 1]?.replace(/[^a-zA-Z]/g, '') : 'Delhi';
-    return { city, count };
+    return { city, count, businessType: 'businesses' };
   }
 }
 
@@ -104,7 +104,6 @@ function normalizeMobileNumber(rawPhone) {
   // 11 digits with leading 0 (local STD format like 07912345678) — likely landline
   if (digits.length === 11 && digits.startsWith('0')) {
     const withoutZero = digits.slice(1);
-    // Only accept if the 10-digit part looks like a mobile (starts 6-9, not an STD code pattern)
     if (/^[6-9]\d{9}$/.test(withoutZero)) return '91' + withoutZero;
     return null;
   }
@@ -112,17 +111,20 @@ function normalizeMobileNumber(rawPhone) {
   return null;
 }
 
-// Scrape hotels from Google Places — paginates to reach requested count
-async function scrapeLeads(city, count) {
+// Scrape any business type from Google Places — paginates to reach requested count
+async function scrapeLeads(city, count, businessType = 'businesses') {
   const googleKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!googleKey) throw new Error('GOOGLE_PLACES_API_KEY not set');
+
+  const searchQuery = `${businessType} in ${city}`;
+  console.log(`[Scraper] Searching: "${searchQuery}"`);
 
   const allResults = [];
   let pageToken = null;
 
   // Google Places Text Search returns 20/page max — paginate to reach count
   do {
-    const params = { query: `hotels in ${city}`, key: googleKey, language: 'en', region: 'in' };
+    const params = { query: searchQuery, key: googleKey, language: 'en', region: 'in' };
     if (pageToken) params.pagetoken = pageToken;
 
     const searchResp = await axios.get(
@@ -183,6 +185,7 @@ async function scrapeLeads(city, count) {
       whatsapp_number: mobile,
       phone: rawPhone,
       city: extractCity(r.formatted_address, city),
+      business_category: businessType,
       source: 'agent',
     });
   }
@@ -190,38 +193,51 @@ async function scrapeLeads(city, count) {
   return leads;
 }
 
-// Save leads, skip duplicates. Returns array of saved lead IDs.
+// Save leads, skip duplicates by whatsapp_number or (business_name + city).
+// Returns array of saved lead IDs.
 async function saveLeads(leads) {
   const savedIds = [];
   for (const lead of leads) {
     try {
+      // Check duplicate by number OR by name+city combo
       const existing = await pool.query(
-        'SELECT id FROM hotel_leads WHERE whatsapp_number = $1 OR (hotel_name ILIKE $2 AND city ILIKE $3)',
+        `SELECT id FROM hotel_leads
+         WHERE whatsapp_number = $1
+            OR (LOWER(hotel_name) = LOWER($2) AND LOWER(city) = LOWER($3))`,
         [lead.whatsapp_number, lead.hotel_name, lead.city]
       );
-      if (existing.rows.length > 0) continue;
+      if (existing.rows.length > 0) {
+        console.log(`[Scraper] Duplicate skipped: "${lead.hotel_name}" (${lead.whatsapp_number})`);
+        continue;
+      }
 
       const result = await pool.query(
-        `INSERT INTO hotel_leads (hotel_name, owner_name, email, whatsapp_number, city, phone, source, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'new') RETURNING id`,
-        [lead.hotel_name, lead.owner_name, lead.email, lead.whatsapp_number, lead.city, lead.phone, lead.source]
+        `INSERT INTO hotel_leads
+           (hotel_name, owner_name, email, whatsapp_number, city, phone, source, business_category, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'new')
+         RETURNING id`,
+        [lead.hotel_name, lead.owner_name, lead.email, lead.whatsapp_number,
+         lead.city, lead.phone, lead.source, lead.business_category || null]
       );
       if (result.rows[0]) savedIds.push(result.rows[0].id);
-    } catch { /* skip on error */ }
+    } catch (err) {
+      console.error(`[Scraper] saveLeads error for "${lead.hotel_name}":`, err.message);
+    }
   }
   return savedIds;
 }
 
 // Upsert a city group and add the given lead IDs into it
-async function upsertCityGroup(city, leadIds) {
+async function upsertCityGroup(city, businessType, leadIds) {
   if (!leadIds.length) return null;
 
+  const groupName = `${businessType} in ${city}`;
   const groupResult = await pool.query(
     `INSERT INTO lead_groups (name, description)
      VALUES ($1, $2)
      ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
      RETURNING id`,
-    [city, `Hotels in ${city}`]
+    [groupName, `${businessType} scraped from ${city}`]
   );
   const groupId = groupResult.rows[0].id;
 
@@ -232,8 +248,23 @@ async function upsertCityGroup(city, leadIds) {
     );
   }
 
-  console.log(`[Scheduler] City group "${city}" (id=${groupId}) — added ${leadIds.length} leads`);
+  console.log(`[Scheduler] Group "${groupName}" (id=${groupId}) — added ${leadIds.length} leads`);
   return groupId;
+}
+
+// Get the best available approved template (task-specific or latest approved)
+async function getApprovedTemplate(templateId) {
+  if (templateId) {
+    const t = await pool.query(
+      `SELECT * FROM waba_templates WHERE id=$1 AND status='approved'`,
+      [templateId]
+    );
+    if (t.rows[0]) return t.rows[0];
+  }
+  const t = await pool.query(
+    `SELECT * FROM waba_templates WHERE status='approved' ORDER BY created_at DESC LIMIT 1`
+  );
+  return t.rows[0] || null;
 }
 
 // Run a single agent task end-to-end
@@ -248,35 +279,26 @@ async function runTask(task) {
   try {
     console.log(`[Scheduler] Task ${taskId}: "${task.instruction}"`);
 
-    // 1. Parse city + count from instruction
-    const { city, count } = await parseInstruction(task.instruction);
-    // task.lead_count is set from the UI input; count is parsed from the instruction text
+    // 1. Parse business type, city, count from instruction
+    const { city, count, businessType = 'businesses' } = await parseInstruction(task.instruction);
     const leadCount = task.lead_count || count || 50;
 
-    console.log(`[Scheduler] Parsed → city="${city}", count=${leadCount}`);
+    console.log(`[Scheduler] Parsed → businessType="${businessType}" city="${city}", count=${leadCount}`);
 
-    // 2. Scrape Google Places
-    const scraped = await scrapeLeads(city, leadCount);
-    console.log(`[Scheduler] Scraped ${scraped.length} leads for ${city}`);
+    // 2. Scrape Google Places for the given business type
+    const scraped = await scrapeLeads(city, leadCount, businessType);
+    console.log(`[Scheduler] Scraped ${scraped.length} leads for ${businessType} in ${city}`);
 
     // 3. Save new leads (deduplicated) — returns saved lead IDs
     const savedIds = await saveLeads(scraped);
     const saved = savedIds.length;
     console.log(`[Scheduler] Saved ${saved} new leads`);
 
-    // 3b. Auto-create/update city group and add all saved leads into it
-    await upsertCityGroup(city, savedIds);
+    // 3b. Auto-create/update business+city group
+    await upsertCityGroup(city, businessType, savedIds);
 
     // 4. Get approved template
-    let template = null;
-    if (task.template_id) {
-      const t = await pool.query('SELECT * FROM waba_templates WHERE id=$1 AND status=$2', [task.template_id, 'approved']);
-      template = t.rows[0] || null;
-    }
-    if (!template) {
-      const t = await pool.query("SELECT * FROM waba_templates WHERE status='approved' ORDER BY created_at DESC LIMIT 1");
-      template = t.rows[0] || null;
-    }
+    const template = await getApprovedTemplate(task.template_id);
 
     if (!template || saved === 0) {
       const reason = !template ? 'No approved template found' : 'No new leads to contact';
@@ -289,7 +311,7 @@ async function runTask(task) {
     }
 
     // 5. Create campaign
-    const campaignName = `Agent: ${city} – ${new Date().toLocaleDateString('en-IN')}`;
+    const campaignName = `Agent: ${businessType} in ${city} – ${new Date().toLocaleDateString('en-IN')}`;
     const campResult = await pool.query(
       `INSERT INTO campaigns (campaign_name, template_id, target_city, target_type, status, created_by)
        VALUES ($1, $2, $3, 'city', 'draft', 'agent') RETURNING *`,
@@ -297,10 +319,10 @@ async function runTask(task) {
     );
     const campaign = campResult.rows[0];
 
-    // 6. Launch — send to all new leads in this city
+    // 6. Send initial message to all newly saved leads only
     const leadsResult = await pool.query(
-      `SELECT * FROM hotel_leads WHERE LOWER(city) = LOWER($1) AND status = 'new'`,
-      [city]
+      `SELECT * FROM hotel_leads WHERE id = ANY($1::int[])`,
+      [savedIds]
     );
     const leads = leadsResult.rows;
 
@@ -336,6 +358,64 @@ async function runTask(task) {
   }
 }
 
+// Follow up with leads that haven't responded.
+// Runs daily: sends follow-up every 2 days, up to 5 follow-ups (10 days total).
+// After 5 follow-ups with no response → mark as 'dead'.
+async function runFollowUps() {
+  console.log('[FollowUp] Checking leads for follow-up...');
+
+  try {
+    // Leads that:
+    // - status = 'new' (no response yet, not opted out, not dead)
+    // - have at least 1 prior outreach
+    // - last outreach was >= 2 days ago
+    const result = await pool.query(`
+      SELECT hl.*,
+             COUNT(ol.id)::int      AS outreach_count,
+             MAX(ol.sent_at)        AS last_outreach
+      FROM hotel_leads hl
+      INNER JOIN outreach_logs ol ON ol.lead_id = hl.id
+      WHERE hl.status = 'new'
+        AND hl.whatsapp_number IS NOT NULL
+      GROUP BY hl.id
+      HAVING MAX(ol.sent_at) <= NOW() - INTERVAL '2 days'
+    `);
+
+    console.log(`[FollowUp] ${result.rows.length} lead(s) due for follow-up or expiry`);
+
+    const template = await getApprovedTemplate(null);
+
+    for (const lead of result.rows) {
+      const outreachCount = lead.outreach_count;
+
+      // 1 initial + 5 follow-ups = 6 total contacts over 10 days
+      if (outreachCount >= 6) {
+        await pool.query(
+          `UPDATE hotel_leads SET status='dead', updated_at=NOW() WHERE id=$1`,
+          [lead.id]
+        );
+        console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" → dead (${outreachCount} contacts, no response)`);
+        continue;
+      }
+
+      if (!template) {
+        console.warn('[FollowUp] No approved template — skipping follow-up sends');
+        break;
+      }
+
+      const wabaResult = await WABAService.sendPersonalizedTemplate(lead, template);
+      if (wabaResult.success) {
+        await LeadService.logOutreach(lead.id, null, template.id, wabaResult.messageId);
+        console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" — follow-up #${outreachCount} sent`);
+      } else {
+        console.warn(`[FollowUp] Lead ${lead.id} send failed: ${wabaResult.error}`);
+      }
+    }
+  } catch (err) {
+    console.error('[FollowUp] Error:', err.message);
+  }
+}
+
 // Check every minute for pending tasks that are due
 let running = false;
 
@@ -356,6 +436,11 @@ schedule.scheduleJob('* * * * *', async () => {
   }
 });
 
-console.log('🤖 Agent scheduler started — checks every minute for pending tasks');
+// Daily at 10:00 AM — follow up with non-responding leads
+schedule.scheduleJob('0 10 * * *', async () => {
+  await runFollowUps();
+});
 
-module.exports = { runTask, parseInstruction };
+console.log('🤖 Agent scheduler started — checks every minute for tasks, daily follow-ups at 10AM');
+
+module.exports = { runTask, parseInstruction, runFollowUps };
