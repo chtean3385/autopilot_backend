@@ -58,47 +58,64 @@ class WABAService {
 
   // template can be a string (template_name) or the full template object from DB
   static async sendPersonalizedTemplate(hotelLead, template) {
-    const templateName   = typeof template === 'string' ? template : template.template_name;
-    const localImageUrl  = typeof template === 'object' ? (template.header_image_url || null) : null;
-    const localBodyText  = typeof template === 'object' && template?.body_text ? template.body_text : '';
+    const templateName  = typeof template === 'string' ? template : template.template_name;
+    const localImageUrl = typeof template === 'object' ? (template.header_image_url || null) : null;
+    const localBodyText = typeof template === 'object' && template?.body_text ? template.body_text : '';
 
-    // Possible fill values in order: {{1}} owner_name, {{2}} hotel_name, {{3}} city, {{4}} demo_link
-    const fillValues = [
-      hotelLead.owner_name || hotelLead.hotel_name || '',
-      hotelLead.hotel_name || '',
-      hotelLead.city       || '',
-      process.env.DEMO_LINK || 'https://resort.dreamstechnology.in',
-    ];
+    // parameter_mapping: {"1": "owner_name", "2": "hotel_name", ...} — set by user when creating template
+    let paramMapping = {};
+    if (typeof template === 'object' && template.parameter_mapping) {
+      paramMapping = typeof template.parameter_mapping === 'string'
+        ? JSON.parse(template.parameter_mapping)
+        : template.parameter_mapping;
+    }
 
-    // Fetch actual template structure from Meta so we send exactly the right components
+    // Resolve a variable number (string "1","2",...) to the actual value for this lead
+    const resolveVar = (num) => {
+      const field = paramMapping[String(num)];
+      if (field === 'demo_link') return process.env.DEMO_LINK || 'https://resort.dreamstechnology.in';
+      if (field && hotelLead[field] !== undefined) return String(hotelLead[field] || '');
+      // No mapping — positional fallback so existing templates without mapping still work
+      const fallback = {
+        '1': hotelLead.owner_name || hotelLead.hotel_name || '',
+        '2': hotelLead.hotel_name || '',
+        '3': hotelLead.city || '',
+        '4': process.env.DEMO_LINK || 'https://resort.dreamstechnology.in',
+      };
+      return fallback[String(num)] || '';
+    };
+
+    // Fetch actual template structure from Meta — never guess what components exist
     const metaTemplate = await this.getTemplateDetails(templateName);
+    const language = metaTemplate?.language || 'en_US';
     const components = [];
 
     if (metaTemplate && metaTemplate.components) {
       for (const comp of metaTemplate.components) {
         if (comp.type === 'HEADER') {
           if (comp.format === 'IMAGE') {
-            // Use our stored image URL, or fall back to the example handle Meta has
+            // Prefer our stored URL (user-chosen), fall back to Meta's example handle
             const imgUrl = localImageUrl || comp.example?.header_handle?.[0];
             if (imgUrl) {
-              components.push({
-                type: 'header',
-                parameters: [{ type: 'image', image: { link: imgUrl } }]
-              });
+              components.push({ type: 'header', parameters: [{ type: 'image', image: { link: imgUrl } }] });
+            } else {
+              console.warn(`[WABA] Template "${templateName}" has IMAGE header but no image URL set. Set header_image_url in the template.`);
             }
           }
-          // TEXT / DOCUMENT / VIDEO headers without variables need no parameters component
+          // TEXT/VIDEO/DOCUMENT headers with no variables need no parameters entry
         } else if (comp.type === 'BODY') {
-          const varMatches = (comp.text || '').match(/\{\{\d+\}\}/g) || [];
-          const varCount = [...new Set(varMatches)].length;
-          if (varCount > 0) {
+          // Extract unique variable numbers in order they appear ({{1}}, {{2}}, ...)
+          const varNums = [...new Set((comp.text || '').match(/\{\{(\d+)\}\}/g) || [])]
+            .map(v => v.replace(/\D/g, ''))
+            .sort((a, b) => Number(a) - Number(b));
+          if (varNums.length > 0) {
             components.push({
               type: 'body',
-              parameters: fillValues.slice(0, varCount).map(v => ({ type: 'text', text: String(v) }))
+              parameters: varNums.map(num => ({ type: 'text', text: resolveVar(num) }))
             });
           }
         } else if (comp.type === 'BUTTONS') {
-          // Handle URL buttons with dynamic {{1}} variable
+          // Handle URL buttons that have a dynamic {{1}} suffix variable
           (comp.buttons || []).forEach((btn, idx) => {
             if (btn.type === 'URL' && btn.url && btn.url.includes('{{')) {
               components.push({
@@ -111,21 +128,22 @@ class WABAService {
           });
         }
       }
-      console.log(`[WABA] Built components from Meta template for "${templateName}":`, JSON.stringify(components));
+      console.log(`[WABA] Components for "${templateName}" (lang: ${language}):`, JSON.stringify(components));
     } else {
-      // Fallback: use local DB body text if Meta fetch fails
-      console.warn(`[WABA] Could not fetch Meta template "${templateName}", using local body text as fallback`);
-      const varMatches = localBodyText.match(/\{\{\d+\}\}/g) || [];
-      const varCount = [...new Set(varMatches)].length;
+      // Meta fetch failed — fall back to local DB body text so send still works
+      console.warn(`[WABA] Could not fetch "${templateName}" from Meta — using local DB body as fallback`);
+      const varNums = [...new Set((localBodyText.match(/\{\{(\d+)\}\}/g) || []))]
+        .map(v => v.replace(/\D/g, ''))
+        .sort((a, b) => Number(a) - Number(b));
       if (localImageUrl) {
         components.push({ type: 'header', parameters: [{ type: 'image', image: { link: localImageUrl } }] });
       }
-      if (varCount > 0) {
-        components.push({ type: 'body', parameters: fillValues.slice(0, varCount).map(v => ({ type: 'text', text: String(v) })) });
+      if (varNums.length > 0) {
+        components.push({ type: 'body', parameters: varNums.map(num => ({ type: 'text', text: resolveVar(num) })) });
       }
     }
 
-    return this.sendTemplateMessageWithComponents(hotelLead.whatsapp_number, templateName, components);
+    return this.sendTemplateMessageWithComponents(hotelLead.whatsapp_number, templateName, components, language);
   }
 
   // Submit a template to Meta for approval
@@ -236,7 +254,7 @@ class WABAService {
   }
 
   // Send a template with a pre-built components array (used by sendPersonalizedTemplate)
-  static async sendTemplateMessageWithComponents(recipientPhone, templateName, components) {
+  static async sendTemplateMessageWithComponents(recipientPhone, templateName, components, language = 'en_US') {
     try {
       const payload = {
         messaging_product: 'whatsapp',
@@ -245,7 +263,7 @@ class WABAService {
         type: 'template',
         template: {
           name: templateName,
-          language: { code: 'en_US' },
+          language: { code: language },
           components
         }
       };

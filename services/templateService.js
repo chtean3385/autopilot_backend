@@ -5,8 +5,8 @@ class TemplateService {
   static async createTemplate(templateData) {
     const query = `
       INSERT INTO waba_templates
-      (template_name, template_category, body_text, parameters, examples, footer_text, header_image_url, status, created_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', $8)
+      (template_name, template_category, body_text, parameters, examples, footer_text, header_image_url, parameter_mapping, status, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'draft', $9)
       RETURNING *;
     `;
     try {
@@ -18,6 +18,7 @@ class TemplateService {
         JSON.stringify(templateData.examples || []),
         templateData.footer_text || null,
         templateData.header_image_url || null,
+        JSON.stringify(templateData.parameter_mapping || {}),
         'admin'
       ]);
       return { success: true, data: result.rows[0] };
