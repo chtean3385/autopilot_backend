@@ -5,8 +5,24 @@ require('dotenv').config();
 const WABA_API_URL = `https://graph.facebook.com/${process.env.WABA_API_VERSION || 'v18.0'}`;
 
 class WABAService {
-  static async sendTemplateMessage(recipientPhone, templateName, parameters = []) {
+  static async sendTemplateMessage(recipientPhone, templateName, parameters = [], headerImageUrl = null) {
     try {
+      const components = [];
+
+      if (headerImageUrl) {
+        components.push({
+          type: 'header',
+          parameters: [{ type: 'image', image: { link: headerImageUrl } }]
+        });
+      }
+
+      if (parameters.length > 0) {
+        components.push({
+          type: 'body',
+          parameters: parameters.map(p => ({ type: 'text', text: String(p) }))
+        });
+      }
+
       const payload = {
         messaging_product: 'whatsapp',
         recipient_type: 'individual',
@@ -15,12 +31,7 @@ class WABAService {
         template: {
           name: templateName,
           language: { code: 'en_US' },
-          components: [
-            {
-              type: 'body',
-              parameters: parameters.map(p => ({ type: 'text', text: String(p) }))
-            }
-          ]
+          components
         }
       };
 
@@ -47,8 +58,9 @@ class WABAService {
 
   // template can be a string (template_name) or the full template object from DB
   static async sendPersonalizedTemplate(hotelLead, template) {
-    const templateName = typeof template === 'string' ? template : template.template_name;
-    const bodyText    = typeof template === 'object' && template?.body_text ? template.body_text : '';
+    const templateName   = typeof template === 'string' ? template : template.template_name;
+    const bodyText       = typeof template === 'object' && template?.body_text ? template.body_text : '';
+    const headerImageUrl = typeof template === 'object' ? (template.header_image_url || null) : null;
 
     // Count how many {{n}} variables are in the template body
     const varCount = (bodyText.match(/\{\{\d+\}\}/g) || []).length;
@@ -65,13 +77,22 @@ class WABAService {
       params.push(process.env.DEMO_LINK || 'https://resort.dreamstechnology.in');
     }
 
-    return this.sendTemplateMessage(hotelLead.whatsapp_number, templateName, params);
+    return this.sendTemplateMessage(hotelLead.whatsapp_number, templateName, params, headerImageUrl);
   }
 
   // Submit a template to Meta for approval
   static async submitTemplateToMeta(templateData) {
     try {
       const components = [];
+
+      // Header image component — if provided, include as IMAGE header
+      if (templateData.header_image_url) {
+        components.push({
+          type: 'HEADER',
+          format: 'IMAGE',
+          example: { header_handle: [templateData.header_image_url] }
+        });
+      }
 
       // Body component — detect {{n}} variables and add examples
       const bodyText = templateData.body_text;
