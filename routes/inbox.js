@@ -52,7 +52,12 @@ router.get('/thread/:leadId', async (req, res) => {
     const [leadRes, logsRes] = await Promise.all([
       pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId]),
       pool.query(`
-        SELECT ol.*, t.template_name, t.body_text, c.campaign_name
+        SELECT ol.id, ol.lead_id, ol.campaign_id, ol.template_id,
+               ol.message_type, ol.message_text,
+               ol.waba_message_id, ol.sent_at, ol.delivered_at, ol.read_at,
+               ol.response_received, ol.response_text, ol.response_received_at,
+               ol.qualified_for_demo, ol.lead_status_after,
+               t.template_name, t.body_text, c.campaign_name
         FROM outreach_logs ol
         LEFT JOIN waba_templates t ON t.id = ol.template_id
         LEFT JOIN campaigns c ON c.id = ol.campaign_id
@@ -64,24 +69,39 @@ router.get('/thread/:leadId', async (req, res) => {
     const lead = leadRes.rows[0];
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
 
-    // Build a flat chronological thread: each outreach_log = 1 outgoing msg + optionally 1 incoming
+    // Build flat chronological thread
     const messages = [];
     for (const log of logsRes.rows) {
-      // Show template name tag instead of raw body with {{1}} placeholders
-      const outText = log.template_name
-        ? `[Template: ${log.template_name}]`
-        : (log.body_text || '[Message sent]');
-      messages.push({
-        id: `out-${log.id}`,
-        direction: 'outgoing',
-        text: outText,
-        campaign: log.campaign_name,
-        template: log.template_name,
-        timestamp: log.sent_at,
-        delivered_at: log.delivered_at,
-        read_at: log.read_at,
-        wamid: log.waba_message_id,
-      });
+      if (log.message_type === 'reply' && log.message_text) {
+        // Agent or manual text reply we sent
+        messages.push({
+          id: `out-${log.id}`,
+          direction: 'outgoing',
+          text: log.message_text,
+          message_type: 'reply',
+          timestamp: log.sent_at,
+          wamid: log.waba_message_id,
+        });
+      } else {
+        // Template outreach message
+        const outText = log.template_name
+          ? `[${log.template_name}]`
+          : (log.message_text || '[Message sent]');
+        messages.push({
+          id: `out-${log.id}`,
+          direction: 'outgoing',
+          text: outText,
+          message_type: 'template',
+          campaign: log.campaign_name,
+          template: log.template_name,
+          timestamp: log.sent_at,
+          delivered_at: log.delivered_at,
+          read_at: log.read_at,
+          wamid: log.waba_message_id,
+        });
+      }
+
+      // Incoming reply from the lead
       if (log.response_received && log.response_text) {
         messages.push({
           id: `in-${log.id}`,
