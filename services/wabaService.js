@@ -62,20 +62,20 @@ class WABAService {
     const bodyText       = typeof template === 'object' && template?.body_text ? template.body_text : '';
     const headerImageUrl = typeof template === 'object' ? (template.header_image_url || null) : null;
 
-    // Count how many {{n}} variables are in the template body
-    const varCount = (bodyText.match(/\{\{\d+\}\}/g) || []).length;
+    // Count unique {{n}} variables in the body — only send exactly that many params
+    const varMatches = bodyText.match(/\{\{\d+\}\}/g) || [];
+    const varCount = [...new Set(varMatches)].length;
 
-    // Base params: {{1}} owner_name, {{2}} hotel_name, {{3}} city
-    const params = [
-      hotelLead.owner_name || '',
+    // All possible params in order: {{1}} owner_name, {{2}} hotel_name, {{3}} city, {{4}} demo_link
+    const allParams = [
+      hotelLead.owner_name || hotelLead.hotel_name || '',
       hotelLead.hotel_name || '',
       hotelLead.city       || '',
+      process.env.DEMO_LINK || 'https://resort.dreamstechnology.in',
     ];
 
-    // If template has {{4}}, supply the demo link
-    if (varCount >= 4) {
-      params.push(process.env.DEMO_LINK || 'https://resort.dreamstechnology.in');
-    }
+    // Only pass as many params as the template actually uses
+    const params = varCount > 0 ? allParams.slice(0, varCount) : [];
 
     return this.sendTemplateMessage(hotelLead.whatsapp_number, templateName, params, headerImageUrl);
   }

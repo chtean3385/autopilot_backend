@@ -119,11 +119,14 @@ async function handleReply(lead, incomingText) {
 }
 
 async function notifyOwner(lead, lastMessage) {
-  const ownerNumber = process.env.OWNER_WHATSAPP;
+  let ownerNumber = process.env.OWNER_WHATSAPP;
   if (!ownerNumber) {
     console.log('[Agent] OWNER_WHATSAPP not set — skipping personal notification');
     return;
   }
+  // Normalize: strip non-digits, add 91 prefix if 10-digit Indian number
+  ownerNumber = ownerNumber.replace(/\D/g, '');
+  if (ownerNumber.length === 10) ownerNumber = '91' + ownerNumber;
 
   const msg =
     `🎯 *New Qualified Lead!*\n\n` +
