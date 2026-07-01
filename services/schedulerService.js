@@ -29,31 +29,80 @@ pool.query(`
 `).then(() => console.log('[Scheduler] agent_tasks table ready'))
   .catch(err => console.error('[Scheduler] Table init error:', err.message));
 
-// Parse natural language instruction → { city, count, businessType }
-async function parseInstruction(instruction) {
+// Refine the user's instruction using GPT.
+// Returns { refinedInstruction, refinementNote, parsed, canRun }
+// canRun=false only if the city is completely missing and unfixable.
+async function refineInstruction(instruction) {
   try {
     const res = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 150,
+      max_tokens: 400,
       messages: [
         {
           role: 'system',
-          content: 'Extract the business type, target city, and number of leads from the instruction. Reply with JSON only: {"businessType": "restaurants", "city": "CityName", "count": 20}. Use the exact number mentioned — do NOT default to 20 if a number is given. businessType should be the plural category of business (e.g. "hotels", "restaurants", "gyms", "salons", "pharmacies"). If not clear, use "businesses".'
+          content: `You are a lead generation assistant for an Indian B2B WhatsApp outreach tool.
+
+What the tool CAN do:
+- Search any business type (restaurants, hotels, gyms, salons, pharmacies, etc.) in any Indian city via Google Places
+- Send WhatsApp template messages to found businesses
+- Auto follow-up every 2 days for 10 days if no reply
+
+What it CANNOT do:
+- Filter by website presence/absence
+- Filter by Google rating or reviews
+- Search outside India
+- Send emails or make calls
+
+Your job:
+1. Fix typos and grammar in the instruction
+2. Make vague business types more specific if possible (e.g. "any business" → keep as "businesses" unless you can infer the type)
+3. If instruction mentions something impossible (e.g. "no website filter"), remove it and note that
+4. Keep the user's original intent — do NOT change the city, count, or business type without reason
+5. If city is completely missing, note it in refinementNote but still produce a refined instruction
+
+Respond with JSON only:
+{
+  "refinedInstruction": "Find 40 businesses in Gandhinagar and send WhatsApp outreach today",
+  "refinementNote": "Removed 'no website filter' — not supported by Google Places API. Everything else looks good.",
+  "parsed": {
+    "businessType": "businesses",
+    "city": "Gandhinagar",
+    "count": 40
+  },
+  "canRun": true
+}`
         },
         { role: 'user', content: instruction }
       ],
       response_format: { type: 'json_object' },
     });
-    return JSON.parse(res.choices[0].message.content);
-  } catch {
-    // Fallback: simple regex parse
+    const result = JSON.parse(res.choices[0].message.content);
+    return {
+      refinedInstruction: result.refinedInstruction || instruction,
+      refinementNote: result.refinementNote || '',
+      parsed: result.parsed || {},
+      canRun: result.canRun !== false,
+    };
+  } catch (err) {
+    console.error('[Scheduler] refineInstruction error:', err.message);
+    // Fallback: basic parse, send back as-is
     const countMatch = instruction.match(/\b(\d+)\b/);
     const count = countMatch ? parseInt(countMatch[1]) : 20;
     const words = instruction.split(/\s+/);
     const inIdx = words.findIndex(w => w.toLowerCase() === 'in');
-    const city = inIdx !== -1 ? words[inIdx + 1]?.replace(/[^a-zA-Z]/g, '') : 'Delhi';
-    return { city, count, businessType: 'businesses' };
+    const city = inIdx !== -1 ? words[inIdx + 1]?.replace(/[^a-zA-Z]/g, '') : '';
+    return {
+      refinedInstruction: instruction,
+      refinementNote: 'GPT unavailable — using instruction as-is.',
+      parsed: { businessType: 'businesses', city, count },
+      canRun: !!city,
+    };
   }
+}
+
+async function parseInstruction(instruction) {
+  const r = await refineInstruction(instruction);
+  return r.parsed;
 }
 
 // Normalize raw phone → 12-digit WhatsApp-ready Indian mobile (91XXXXXXXXXX)
@@ -111,18 +160,22 @@ function normalizeMobileNumber(rawPhone) {
   return null;
 }
 
-// Scrape any business type from Google Places — paginates to reach requested count
+// Scrape any business type from Google Places.
+// Fetches aggressively (up to 60 results — Google's max) to ensure we hit the requested count
+// after filtering out landlines. Returns as many valid mobile leads as found (ideally >= count).
 async function scrapeLeads(city, count, businessType = 'businesses') {
   const googleKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!googleKey) throw new Error('GOOGLE_PLACES_API_KEY not set');
 
   const searchQuery = `${businessType} in ${city}`;
-  console.log(`[Scraper] Searching: "${searchQuery}"`);
+  // Always fetch the maximum Google allows (60) so we have headroom after landline filtering
+  const fetchTarget = Math.max(count * 2, 40);
+
+  console.log(`[Scraper] Searching: "${searchQuery}" (want ${count}, fetching up to ${fetchTarget})`);
 
   const allResults = [];
   let pageToken = null;
 
-  // Google Places Text Search returns 20/page max — paginate to reach count
   do {
     const params = { query: searchQuery, key: googleKey, language: 'en', region: 'in' };
     if (pageToken) params.pagetoken = pageToken;
@@ -136,13 +189,13 @@ async function scrapeLeads(city, count, businessType = 'businesses') {
     allResults.push(...results);
     pageToken = searchResp.data.next_page_token || null;
 
-    // Google requires a 2s delay before next_page_token becomes valid
-    if (pageToken && allResults.length < count) {
+    if (pageToken && allResults.length < fetchTarget) {
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
-  } while (pageToken && allResults.length < count);
+  } while (pageToken && allResults.length < fetchTarget);
 
-  const rawResults = allResults.slice(0, count);
+  const rawResults = allResults.slice(0, fetchTarget);
+  console.log(`[Scraper] Fetched ${rawResults.length} raw results from Google`);
 
   const detailed = await Promise.allSettled(
     rawResults.map(r =>
@@ -190,6 +243,7 @@ async function scrapeLeads(city, count, businessType = 'businesses') {
     });
   }
 
+  console.log(`[Scraper] ${leads.length} valid mobile leads found (requested: ${count})`);
   return leads;
 }
 
@@ -279,11 +333,17 @@ async function runTask(task) {
   try {
     console.log(`[Scheduler] Task ${taskId}: "${task.instruction}"`);
 
-    // 1. Parse business type, city, count from instruction
-    const { city, count, businessType = 'businesses' } = await parseInstruction(task.instruction);
-    const leadCount = task.lead_count || count || 50;
+    // 1. Use stored parsed_params (set during analysis) or fall back to parsing now
+    let parsedParams = task.parsed_params;
+    if (typeof parsedParams === 'string') parsedParams = JSON.parse(parsedParams);
+    if (!parsedParams || !parsedParams.city) {
+      parsedParams = await parseInstruction(task.instruction);
+    }
 
-    console.log(`[Scheduler] Parsed → businessType="${businessType}" city="${city}", count=${leadCount}`);
+    const { city, count, businessType = 'businesses' } = parsedParams;
+    const leadCount = task.lead_count || count || 20;
+
+    console.log(`[Scheduler] Params → businessType="${businessType}" city="${city}" count=${leadCount}`);
 
     // 2. Scrape Google Places for the given business type
     const scraped = await scrapeLeads(city, leadCount, businessType);
@@ -443,4 +503,4 @@ schedule.scheduleJob('0 10 * * *', async () => {
 
 console.log('🤖 Agent scheduler started — checks every minute for tasks, daily follow-ups at 10AM');
 
-module.exports = { runTask, parseInstruction, runFollowUps };
+module.exports = { runTask, parseInstruction, refineInstruction, runFollowUps };

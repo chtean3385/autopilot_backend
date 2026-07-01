@@ -124,6 +124,11 @@ async function initDB() {
       error_message TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS parsed_params JSON;
+    ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS clarification_questions JSON;
+    ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS clarification_answers JSON;
+    ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS refined_instruction TEXT;
+    ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS refinement_note TEXT;
     CREATE INDEX IF NOT EXISTS idx_leads_city ON hotel_leads(city);
     CREATE INDEX IF NOT EXISTS idx_leads_status ON hotel_leads(status);
     CREATE INDEX IF NOT EXISTS idx_outreach_lead ON outreach_logs(lead_id);

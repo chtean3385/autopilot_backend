@@ -1,6 +1,6 @@
 const express = require('express');
 const pool = require('../config/db');
-const { runTask, parseInstruction } = require('../services/schedulerService');
+const { runTask, refineInstruction } = require('../services/schedulerService');
 const router = express.Router();
 
 // List all tasks (newest first)
@@ -20,39 +20,99 @@ router.get('/tasks', async (req, res) => {
   }
 });
 
-// Create a new task
+// Create task — GPT refines instruction, waits for user approval before running
 router.post('/tasks', async (req, res) => {
   const { instruction, template_id, lead_count, schedule, custom_time } = req.body;
   if (!instruction?.trim()) return res.status(400).json({ error: 'Instruction is required' });
 
   try {
-    const parsed = await parseInstruction(instruction);
+    const refined = await refineInstruction(instruction.trim());
 
     let runAt = new Date();
-    if (schedule === 'custom' && custom_time) {
-      runAt = new Date(custom_time);
-    }
+    if (schedule === 'custom' && custom_time) runAt = new Date(custom_time);
 
     const result = await pool.query(
-      `INSERT INTO agent_tasks (instruction, city, lead_count, template_id, status, run_at)
-       VALUES ($1, $2, $3, $4, 'pending', $5) RETURNING *`,
-      [instruction.trim(), parsed.city || null, lead_count || parsed.count || 50, template_id || null, runAt]
+      `INSERT INTO agent_tasks
+         (instruction, refined_instruction, refinement_note, city, lead_count,
+          template_id, status, run_at, parsed_params)
+       VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8)
+       RETURNING *`,
+      [
+        instruction.trim(),
+        refined.refinedInstruction,
+        refined.refinementNote,
+        refined.parsed?.city || null,
+        lead_count || refined.parsed?.count || 20,
+        template_id || null,
+        runAt,
+        JSON.stringify(refined.parsed),
+      ]
     );
 
-    const task = result.rows[0];
-
-    // If running now, kick off immediately in background
-    if (schedule !== 'custom') {
-      runTask(task).catch(e => console.error('[Agent Route] runTask error:', e.message));
-    }
-
-    res.json({ success: true, task });
+    res.json({ success: true, task: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get single task status (for polling)
+// User approves the refined instruction — run the task
+router.post('/tasks/:id/approve', async (req, res) => {
+  try {
+    const taskResult = await pool.query('SELECT * FROM agent_tasks WHERE id=$1', [req.params.id]);
+    const task = taskResult.rows[0];
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    if (task.status !== 'needs_approval') return res.status(400).json({ error: 'Task is not waiting for approval' });
+
+    const updated = await pool.query(
+      `UPDATE agent_tasks SET status='pending' WHERE id=$1 RETURNING *`,
+      [task.id]
+    );
+
+    const readyTask = updated.rows[0];
+    runTask(readyTask).catch(e => console.error('[Agent Route] runTask error:', e.message));
+
+    res.json({ success: true, task: readyTask });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// User edits and resubmits — GPT re-refines, waits for approval again
+router.post('/tasks/:id/revise', async (req, res) => {
+  const { instruction } = req.body;
+  if (!instruction?.trim()) return res.status(400).json({ error: 'instruction is required' });
+
+  try {
+    const taskResult = await pool.query('SELECT * FROM agent_tasks WHERE id=$1', [req.params.id]);
+    const task = taskResult.rows[0];
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    if (task.status !== 'needs_approval') return res.status(400).json({ error: 'Task is not in approval state' });
+
+    const refined = await refineInstruction(instruction.trim());
+
+    const updated = await pool.query(
+      `UPDATE agent_tasks
+       SET instruction=$1, refined_instruction=$2, refinement_note=$3,
+           city=$4, parsed_params=$5
+       WHERE id=$6
+       RETURNING *`,
+      [
+        instruction.trim(),
+        refined.refinedInstruction,
+        refined.refinementNote,
+        refined.parsed?.city || null,
+        JSON.stringify(refined.parsed),
+        task.id,
+      ]
+    );
+
+    res.json({ success: true, task: updated.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get single task status
 router.get('/tasks/:id', async (req, res) => {
   try {
     const result = await pool.query(
@@ -70,7 +130,7 @@ router.get('/tasks/:id', async (req, res) => {
   }
 });
 
-// Delete a task (only pending/failed ones)
+// Delete a task
 router.delete('/tasks/:id', async (req, res) => {
   try {
     await pool.query('DELETE FROM agent_tasks WHERE id=$1', [req.params.id]);
