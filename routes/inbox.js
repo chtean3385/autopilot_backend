@@ -67,10 +67,14 @@ router.get('/thread/:leadId', async (req, res) => {
     // Build a flat chronological thread: each outreach_log = 1 outgoing msg + optionally 1 incoming
     const messages = [];
     for (const log of logsRes.rows) {
+      // Show template name tag instead of raw body with {{1}} placeholders
+      const outText = log.template_name
+        ? `[Template: ${log.template_name}]`
+        : (log.body_text || '[Message sent]');
       messages.push({
         id: `out-${log.id}`,
         direction: 'outgoing',
-        text: log.body_text || `[${log.template_name || 'Template message'}]`,
+        text: outText,
         campaign: log.campaign_name,
         template: log.template_name,
         timestamp: log.sent_at,

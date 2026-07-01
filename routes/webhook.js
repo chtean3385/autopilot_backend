@@ -133,9 +133,13 @@ router.post('/whatsapp', async (req, res) => {
             // AI agent auto-replies to qualify the lead
             const leadRow = await pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId]);
             if (leadRow.rows[0]) {
-              agentService.handleReply(leadRow.rows[0], msgText).catch(e =>
-                console.error('[Agent] handleReply threw:', e.message)
-              );
+              if (!process.env.OPENAI_API_KEY) {
+                console.error('[Agent] ❌ OPENAI_API_KEY not set — agent cannot reply. Add it to Render env vars.');
+              } else {
+                agentService.handleReply(leadRow.rows[0], msgText).catch(e =>
+                  console.error('[Agent] handleReply failed:', e.message)
+                );
+              }
             }
           }
         }
