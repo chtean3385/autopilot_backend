@@ -37,6 +37,7 @@ async function initDB() {
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS meta_template_id VARCHAR(100);
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS header_image_url VARCHAR(500);
+    ALTER TABLE outreach_logs ADD COLUMN IF NOT EXISTS message_text TEXT;
     CREATE TABLE IF NOT EXISTS lead_groups (
       id SERIAL PRIMARY KEY,
       name VARCHAR(255) NOT NULL UNIQUE,
