@@ -59,25 +59,73 @@ class WABAService {
   // template can be a string (template_name) or the full template object from DB
   static async sendPersonalizedTemplate(hotelLead, template) {
     const templateName   = typeof template === 'string' ? template : template.template_name;
-    const bodyText       = typeof template === 'object' && template?.body_text ? template.body_text : '';
-    const headerImageUrl = typeof template === 'object' ? (template.header_image_url || null) : null;
+    const localImageUrl  = typeof template === 'object' ? (template.header_image_url || null) : null;
+    const localBodyText  = typeof template === 'object' && template?.body_text ? template.body_text : '';
 
-    // Count unique {{n}} variables in the body — only send exactly that many params
-    const varMatches = bodyText.match(/\{\{\d+\}\}/g) || [];
-    const varCount = [...new Set(varMatches)].length;
-
-    // All possible params in order: {{1}} owner_name, {{2}} hotel_name, {{3}} city, {{4}} demo_link
-    const allParams = [
+    // Possible fill values in order: {{1}} owner_name, {{2}} hotel_name, {{3}} city, {{4}} demo_link
+    const fillValues = [
       hotelLead.owner_name || hotelLead.hotel_name || '',
       hotelLead.hotel_name || '',
       hotelLead.city       || '',
       process.env.DEMO_LINK || 'https://resort.dreamstechnology.in',
     ];
 
-    // Only pass as many params as the template actually uses
-    const params = varCount > 0 ? allParams.slice(0, varCount) : [];
+    // Fetch actual template structure from Meta so we send exactly the right components
+    const metaTemplate = await this.getTemplateDetails(templateName);
+    const components = [];
 
-    return this.sendTemplateMessage(hotelLead.whatsapp_number, templateName, params, headerImageUrl);
+    if (metaTemplate && metaTemplate.components) {
+      for (const comp of metaTemplate.components) {
+        if (comp.type === 'HEADER') {
+          if (comp.format === 'IMAGE') {
+            // Use our stored image URL, or fall back to the example handle Meta has
+            const imgUrl = localImageUrl || comp.example?.header_handle?.[0];
+            if (imgUrl) {
+              components.push({
+                type: 'header',
+                parameters: [{ type: 'image', image: { link: imgUrl } }]
+              });
+            }
+          }
+          // TEXT / DOCUMENT / VIDEO headers without variables need no parameters component
+        } else if (comp.type === 'BODY') {
+          const varMatches = (comp.text || '').match(/\{\{\d+\}\}/g) || [];
+          const varCount = [...new Set(varMatches)].length;
+          if (varCount > 0) {
+            components.push({
+              type: 'body',
+              parameters: fillValues.slice(0, varCount).map(v => ({ type: 'text', text: String(v) }))
+            });
+          }
+        } else if (comp.type === 'BUTTONS') {
+          // Handle URL buttons with dynamic {{1}} variable
+          (comp.buttons || []).forEach((btn, idx) => {
+            if (btn.type === 'URL' && btn.url && btn.url.includes('{{')) {
+              components.push({
+                type: 'button',
+                sub_type: 'url',
+                index: String(idx),
+                parameters: [{ type: 'text', text: process.env.DEMO_LINK || 'https://resort.dreamstechnology.in' }]
+              });
+            }
+          });
+        }
+      }
+      console.log(`[WABA] Built components from Meta template for "${templateName}":`, JSON.stringify(components));
+    } else {
+      // Fallback: use local DB body text if Meta fetch fails
+      console.warn(`[WABA] Could not fetch Meta template "${templateName}", using local body text as fallback`);
+      const varMatches = localBodyText.match(/\{\{\d+\}\}/g) || [];
+      const varCount = [...new Set(varMatches)].length;
+      if (localImageUrl) {
+        components.push({ type: 'header', parameters: [{ type: 'image', image: { link: localImageUrl } }] });
+      }
+      if (varCount > 0) {
+        components.push({ type: 'body', parameters: fillValues.slice(0, varCount).map(v => ({ type: 'text', text: String(v) })) });
+      }
+    }
+
+    return this.sendTemplateMessageWithComponents(hotelLead.whatsapp_number, templateName, components);
   }
 
   // Submit a template to Meta for approval
@@ -183,6 +231,42 @@ class WABAService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('[WABA] Delete template error:', error.response?.data || error.message);
+      return { success: false, error: error.response?.data?.error?.message || error.message };
+    }
+  }
+
+  // Send a template with a pre-built components array (used by sendPersonalizedTemplate)
+  static async sendTemplateMessageWithComponents(recipientPhone, templateName, components) {
+    try {
+      const payload = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: recipientPhone,
+        type: 'template',
+        template: {
+          name: templateName,
+          language: { code: 'en_US' },
+          components
+        }
+      };
+
+      console.log(`[WABA] Sending template "${templateName}" to ${recipientPhone} with ${components.length} component(s)`);
+
+      const response = await axios.post(
+        `${WABA_API_URL}/${process.env.WABA_PHONE_ID}/messages`,
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.WABA_API_TOKEN}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      console.log(`[WABA] Message sent. ID: ${response.data.messages[0].id}`);
+      return { success: true, messageId: response.data.messages[0].id, timestamp: new Date() };
+    } catch (error) {
+      console.error('[WABA] Error sending message:', error.response?.data || error.message);
       return { success: false, error: error.response?.data?.error?.message || error.message };
     }
   }
