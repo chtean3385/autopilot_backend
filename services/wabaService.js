@@ -86,11 +86,14 @@ class WABAService {
     };
 
     // Fetch actual template structure from Meta — never guess what components exist
+    console.log(`[WABA] sendPersonalizedTemplate: fetching Meta structure for "${templateName}"...`);
     const metaTemplate = await this.getTemplateDetails(templateName);
     const language = metaTemplate?.language || 'en_US';
     const components = [];
 
     if (metaTemplate && metaTemplate.components) {
+      console.log(`[WABA] Using Meta structure for "${templateName}" (${metaTemplate.components.length} components)`);
+
       for (const comp of metaTemplate.components) {
         if (comp.type === 'HEADER') {
           if (comp.format === 'IMAGE') {
@@ -131,7 +134,7 @@ class WABAService {
       console.log(`[WABA] Components for "${templateName}" (lang: ${language}):`, JSON.stringify(components));
     } else {
       // Meta fetch failed — fall back to local DB body text so send still works
-      console.warn(`[WABA] Could not fetch "${templateName}" from Meta — using local DB body as fallback`);
+      console.warn(`[WABA] FALLBACK: Meta fetch failed or returned no components for "${templateName}" — using local DB body_text`);
       const varNums = [...new Set((localBodyText.match(/\{\{(\d+)\}\}/g) || []))]
         .map(v => v.replace(/\D/g, ''))
         .sort((a, b) => Number(a) - Number(b));
@@ -312,13 +315,22 @@ class WABAService {
 
   static async getTemplateDetails(templateName) {
     try {
-      const response = await axios.get(
-        `${WABA_API_URL}/${process.env.WABA_BUSINESS_ACCOUNT_ID}/message_templates?name=${templateName}`,
-        { headers: { Authorization: `Bearer ${process.env.WABA_API_TOKEN}` } }
-      );
-      return response.data.data[0];
+      // Explicitly request components field — not always returned by default
+      const url = `${WABA_API_URL}/${process.env.WABA_BUSINESS_ACCOUNT_ID}/message_templates?name=${encodeURIComponent(templateName)}&fields=name,status,language,components`;
+      const response = await axios.get(url, { headers: { Authorization: `Bearer ${process.env.WABA_API_TOKEN}` } });
+      const results = response.data.data || [];
+      console.log(`[WABA] getTemplateDetails("${templateName}"): ${results.length} result(s) from Meta`);
+
+      // Find exact name match (Meta may return partial matches)
+      const match = results.find(t => t.name === templateName);
+      if (!match) {
+        console.warn(`[WABA] Template "${templateName}" not found in Meta response. Got: ${results.map(t => t.name).join(', ')}`);
+        return null;
+      }
+      console.log(`[WABA] Template "${templateName}" components: ${(match.components || []).map(c => c.type).join(', ')}`);
+      return match;
     } catch (error) {
-      console.error('[WABA] Error fetching template:', error.message);
+      console.error('[WABA] getTemplateDetails error:', error.response?.data || error.message);
       return null;
     }
   }

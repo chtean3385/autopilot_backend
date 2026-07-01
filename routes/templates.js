@@ -183,4 +183,24 @@ router.put('/:id/status', async (req, res) => {
   res.json(result);
 });
 
+// Update local fields only (header_image_url, parameter_mapping) — does NOT re-submit to Meta
+router.put('/:id/local', async (req, res) => {
+  try {
+    const { header_image_url, parameter_mapping } = req.body;
+    const result = await pool.query(
+      `UPDATE waba_templates
+       SET header_image_url = $1,
+           parameter_mapping = $2,
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [header_image_url || null, JSON.stringify(parameter_mapping || {}), req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Template not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
