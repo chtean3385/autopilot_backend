@@ -51,6 +51,7 @@ async function initDB() {
     );
     ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS group_id INT REFERENCES lead_groups(id);
     ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS target_type VARCHAR(20) DEFAULT 'city';
+    ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS target_lead_status VARCHAR(50) DEFAULT 'new';
     CREATE TABLE IF NOT EXISTS campaigns (
       id SERIAL PRIMARY KEY,
       campaign_name VARCHAR(255) NOT NULL,
