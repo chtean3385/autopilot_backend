@@ -459,7 +459,7 @@ async function sendTask(taskId) {
   const taskResult = await pool.query(`SELECT * FROM agent_tasks WHERE id=$1`, [taskId]);
   const task = taskResult.rows[0];
   if (!task) throw new Error('Task not found');
-  if (task.status !== 'preview') throw new Error('Task is not in preview state');
+  if (task.status !== 'preview' && task.status !== 'scheduled_send') throw new Error('Task is not in preview state');
 
   await pool.query(`UPDATE agent_tasks SET status='running' WHERE id=$1`, [taskId]);
 
@@ -578,10 +578,15 @@ schedule.scheduleJob('* * * * *', async () => {
   running = true;
   try {
     const result = await pool.query(
-      `SELECT * FROM agent_tasks WHERE status='pending' AND run_at <= NOW() ORDER BY run_at ASC LIMIT 1`
+      `SELECT * FROM agent_tasks WHERE status IN ('pending', 'scheduled_send') AND run_at <= NOW() ORDER BY run_at ASC LIMIT 1`
     );
     if (result.rows.length > 0) {
-      await runTask(result.rows[0]);
+      const task = result.rows[0];
+      if (task.status === 'scheduled_send') {
+        await sendTask(task.id);
+      } else {
+        await runTask(task);
+      }
     }
   } catch (err) {
     console.error('[Scheduler] Cron error:', err.message);

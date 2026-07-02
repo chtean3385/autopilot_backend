@@ -182,8 +182,20 @@ router.delete('/tasks/:id/leads/:leadId', async (req, res) => {
 });
 
 // Admin triggers send after reviewing the lead list
+// Optional body: { send_at: ISO datetime } — schedules for later instead of sending immediately
 router.post('/tasks/:id/send', async (req, res) => {
   try {
+    const { send_at } = req.body || {};
+    if (send_at) {
+      const sendTime = new Date(send_at);
+      if (sendTime > new Date()) {
+        await pool.query(
+          `UPDATE agent_tasks SET status='scheduled_send', run_at=$1 WHERE id=$2`,
+          [sendTime, req.params.id]
+        );
+        return res.json({ success: true, scheduled: true, send_at: sendTime });
+      }
+    }
     const sent = await sendTask(parseInt(req.params.id));
     res.json({ success: true, messages_sent: sent });
   } catch (err) {
