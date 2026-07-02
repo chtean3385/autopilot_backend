@@ -26,8 +26,11 @@ pool.query(`
     error_message TEXT,
     created_at TIMESTAMP DEFAULT NOW()
   )
-`).then(() => console.log('[Scheduler] agent_tasks table ready'))
-  .catch(err => console.error('[Scheduler] Table init error:', err.message));
+`).then(async () => {
+  console.log('[Scheduler] agent_tasks table ready');
+  // Fix 2: migrate pre-approval-gate tasks so cron doesn't run them without user review
+  await pool.query(`UPDATE agent_tasks SET status='needs_approval' WHERE status='pending' AND parsed_params IS NULL`);
+}).catch(err => console.error('[Scheduler] Table init error:', err.message));
 
 // Refine the user's instruction using GPT.
 // Returns { refinedInstruction, refinementNote, parsed, canRun }
@@ -36,41 +39,69 @@ async function refineInstruction(instruction) {
   try {
     const res = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 400,
+      max_tokens: 900,
       messages: [
         {
           role: 'system',
-          content: `You are a lead generation assistant for an Indian B2B WhatsApp outreach tool.
+          content: `You are a lead generation assistant for an Indian B2B WhatsApp outreach tool called Dreams Technology.
 
 What the tool CAN do:
-- Search any business type (restaurants, hotels, gyms, salons, pharmacies, etc.) in any Indian city via Google Places
+- Search any business type (restaurants, hotels, gyms, salons, pharmacies, dental clinics, etc.) in any Indian city via Google Places
+- Filter out businesses that already have a website (website field comes from Google Places Details API)
 - Send WhatsApp template messages to found businesses
+- An AI bot auto-replies on WhatsApp to qualify leads for a demo
 - Auto follow-up every 2 days for 10 days if no reply
 
 What it CANNOT do:
-- Filter by website presence/absence
 - Filter by Google rating or reviews
 - Search outside India
 - Send emails or make calls
 
 Your job:
-1. Fix typos and grammar in the instruction
-2. Make vague business types more specific if possible (e.g. "any business" → keep as "businesses" unless you can infer the type)
-3. If instruction mentions something impossible (e.g. "no website filter"), remove it and note that
-4. Keep the user's original intent — do NOT change the city, count, or business type without reason
-5. If city is completely missing, note it in refinementNote but still produce a refined instruction
+1. Fix typos and grammar in the instruction — do NOT add words that are not in the original
+2. Extract business type, city, and count from the instruction
+3. Keep the user's original intent exactly — do NOT add filters or conditions they did not mention
+4. CRITICAL: filterHasWebsite must be true ONLY when the user explicitly says "no website", "without website", "don't have website", "without a website listing" or very similar. If they did NOT mention website at all, set filterHasWebsite: false. Do NOT assume or add this filter by default.
+5. If city is completely missing, note it in refinementNote
+6. Generate a WhatsApp bot system prompt tailored to the specific business type for qualifying leads
 
-Respond with JSON only:
+The systemPrompt you generate must:
+- Be for a WhatsApp sales bot representing Dreams Technology (Indian business software company)
+- Be tailored to the specific business type — understand their pain points, language, and needs
+- Focus on qualifying: is the person a decision maker, do they have a problem our software solves, will they take a free demo?
+- Use short WhatsApp-style replies (1-3 sentences), conversational, can mix Hindi/Hinglish naturally
+- NEVER say it is an AI
+- End every reply with exactly one tag on a new line: [CONTINUE], [QUALIFIED], or [NOT_INTERESTED]
+
+Example — user says "find 30 IT companies in Gandhinagar" (NO website mention):
 {
-  "refinedInstruction": "Find 40 businesses in Gandhinagar and send WhatsApp outreach today",
-  "refinementNote": "Removed 'no website filter' — not supported by Google Places API. Everything else looks good.",
+  "refinedInstruction": "Find 30 IT companies in Gandhinagar and send WhatsApp outreach today",
+  "refinementNote": "Fixed typos. No website filter applied as user did not mention it.",
   "parsed": {
-    "businessType": "businesses",
+    "businessType": "IT companies",
     "city": "Gandhinagar",
-    "count": 40
+    "count": 30,
+    "filterHasWebsite": false
   },
+  "systemPrompt": "...",
   "canRun": true
-}`
+}
+
+Example — user says "find dental clinics in Mumbai who don't have website" (explicit website mention):
+{
+  "refinedInstruction": "Find 30 dental clinics in Mumbai without a website and send WhatsApp outreach today",
+  "refinementNote": "Website filter applied — will skip clinics that already have a website listed on Google.",
+  "parsed": {
+    "businessType": "dental clinics",
+    "city": "Mumbai",
+    "count": 30,
+    "filterHasWebsite": true
+  },
+  "systemPrompt": "...",
+  "canRun": true
+}
+
+Now respond with JSON only for the user's actual instruction:`
         },
         { role: 'user', content: instruction }
       ],
@@ -81,6 +112,7 @@ Respond with JSON only:
       refinedInstruction: result.refinedInstruction || instruction,
       refinementNote: result.refinementNote || '',
       parsed: result.parsed || {},
+      systemPrompt: result.systemPrompt || null,
       canRun: result.canRun !== false,
     };
   } catch (err) {
@@ -95,6 +127,7 @@ Respond with JSON only:
       refinedInstruction: instruction,
       refinementNote: 'GPT unavailable — using instruction as-is.',
       parsed: { businessType: 'businesses', city, count },
+      systemPrompt: null,
       canRun: !!city,
     };
   }
@@ -163,7 +196,7 @@ function normalizeMobileNumber(rawPhone) {
 // Scrape any business type from Google Places.
 // Fetches aggressively (up to 60 results — Google's max) to ensure we hit the requested count
 // after filtering out landlines. Returns as many valid mobile leads as found (ideally >= count).
-async function scrapeLeads(city, count, businessType = 'businesses') {
+async function scrapeLeads(city, count, businessType = 'businesses', filterHasWebsite = false, maxReviews = null) {
   const googleKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!googleKey) throw new Error('GOOGLE_PLACES_API_KEY not set');
 
@@ -197,18 +230,28 @@ async function scrapeLeads(city, count, businessType = 'businesses') {
   const rawResults = allResults.slice(0, fetchTarget);
   console.log(`[Scraper] Fetched ${rawResults.length} raw results from Google`);
 
-  const detailed = await Promise.allSettled(
-    rawResults.map(r =>
-      axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
-        params: {
-          place_id: r.place_id,
-          fields: 'name,formatted_phone_number,international_phone_number,website',
-          key: googleKey,
-          language: 'en'
-        }
-      })
-    )
-  );
+  // Fix 4: chunk Detail calls to stay within Google's ~10 QPS rate limit
+  const CHUNK_SIZE = 10;
+  const detailed = [];
+  for (let ci = 0; ci < rawResults.length; ci += CHUNK_SIZE) {
+    const chunk = rawResults.slice(ci, ci + CHUNK_SIZE);
+    const chunkResults = await Promise.allSettled(
+      chunk.map(r =>
+        axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
+          params: {
+            place_id: r.place_id,
+            fields: 'name,formatted_phone_number,international_phone_number,website',
+            key: googleKey,
+            language: 'en'
+          }
+        })
+      )
+    );
+    detailed.push(...chunkResults);
+    if (ci + CHUNK_SIZE < rawResults.length) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
 
   const extractCity = (address, fallback) => {
     if (!address) return fallback || '';
@@ -231,6 +274,16 @@ async function scrapeLeads(city, count, businessType = 'businesses') {
       continue;
     }
 
+    if (filterHasWebsite && detail.website) {
+      console.log(`[Scraper] Skipping "${r.name}" — already has website: ${detail.website}`);
+      continue;
+    }
+
+    if (maxReviews !== null && (r.user_ratings_total || 0) >= maxReviews) {
+      console.log(`[Scraper] Skipping "${r.name}" — too many reviews: ${r.user_ratings_total}`);
+      continue;
+    }
+
     leads.push({
       hotel_name: r.name || '',
       owner_name: r.name || '',
@@ -244,7 +297,7 @@ async function scrapeLeads(city, count, businessType = 'businesses') {
   }
 
   console.log(`[Scraper] ${leads.length} valid mobile leads found (requested: ${count})`);
-  return leads;
+  return leads.slice(0, count);
 }
 
 // Save leads, skip duplicates by whatsapp_number or (business_name + city).
@@ -325,10 +378,15 @@ async function getApprovedTemplate(templateId) {
 async function runTask(task) {
   const taskId = task.id;
 
-  await pool.query(
-    `UPDATE agent_tasks SET status='running', started_at=NOW() WHERE id=$1`,
+  // Fix 1: compare-and-swap — only one caller (approve route or cron) wins the race
+  const claim = await pool.query(
+    `UPDATE agent_tasks SET status='running', started_at=NOW() WHERE id=$1 AND status='pending' RETURNING id`,
     [taskId]
   );
+  if (claim.rowCount === 0) {
+    console.log(`[Scheduler] Task ${taskId} already claimed by another process — skipping`);
+    return;
+  }
 
   try {
     console.log(`[Scheduler] Task ${taskId}: "${task.instruction}"`);
@@ -340,13 +398,16 @@ async function runTask(task) {
       parsedParams = await parseInstruction(task.instruction);
     }
 
-    const { city, count, businessType = 'businesses' } = parsedParams;
+    const { city, count, businessType = 'businesses', filterHasWebsite = false, maxReviews = null } = parsedParams;
+    if (!city) {
+      throw new Error('City could not be determined from instruction. Please specify a city name.');
+    }
     const leadCount = task.lead_count || count || 20;
 
-    console.log(`[Scheduler] Params → businessType="${businessType}" city="${city}" count=${leadCount}`);
+    console.log(`[Scheduler] Params → businessType="${businessType}" city="${city}" count=${leadCount} filterHasWebsite=${filterHasWebsite} maxReviews=${maxReviews}`);
 
-    // 2. Scrape Google Places for the given business type
-    const scraped = await scrapeLeads(city, leadCount, businessType);
+    // 2. Scrape Google Places
+    const scraped = await scrapeLeads(city, leadCount, businessType, filterHasWebsite, maxReviews);
     console.log(`[Scheduler] Scraped ${scraped.length} leads for ${businessType} in ${city}`);
 
     // 3. Save new leads (deduplicated) — returns saved lead IDs
@@ -354,37 +415,71 @@ async function runTask(task) {
     const saved = savedIds.length;
     console.log(`[Scheduler] Saved ${saved} new leads`);
 
-    // 3b. Auto-create/update business+city group
-    await upsertCityGroup(city, businessType, savedIds);
-
-    // 4. Get approved template
-    const template = await getApprovedTemplate(task.template_id);
-
-    if (!template || saved === 0) {
-      const reason = !template ? 'No approved template found' : 'No new leads to contact';
+    if (saved === 0) {
       await pool.query(
-        `UPDATE agent_tasks SET status='done', completed_at=NOW(), leads_scraped=$1, leads_saved=$2,
-         messages_sent=0, error_message=$3 WHERE id=$4`,
-        [scraped.length, saved, reason, taskId]
+        `UPDATE agent_tasks SET status='done', completed_at=NOW(), leads_scraped=$1, leads_saved=0,
+         messages_sent=0, error_message=$2 WHERE id=$3`,
+        [scraped.length, 'No new leads found (all duplicates or filtered)', taskId]
       );
       return;
     }
 
-    // 5. Create campaign
+    // 4. Auto-create/update business+city group, get back groupId
+    const groupId = await upsertCityGroup(city, businessType, savedIds);
+
+    // 5. Create campaign (draft — not sent yet; admin reviews leads first)
     const campaignName = `Agent: ${businessType} in ${city} – ${new Date().toLocaleDateString('en-IN')}`;
     const campResult = await pool.query(
-      `INSERT INTO campaigns (campaign_name, template_id, target_city, target_type, status, created_by)
-       VALUES ($1, $2, $3, 'city', 'draft', 'agent') RETURNING *`,
-      [campaignName, template.id, city]
+      `INSERT INTO campaigns (campaign_name, template_id, target_city, target_type, status, created_by, system_prompt, business_type, group_id)
+       VALUES ($1, $2, $3, 'city', 'draft', 'agent', $4, $5, $6) RETURNING *`,
+      [campaignName, task.template_id || null, city, task.system_prompt || null, businessType, groupId]
     );
     const campaign = campResult.rows[0];
 
-    // 6. Send initial message to all newly saved leads only
+    // 6. Set task to 'preview' — wait for admin to review leads then trigger send
+    await pool.query(
+      `UPDATE agent_tasks SET status='preview', leads_scraped=$1, leads_saved=$2, campaign_id=$3 WHERE id=$4`,
+      [scraped.length, saved, campaign.id, taskId]
+    );
+
+    console.log(`[Scheduler] Task ${taskId} → preview (${saved} leads ready for review)`);
+
+  } catch (err) {
+    console.error(`[Scheduler] Task ${taskId} failed:`, err.message);
+    await pool.query(
+      `UPDATE agent_tasks SET status='failed', completed_at=NOW(), error_message=$1 WHERE id=$2`,
+      [err.message, taskId]
+    );
+  }
+}
+
+// Phase 2: send WhatsApp messages to leads in the task's campaign group.
+// Called by admin after reviewing the lead list.
+async function sendTask(taskId) {
+  const taskResult = await pool.query(`SELECT * FROM agent_tasks WHERE id=$1`, [taskId]);
+  const task = taskResult.rows[0];
+  if (!task) throw new Error('Task not found');
+  if (task.status !== 'preview') throw new Error('Task is not in preview state');
+
+  await pool.query(`UPDATE agent_tasks SET status='running' WHERE id=$1`, [taskId]);
+
+  try {
+    const campResult = await pool.query(`SELECT * FROM campaigns WHERE id=$1`, [task.campaign_id]);
+    const campaign = campResult.rows[0];
+    if (!campaign) throw new Error('Campaign not found');
+    if (!campaign.group_id) throw new Error('Campaign has no lead group');
+
+    const template = await getApprovedTemplate(campaign.template_id || task.template_id);
+    if (!template) throw new Error('No approved WhatsApp template available');
+
     const leadsResult = await pool.query(
-      `SELECT * FROM hotel_leads WHERE id = ANY($1::int[])`,
-      [savedIds]
+      `SELECT hl.* FROM hotel_leads hl
+       JOIN lead_group_members lgm ON lgm.lead_id = hl.id
+       WHERE lgm.group_id = $1`,
+      [campaign.group_id]
     );
     const leads = leadsResult.rows;
+    console.log(`[Scheduler] sendTask ${taskId} — sending to ${leads.length} leads`);
 
     let sent = 0;
     for (const lead of leads) {
@@ -396,25 +491,24 @@ async function runTask(task) {
     }
 
     await pool.query(
-      `UPDATE campaigns SET status='active', total_leads=$1 WHERE id=$2`,
-      [leads.length, campaign.id]
+      `UPDATE campaigns SET status='active', total_leads=$1, template_id=$2 WHERE id=$3`,
+      [leads.length, template.id, campaign.id]
     );
-
     await pool.query(
-      `UPDATE agent_tasks SET status='done', completed_at=NOW(),
-       leads_scraped=$1, leads_saved=$2, messages_sent=$3, campaign_id=$4
-       WHERE id=$5`,
-      [scraped.length, saved, sent, campaign.id, taskId]
+      `UPDATE agent_tasks SET status='done', completed_at=NOW(), messages_sent=$1 WHERE id=$2`,
+      [sent, taskId]
     );
 
-    console.log(`[Scheduler] Task ${taskId} done — scraped:${scraped.length} saved:${saved} sent:${sent}`);
+    console.log(`[Scheduler] Task ${taskId} done — sent:${sent}`);
+    return sent;
 
   } catch (err) {
-    console.error(`[Scheduler] Task ${taskId} failed:`, err.message);
+    console.error(`[Scheduler] sendTask ${taskId} failed:`, err.message);
     await pool.query(
       `UPDATE agent_tasks SET status='failed', completed_at=NOW(), error_message=$1 WHERE id=$2`,
       [err.message, taskId]
     );
+    throw err;
   }
 }
 
@@ -460,7 +554,7 @@ async function runFollowUps() {
 
       if (!template) {
         console.warn('[FollowUp] No approved template — skipping follow-up sends');
-        break;
+        continue;
       }
 
       const wabaResult = await WABAService.sendPersonalizedTemplate(lead, template);
@@ -503,4 +597,4 @@ schedule.scheduleJob('0 10 * * *', async () => {
 
 console.log('🤖 Agent scheduler started — checks every minute for tasks, daily follow-ups at 10AM');
 
-module.exports = { runTask, parseInstruction, refineInstruction, runFollowUps };
+module.exports = { runTask, sendTask, parseInstruction, refineInstruction, runFollowUps };

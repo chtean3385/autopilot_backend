@@ -106,7 +106,8 @@ router.post('/whatsapp', async (req, res) => {
             const leadId = leadResult.rows[0].id;
 
             // Opt-out detection — mark and never contact again
-            const isOptOut = /\bstop\b|not\s+interested|opt.?out|unsubscribe|no\s+thanks|don't\s+contact|do\s+not\s+contact|remove\s+me|hatao|band\s+karo|nahi\s+chahiye/i.test(msgText);
+            // Fix 7: include Unicode right-single-quote (U+2019) that mobile keyboards produce
+            const isOptOut = /\bstop\b|not\s+interested|opt.?out|unsubscribe|no\s+thanks|don[’']t\s+contact|do\s+not\s+contact|remove\s+me|hatao|band\s+karo|nahi\s+chahiye/i.test(msgText);
             if (isOptOut) {
               await pool.query(
                 `UPDATE hotel_leads SET status='opted_out', updated_at=NOW() WHERE id=$1`,

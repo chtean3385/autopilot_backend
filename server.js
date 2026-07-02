@@ -129,6 +129,9 @@ async function initDB() {
     ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS clarification_answers JSON;
     ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS refined_instruction TEXT;
     ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS refinement_note TEXT;
+    ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS system_prompt TEXT;
+    ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS system_prompt TEXT;
+    ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS business_type VARCHAR(100);
     CREATE INDEX IF NOT EXISTS idx_leads_city ON hotel_leads(city);
     CREATE INDEX IF NOT EXISTS idx_leads_status ON hotel_leads(status);
     CREATE INDEX IF NOT EXISTS idx_outreach_lead ON outreach_logs(lead_id);

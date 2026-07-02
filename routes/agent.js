@@ -1,6 +1,6 @@
 const express = require('express');
 const pool = require('../config/db');
-const { runTask, refineInstruction } = require('../services/schedulerService');
+const { runTask, sendTask, refineInstruction } = require('../services/schedulerService');
 const router = express.Router();
 
 // List all tasks (newest first)
@@ -22,11 +22,18 @@ router.get('/tasks', async (req, res) => {
 
 // Create task — GPT refines instruction, waits for user approval before running
 router.post('/tasks', async (req, res) => {
-  const { instruction, template_id, lead_count, schedule, custom_time } = req.body;
+  const { instruction, template_id, lead_count, schedule, custom_time, filters } = req.body;
   if (!instruction?.trim()) return res.status(400).json({ error: 'Instruction is required' });
 
   try {
     const refined = await refineInstruction(instruction.trim());
+
+    // Explicit UI filters always override what GPT parsed from text
+    const parsedParams = {
+      ...refined.parsed,
+      filterHasWebsite: filters?.filterHasWebsite === true ? true : (refined.parsed?.filterHasWebsite || false),
+      maxReviews: filters?.maxReviews || null,
+    };
 
     let runAt = new Date();
     if (schedule === 'custom' && custom_time) runAt = new Date(custom_time);
@@ -34,18 +41,19 @@ router.post('/tasks', async (req, res) => {
     const result = await pool.query(
       `INSERT INTO agent_tasks
          (instruction, refined_instruction, refinement_note, city, lead_count,
-          template_id, status, run_at, parsed_params)
-       VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8)
+          template_id, status, run_at, parsed_params, system_prompt)
+       VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9)
        RETURNING *`,
       [
         instruction.trim(),
         refined.refinedInstruction,
         refined.refinementNote,
-        refined.parsed?.city || null,
-        lead_count || refined.parsed?.count || 20,
+        parsedParams.city || null,
+        lead_count || parsedParams.count || 20,
         template_id || null,
         runAt,
-        JSON.stringify(refined.parsed),
+        JSON.stringify(parsedParams),
+        refined.systemPrompt || null,
       ]
     );
 
@@ -69,7 +77,11 @@ router.post('/tasks/:id/approve', async (req, res) => {
     );
 
     const readyTask = updated.rows[0];
-    runTask(readyTask).catch(e => console.error('[Agent Route] runTask error:', e.message));
+    // Fix 6: only fire immediately if the scheduled time has passed; otherwise let cron handle it
+    // Fix 1: runTask uses a CAS update so even if cron fires first, only one wins
+    if (new Date(readyTask.run_at) <= new Date()) {
+      runTask(readyTask).catch(e => console.error('[Agent Route] runTask error:', e.message));
+    }
 
     res.json({ success: true, task: readyTask });
   } catch (err) {
@@ -125,6 +137,55 @@ router.get('/tasks/:id', async (req, res) => {
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Task not found' });
     res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// List leads captured for a preview-state task (for admin review before sending)
+router.get('/tasks/:id/leads', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT hl.id, hl.hotel_name, hl.whatsapp_number, hl.phone, hl.city,
+              hl.business_category, hl.email AS website, hl.status, hl.created_at
+       FROM agent_tasks at
+       JOIN campaigns c ON at.campaign_id = c.id
+       JOIN lead_group_members lgm ON lgm.group_id = c.group_id
+       JOIN hotel_leads hl ON lgm.lead_id = hl.id
+       WHERE at.id = $1
+       ORDER BY hl.created_at DESC`,
+      [req.params.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Remove a lead from the task's campaign group (so it won't receive messages)
+router.delete('/tasks/:id/leads/:leadId', async (req, res) => {
+  try {
+    await pool.query(
+      `DELETE FROM lead_group_members
+       WHERE lead_id = $1
+         AND group_id = (
+           SELECT c.group_id FROM agent_tasks at
+           JOIN campaigns c ON at.campaign_id = c.id
+           WHERE at.id = $2
+         )`,
+      [req.params.leadId, req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin triggers send after reviewing the lead list
+router.post('/tasks/:id/send', async (req, res) => {
+  try {
+    const sent = await sendTask(parseInt(req.params.id));
+    res.json({ success: true, messages_sent: sent });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -4,24 +4,45 @@ const pool = require('../config/db');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const SYSTEM_PROMPT = `You are a friendly sales assistant for Dreams Technology, a hotel management & booking software company in India. You talk to hotel owners on WhatsApp to qualify them for a product demo.
+function buildDefaultPrompt(businessCategory) {
+  return `You are a friendly sales assistant for Dreams Technology, a business management software company in India. You are reaching out to ${businessCategory} owners on WhatsApp to understand their needs and qualify them for a free software demo.
 
 Your goals:
-1. Understand if they are the decision maker (owner/manager vs. staff)
-2. Find out if they need hotel management or online booking software
-3. Get them interested in a free demo
+1. Confirm they are the owner or decision maker (not a staff member)
+2. Find out their current pain points — manual work, outdated systems, managing customers/records/billing
+3. Get them interested in a free demo of our business management software
 
 Rules:
 - Keep replies SHORT — 1-3 sentences max. This is WhatsApp, not email.
-- Be warm, conversational. Mix Hindi words naturally if they write in Hindi/Hinglish.
-- Don't be pushy. Don't repeat their words back.
-- After 3-4 exchanges, make a decision.
+- Be warm and conversational. Mix Hindi/Hinglish naturally if they write in Hindi.
+- Don't be pushy. Don't repeat their words back to them.
+- After 3-4 exchanges, make a final decision.
 - NEVER mention you are an AI.
 
-After your reply message, on a new line write exactly one of:
-[CONTINUE] - still in conversation, need more exchanges
+After your reply, on a new line write exactly one of:
+[CONTINUE] - still in conversation, need more info
 [QUALIFIED] - they want a demo or are clearly interested
-[NOT_INTERESTED] - they said no, not relevant, wrong number, etc.`;
+[NOT_INTERESTED] - they said no, wrong number, not relevant, etc.`;
+}
+
+async function getCampaignSystemPrompt(leadId) {
+  const result = await pool.query(
+    `SELECT c.system_prompt, hl.business_category
+     FROM hotel_leads hl
+     LEFT JOIN outreach_logs ol ON ol.lead_id = hl.id AND ol.campaign_id IS NOT NULL
+     LEFT JOIN campaigns c ON ol.campaign_id = c.id
+     WHERE hl.id = $1
+     ORDER BY ol.sent_at DESC
+     LIMIT 1`,
+    [leadId]
+  );
+
+  const row = result.rows[0];
+  if (row?.system_prompt) return row.system_prompt;
+
+  const cat = row?.business_category || 'businesses';
+  return buildDefaultPrompt(cat);
+}
 
 async function getConversationHistory(leadId) {
   const result = await pool.query(
@@ -38,11 +59,9 @@ async function getConversationHistory(leadId) {
 
   const messages = [];
   for (const row of result.rows) {
-    // Outgoing template/reply we sent
     if (row.message_text) {
       messages.push({ role: 'assistant', content: row.message_text });
     }
-    // Incoming reply from lead
     if (row.response_text) {
       messages.push({ role: 'user', content: row.response_text });
     }
@@ -54,42 +73,40 @@ async function handleReply(lead, incomingText) {
   try {
     console.log(`[Agent] Processing reply from lead ${lead.id}: "${incomingText}"`);
 
-    // Build conversation history
-    const history = await getConversationHistory(lead.id);
+    const [systemPrompt, history] = await Promise.all([
+      getCampaignSystemPrompt(lead.id),
+      getConversationHistory(lead.id),
+    ]);
 
-    // Make sure the latest incoming message is at the end
     if (history.length === 0 || history[history.length - 1].content !== incomingText) {
       history.push({ role: 'user', content: incomingText });
     }
 
-    // Call OpenAI
+    const leadContext = `\n\nLead info:\nBusiness: ${lead.hotel_name}\nOwner: ${lead.owner_name}\nCity: ${lead.city}${lead.business_category ? `\nCategory: ${lead.business_category}` : ''}`;
+
     const response = await client.chat.completions.create({
       model: 'gpt-4o-mini',
       max_tokens: 300,
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT + `\n\nLead info:\nHotel: ${lead.hotel_name}\nOwner: ${lead.owner_name}\nCity: ${lead.city}` },
+        { role: 'system', content: systemPrompt + leadContext },
         ...history,
       ],
     });
 
     const fullReply = response.choices[0].message.content.trim();
 
-    // Parse out the status tag
     const tagMatch = fullReply.match(/\[(QUALIFIED|NOT_INTERESTED|CONTINUE)\]\s*$/m);
     const status = tagMatch ? tagMatch[1] : 'CONTINUE';
     const replyText = fullReply.replace(/\[(QUALIFIED|NOT_INTERESTED|CONTINUE)\]\s*$/m, '').trim();
 
     console.log(`[Agent] Reply to ${lead.hotel_name}: "${replyText}" [${status}]`);
 
-    // Send the reply via WhatsApp
     const sendResult = await WABAService.sendTextMessage(lead.whatsapp_number, replyText);
-
     if (!sendResult.success) {
       console.error(`[Agent] Failed to send reply to ${lead.id}:`, sendResult.error);
       return;
     }
 
-    // Log agent reply to outreach_logs
     await pool.query(
       `INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
        SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW()
@@ -97,7 +114,6 @@ async function handleReply(lead, incomingText) {
       [lead.id, sendResult.messageId, replyText]
     );
 
-    // Update lead status based on AI decision
     if (status === 'QUALIFIED') {
       await pool.query(
         `UPDATE hotel_leads SET status = 'demo_qualified', updated_at = NOW() WHERE id = $1`,
@@ -124,13 +140,16 @@ async function notifyOwner(lead, lastMessage) {
     console.log('[Agent] OWNER_WHATSAPP not set — skipping personal notification');
     return;
   }
-  // Normalize: strip non-digits, add 91 prefix if 10-digit Indian number
   ownerNumber = ownerNumber.replace(/\D/g, '');
   if (ownerNumber.length === 10) ownerNumber = '91' + ownerNumber;
 
+  const businessLabel = lead.business_category
+    ? `${lead.hotel_name} (${lead.business_category})`
+    : lead.hotel_name;
+
   const msg =
     `🎯 *New Qualified Lead!*\n\n` +
-    `🏨 *${lead.hotel_name}*\n` +
+    `🏢 *${businessLabel}*\n` +
     `👤 ${lead.owner_name}\n` +
     `📍 ${lead.city}\n` +
     `📱 ${lead.whatsapp_number}\n\n` +
