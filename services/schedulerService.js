@@ -194,64 +194,14 @@ function normalizeMobileNumber(rawPhone) {
 }
 
 // Scrape any business type from Google Places.
-// Fetches aggressively (up to 60 results — Google's max) to ensure we hit the requested count
-// after filtering out landlines. Returns as many valid mobile leads as found (ideally >= count).
+// Fetches page by page (20 results each, max 3 pages = 60 from Google).
+// Stops as soon as we have enough valid mobile leads OR Google runs out of pages.
 async function scrapeLeads(city, count, businessType = 'businesses', filterHasWebsite = false, maxReviews = null) {
   const googleKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!googleKey) throw new Error('GOOGLE_PLACES_API_KEY not set');
 
   const searchQuery = `${businessType} in ${city}`;
-  // Always fetch the maximum Google allows (60) so we have headroom after landline filtering
-  const fetchTarget = Math.max(count * 2, 40);
-
-  console.log(`[Scraper] Searching: "${searchQuery}" (want ${count}, fetching up to ${fetchTarget})`);
-
-  const allResults = [];
-  let pageToken = null;
-
-  do {
-    const params = { query: searchQuery, key: googleKey, language: 'en', region: 'in' };
-    if (pageToken) params.pagetoken = pageToken;
-
-    const searchResp = await axios.get(
-      'https://maps.googleapis.com/maps/api/place/textsearch/json',
-      { params }
-    );
-
-    const results = searchResp.data.results || [];
-    allResults.push(...results);
-    pageToken = searchResp.data.next_page_token || null;
-
-    if (pageToken && allResults.length < fetchTarget) {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-  } while (pageToken && allResults.length < fetchTarget);
-
-  const rawResults = allResults.slice(0, fetchTarget);
-  console.log(`[Scraper] Fetched ${rawResults.length} raw results from Google`);
-
-  // Fix 4: chunk Detail calls to stay within Google's ~10 QPS rate limit
-  const CHUNK_SIZE = 10;
-  const detailed = [];
-  for (let ci = 0; ci < rawResults.length; ci += CHUNK_SIZE) {
-    const chunk = rawResults.slice(ci, ci + CHUNK_SIZE);
-    const chunkResults = await Promise.allSettled(
-      chunk.map(r =>
-        axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
-          params: {
-            place_id: r.place_id,
-            fields: 'name,formatted_phone_number,international_phone_number,website',
-            key: googleKey,
-            language: 'en'
-          }
-        })
-      )
-    );
-    detailed.push(...chunkResults);
-    if (ci + CHUNK_SIZE < rawResults.length) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-  }
+  console.log(`[Scraper] Searching: "${searchQuery}" — need ${count} mobile leads`);
 
   const extractCity = (address, fallback) => {
     if (!address) return fallback || '';
@@ -263,41 +213,97 @@ async function scrapeLeads(city, count, businessType = 'businesses', filterHasWe
   };
 
   const leads = [];
-  for (let i = 0; i < rawResults.length; i++) {
-    const r = rawResults[i];
-    const detail = detailed[i].status === 'fulfilled' ? detailed[i].value.data.result : {};
-    const rawPhone = detail.international_phone_number || detail.formatted_phone_number || '';
-    const mobile = normalizeMobileNumber(rawPhone);
+  let rawCount = 0;
+  let landlineCount = 0;
+  let noPhoneCount = 0;
+  let pageToken = null;
+  let pageNum = 0;
 
-    if (!mobile) {
-      console.log(`[Scraper] Skipping "${r.name}" — not a mobile number: ${rawPhone}`);
-      continue;
+  do {
+    pageNum++;
+    const params = { query: searchQuery, key: googleKey, language: 'en', region: 'in' };
+    if (pageToken) params.pagetoken = pageToken;
+
+    const searchResp = await axios.get(
+      'https://maps.googleapis.com/maps/api/place/textsearch/json',
+      { params }
+    );
+
+    const pageResults = searchResp.data.results || [];
+    pageToken = searchResp.data.next_page_token || null;
+    rawCount += pageResults.length;
+
+    console.log(`[Scraper] Page ${pageNum}: ${pageResults.length} results from Google (${leads.length}/${count} mobile found so far)`);
+
+    // Fetch Place Details for this page in parallel (10 at a time)
+    const detailed = await Promise.allSettled(
+      pageResults.map(r =>
+        axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
+          params: {
+            place_id: r.place_id,
+            fields: 'name,formatted_phone_number,international_phone_number,website',
+            key: googleKey,
+            language: 'en',
+          }
+        })
+      )
+    );
+
+    for (let i = 0; i < pageResults.length; i++) {
+      if (leads.length >= count) break; // have enough, stop processing this page
+
+      const r = pageResults[i];
+      const detail = detailed[i].status === 'fulfilled' ? detailed[i].value.data.result : {};
+      const rawPhone = detail.international_phone_number || detail.formatted_phone_number || '';
+
+      if (!rawPhone) {
+        noPhoneCount++;
+        console.log(`[Scraper] Skip "${r.name}" — no phone`);
+        continue;
+      }
+
+      const mobile = normalizeMobileNumber(rawPhone);
+      if (!mobile) {
+        landlineCount++;
+        console.log(`[Scraper] Skip "${r.name}" — landline: ${rawPhone}`);
+        continue;
+      }
+
+      if (filterHasWebsite && detail.website) {
+        console.log(`[Scraper] Skip "${r.name}" — has website`);
+        continue;
+      }
+
+      if (maxReviews !== null && (r.user_ratings_total || 0) >= maxReviews) {
+        console.log(`[Scraper] Skip "${r.name}" — ${r.user_ratings_total} reviews`);
+        continue;
+      }
+
+      leads.push({
+        hotel_name: r.name || '',
+        owner_name: r.name || '',
+        email: detail.website || '',
+        whatsapp_number: mobile,
+        phone: rawPhone,
+        city: extractCity(r.formatted_address, city),
+        business_category: businessType,
+        source: 'agent',
+      });
     }
 
-    if (filterHasWebsite && detail.website) {
-      console.log(`[Scraper] Skipping "${r.name}" — already has website: ${detail.website}`);
-      continue;
+    // Wait before next page token becomes valid (Google requirement)
+    if (pageToken && leads.length < count) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
 
-    if (maxReviews !== null && (r.user_ratings_total || 0) >= maxReviews) {
-      console.log(`[Scraper] Skipping "${r.name}" — too many reviews: ${r.user_ratings_total}`);
-      continue;
-    }
+  } while (pageToken && leads.length < count);
 
-    leads.push({
-      hotel_name: r.name || '',
-      owner_name: r.name || '',
-      email: detail.website || '',
-      whatsapp_number: mobile,
-      phone: rawPhone,
-      city: extractCity(r.formatted_address, city),
-      business_category: businessType,
-      source: 'agent',
-    });
-  }
+  console.log(`[Scraper] Done — Google returned ${rawCount} total | Landline: ${landlineCount} | No phone: ${noPhoneCount} | Valid mobile: ${leads.length}/${count} requested`);
 
-  console.log(`[Scraper] ${leads.length} valid mobile leads found (requested: ${count})`);
-  return leads.slice(0, count);
+  return {
+    leads,
+    stats: { rawFromGoogle: rawCount, landline: landlineCount, noPhone: noPhoneCount, validMobile: leads.length },
+  };
 }
 
 // Save leads, skip duplicates by whatsapp_number or (business_name + city).
@@ -407,19 +413,19 @@ async function runTask(task) {
     console.log(`[Scheduler] Params → businessType="${businessType}" city="${city}" count=${leadCount} filterHasWebsite=${filterHasWebsite} maxReviews=${maxReviews}`);
 
     // 2. Scrape Google Places
-    const scraped = await scrapeLeads(city, leadCount, businessType, filterHasWebsite, maxReviews);
-    console.log(`[Scheduler] Scraped ${scraped.length} leads for ${businessType} in ${city}`);
+    const { leads: scraped, stats } = await scrapeLeads(city, leadCount, businessType, filterHasWebsite, maxReviews);
+    console.log(`[Scheduler] Scrape stats for ${businessType} in ${city}:`, stats);
 
     // 3. Save new leads (deduplicated) — returns saved lead IDs
     const savedIds = await saveLeads(scraped);
     const saved = savedIds.length;
-    console.log(`[Scheduler] Saved ${saved} new leads`);
+    console.log(`[Scheduler] Saved ${saved} new leads (${scraped.length} valid mobile found, ${leadCount} requested, ${stats.rawFromGoogle} raw from Google)`);
 
     if (saved === 0) {
       await pool.query(
         `UPDATE agent_tasks SET status='done', completed_at=NOW(), leads_scraped=$1, leads_saved=0,
          messages_sent=0, error_message=$2 WHERE id=$3`,
-        [scraped.length, 'No new leads found (all duplicates or filtered)', taskId]
+        [stats.rawFromGoogle, `No new leads found — Google returned ${stats.rawFromGoogle} results but ${stats.landline} were landlines, ${stats.noPhone} had no phone, rest were duplicates`, taskId]
       );
       return;
     }
@@ -437,9 +443,10 @@ async function runTask(task) {
     const campaign = campResult.rows[0];
 
     // 6. Set task to 'preview' — wait for admin to review leads then trigger send
+    // leads_scraped = raw Google count so UI can show "Google returned X, mobile only: Y"
     await pool.query(
       `UPDATE agent_tasks SET status='preview', leads_scraped=$1, leads_saved=$2, campaign_id=$3 WHERE id=$4`,
-      [scraped.length, saved, campaign.id, taskId]
+      [stats.rawFromGoogle, saved, campaign.id, taskId]
     );
 
     console.log(`[Scheduler] Task ${taskId} → preview (${saved} leads ready for review)`);
