@@ -74,6 +74,16 @@ router.post('/:id/launch', async (req, res) => {
     const campaign = campaignResult.rows[0];
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
+    // Block launch if WABA quality is RED
+    const health = await WABAService.getAccountHealth();
+    if (health.success && health.quality_rating === 'RED') {
+      return res.status(403).json({
+        error: 'Campaign blocked: your WhatsApp number quality rating is RED. Fix quality issues in Meta Business Manager before sending.',
+        quality_rating: 'RED',
+        blocked: true,
+      });
+    }
+
     // Get the template — must be approved on Meta
     let template = null;
     if (campaign.template_id) {

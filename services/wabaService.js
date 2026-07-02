@@ -313,6 +313,30 @@ class WABAService {
     }
   }
 
+  static async getAccountHealth() {
+    try {
+      const version = process.env.WABA_API_VERSION || 'v18.0';
+      const phoneId = process.env.WABA_PHONE_ID;
+      const token = process.env.WABA_API_TOKEN;
+      const response = await axios.get(
+        `https://graph.facebook.com/${version}/${phoneId}?fields=quality_rating,display_phone_number,name_status,account_mode,messaging_limit_tier`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const d = response.data;
+      return {
+        success: true,
+        quality_rating: d.quality_rating || 'UNKNOWN',
+        display_phone_number: d.display_phone_number || '',
+        name_status: d.name_status || '',
+        account_mode: d.account_mode || '',
+        messaging_limit_tier: d.messaging_limit_tier || '',
+      };
+    } catch (error) {
+      console.error('[WABA] getAccountHealth error:', error.response?.data || error.message);
+      return { success: false, error: error.response?.data?.error?.message || error.message };
+    }
+  }
+
   static async getTemplateDetails(templateName) {
     try {
       // Explicitly request components field — not always returned by default

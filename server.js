@@ -132,6 +132,11 @@ async function initDB() {
     ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS system_prompt TEXT;
     ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS system_prompt TEXT;
     ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS business_type VARCHAR(100);
+    CREATE TABLE IF NOT EXISTS settings (
+      key VARCHAR(100) PRIMARY KEY,
+      value TEXT,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
     CREATE INDEX IF NOT EXISTS idx_leads_city ON hotel_leads(city);
     CREATE INDEX IF NOT EXISTS idx_leads_status ON hotel_leads(status);
     CREATE INDEX IF NOT EXISTS idx_outreach_lead ON outreach_logs(lead_id);
@@ -156,6 +161,8 @@ app.use('/api/templates', require('./routes/templates'));
 app.use('/api/groups', require('./routes/groups'));
 app.use('/api/inbox', require('./routes/inbox'));
 app.use('/api/agent', require('./routes/agent'));
+app.use('/api/analytics', require('./routes/analytics'));
+app.use('/api/settings', require('./routes/settings'));
 
 // Health check
 app.get('/health', (req, res) => {

@@ -1,6 +1,7 @@
 const express = require('express');
 const pool = require('../config/db');
 const { runTask, sendTask, refineInstruction } = require('../services/schedulerService');
+const WABAService = require('../services/wabaService');
 const router = express.Router();
 
 // List all tasks (newest first)
@@ -185,6 +186,16 @@ router.delete('/tasks/:id/leads/:leadId', async (req, res) => {
 // Optional body: { send_at: ISO datetime } — schedules for later instead of sending immediately
 router.post('/tasks/:id/send', async (req, res) => {
   try {
+    // Block if WABA quality is RED
+    const health = await WABAService.getAccountHealth();
+    if (health.success && health.quality_rating === 'RED') {
+      return res.status(403).json({
+        error: 'Send blocked: your WhatsApp number quality rating is RED. Fix quality issues in Meta Business Manager before sending messages.',
+        quality_rating: 'RED',
+        blocked: true,
+      });
+    }
+
     const { send_at } = req.body || {};
     if (send_at) {
       const sendTime = new Date(send_at);
