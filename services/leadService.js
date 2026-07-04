@@ -17,10 +17,10 @@ class LeadService {
           continue;
         }
         const result = await pool.query(
-          `INSERT INTO hotel_leads (hotel_name, owner_name, email, whatsapp_number, city, source)
-           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, hotel_name`,
+          `INSERT INTO hotel_leads (hotel_name, owner_name, email, whatsapp_number, city, source, status)
+           VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 'new')) RETURNING id, hotel_name`,
           [lead.hotel_name, lead.owner_name || '', lead.email || '',
-           lead.whatsapp_number || '', lead.city || '', lead.source || 'manual']
+           lead.whatsapp_number || '', lead.city || '', lead.source || 'manual', lead.status || null]
         );
         if (result.rows.length > 0) inserted.push(result.rows[0]);
       }

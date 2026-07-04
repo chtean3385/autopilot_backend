@@ -1,8 +1,12 @@
 const express = require('express');
 const axios = require('axios');
+const multer = require('multer');
 const LeadService = require('../services/leadService');
+const { parseLeadsFile } = require('../services/importService');
 const pool = require('../config/db');
 const router = express.Router();
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 // RAW debug: shows exact query + first result from Text Search + its Place Details
 router.get('/search-raw', async (req, res) => {
@@ -231,6 +235,19 @@ router.post('/bulk', async (req, res) => {
   const { leads } = req.body;
   const result = await LeadService.addLeads(leads);
   res.json(result);
+});
+
+// Parse an uploaded CSV/Excel file into columns + rows for the import column-mapping UI
+router.post('/import/parse', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+  try {
+    const { columns, rows } = await parseLeadsFile(req.file.buffer, req.file.originalname);
+    if (rows.length === 0) return res.status(400).json({ error: 'No data rows found in file.' });
+    res.json({ columns, rows });
+  } catch (err) {
+    console.error('[Import Parse]', err.message);
+    res.status(400).json({ error: err.message || 'Failed to parse file.' });
+  }
 });
 
 // Update full lead

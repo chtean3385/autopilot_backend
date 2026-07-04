@@ -1,6 +1,6 @@
 {
   "name": "hotel-outreach-backend",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,8 +13,12 @@
     "@anthropic-ai/sdk": "^0.107.0",
     "axios": "^1.4.0",
     "cors": "^2.8.5",
+    "csv-parse": "^7.0.1",
     "dotenv": "^16.0.3",
+    "exceljs": "^4.4.0",
     "express": "^4.18.2",
+    "fast-xml-parser": "^5.9.3",
+    "multer": "^2.2.0",
     "node-schedule": "^2.1.1",
     "openai": "^6.45.0",
     "pg": "^8.8.0"
