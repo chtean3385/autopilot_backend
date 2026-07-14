@@ -284,10 +284,10 @@ router.post('/bulk-domains', async (req, res) => {
 
   const results = await mapWithConcurrency(cleaned, BULK_DOMAIN_CONCURRENCY, async (website) => {
     try {
-      const { email, ownerName } = await findEmail({ website, hotel_name: website });
-      return { website, email, ownerName, found: !!email };
+      const { email, ownerName, phone } = await findEmail({ website, hotel_name: website });
+      return { website, email, ownerName, phone, found: !!email };
     } catch (err) {
-      return { website, email: null, ownerName: null, found: false, error: err.message };
+      return { website, email: null, ownerName: null, phone: null, found: false, error: err.message };
     }
   });
 
@@ -295,6 +295,7 @@ router.post('/bulk-domains', async (req, res) => {
     hotel_name: r.ownerName || r.website,
     owner_name: r.ownerName || '',
     email: r.email,
+    phone: r.phone || '',
     website: r.website,
     whatsapp_number: '',
     city: '',

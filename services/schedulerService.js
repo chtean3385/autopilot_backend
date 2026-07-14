@@ -681,10 +681,10 @@ async function runEmailTask(task) {
     // 2. Scrape each site for a contact email (bounded concurrency, same as bulk-domains route)
     const emailResults = await mapWithConcurrency(candidates, 4, async (c) => {
       try {
-        const { email, ownerName } = await findEmail({ website: c.website, hotel_name: c.hotel_name });
-        return { ...c, email, ownerName };
+        const { email, ownerName, phone } = await findEmail({ website: c.website, hotel_name: c.hotel_name });
+        return { ...c, email, ownerName, phone };
       } catch (err) {
-        return { ...c, email: null, ownerName: null };
+        return { ...c, email: null, ownerName: null, phone: null };
       }
     });
     const withEmail = emailResults.filter(r => r.email);
@@ -704,6 +704,7 @@ async function runEmailTask(task) {
       hotel_name: r.ownerName || r.hotel_name,
       owner_name: r.ownerName || '',
       email: r.email,
+      phone: r.phone || '',
       website: r.website,
       city: r.city,
       source: 'agent',
