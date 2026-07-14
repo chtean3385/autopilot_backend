@@ -1,72 +1,71 @@
-const axios = require('axios');
-const cheerio = require('cheerio');
 const OpenAI = require('openai');
+const { normalizeUrl, fetchPage, loadClean, cleanText, extractMailtoTel, discoverRankedLinks } = require('../utils/siteCrawler');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Fallback guesses only kick in if link-discovery below finds nothing (e.g. JS-only nav).
-const FALLBACK_PATHS = ['/contact', '/contact-us', '/contactus', '/about', '/about-us'];
-const CONTACT_LINK_PATTERN = /contact|reach.?us|get.?in.?touch|enquir(y|e)|about/i;
-const REQUEST_TIMEOUT_MS = 8000;
 const MAX_PAGE_TEXT = 3000;
-const MAX_PAGES_TO_FETCH = 5; // homepage + up to 4 more
 
-function normalizeUrl(website) {
-  const trimmed = website.trim();
-  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
-}
+// 3-step crawl budget: homepage, then at most one contact/about-tier page, then at most one
+// privacy/legal-tier fallback page — stopping early the moment a mailto email turns up. Ordered
+// highest-priority-first; pickAndFetchBestPage below picks the single best match per step rather
+// than fetching every candidate (the old approach fetched up to 5 pages per domain regardless).
+const STEP2_LINK_PRIORITY = [
+  /contact[-_]?us/i,
+  /\bcontact\b/i,
+  /get[-_]?in[-_]?touch/i,
+  /reach[-_]?us/i,
+  /\bconnect\b/i,
+  /about[-_]?us/i,
+  /\babout\b/i,
+  /\bteam\b/i,
+  /leadership/i,
+  /\bcompany\b/i,
+];
+const STEP2_FALLBACK_PATHS = [
+  '/contact', '/contact-us', '/contactus', '/contact-us.html', '/contact/',
+  '/about', '/about-us', '/team', '/leadership', '/company', '/connect', '/reach-us',
+];
 
-async function fetchPage(url) {
-  try {
-    const { data } = await axios.get(url, {
-      timeout: REQUEST_TIMEOUT_MS,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DreamsTechnologyBot/1.0)' },
-    });
-    return typeof data === 'string' ? data : null;
-  } catch {
-    return null;
-  }
-}
+// Step 3 only fires if step 2 (and the homepage) turned up no mailto email at all.
+const STEP3_LINK_PRIORITY = [
+  /privacy[-_]?policy/i,
+  /\bprivacy\b/i,
+  /\bterms\b/i,
+  /\bimprint\b/i,
+  /\blegal\b/i,
+  /\bsupport\b/i,
+];
+const STEP3_FALLBACK_PATHS = ['/privacy-policy', '/privacy', '/terms', '/imprint', '/legal', '/support'];
 
 function extractFromHtml(html) {
-  const $ = cheerio.load(html);
-  $('script, style, noscript').remove();
+  const $ = loadClean(html);
+  const { mailtoEmails, telNumbers } = extractMailtoTel(html);
 
-  const mailtoEmails = [];
-  $('a[href^="mailto:"]').each((_, el) => {
-    const email = ($(el).attr('href') || '').replace(/^mailto:/i, '').split('?')[0].trim();
-    if (email) mailtoEmails.push(email);
-  });
-
-  const telNumbers = [];
-  $('a[href^="tel:"]').each((_, el) => {
-    const tel = ($(el).attr('href') || '').replace(/^tel:/i, '').trim();
-    if (tel) telNumbers.push(tel);
-  });
-
-  const footerText = $('footer').text().replace(/\s+/g, ' ').trim().slice(0, MAX_PAGE_TEXT);
-  const bodyText = $('body').text().replace(/\s+/g, ' ').trim().slice(0, MAX_PAGE_TEXT);
+  const footerText = cleanText($('footer').text()).slice(0, MAX_PAGE_TEXT);
+  const bodyText = cleanText($('body').text()).slice(0, MAX_PAGE_TEXT);
 
   return { mailtoEmails, telNumbers, footerText, bodyText };
 }
 
-// Real sites name their contact page all sorts of things (typos included — see "conatact").
-// Rather than guessing exact paths, read the homepage's own links and follow whichever ones
-// look like a contact/about page by their href or visible text.
-function discoverContactLinks(homepageHtml, baseUrl) {
-  const $ = cheerio.load(homepageHtml);
-  const found = new Set();
-  $('a[href]').each((_, el) => {
-    const href = ($(el).attr('href') || '').trim();
-    const text = $(el).text().trim();
-    if (!href || /^(mailto|tel):/i.test(href) || href.startsWith('#')) return;
-    if (CONTACT_LINK_PATTERN.test(href) || CONTACT_LINK_PATTERN.test(text)) {
-      try {
-        found.add(new URL(href, baseUrl).toString());
-      } catch { /* malformed href, skip */ }
-    }
-  });
-  return [...found];
+// Fetches exactly one page for this crawl step: the highest-priority discovered link (ranked by
+// its position in priorityList via discoverRankedLinks), or — if link-discovery found nothing at
+// all (e.g. JS-only nav) — the first fallbackPaths guess that actually resolves. Returns null if
+// nothing worked.
+async function pickAndFetchBestPage(rankedLinks, fallbackPaths, base, fetchedUrls) {
+  const best = rankedLinks[0]?.url;
+  if (best && !fetchedUrls.has(best)) {
+    fetchedUrls.add(best);
+    const html = await fetchPage(best);
+    if (html) return { url: best, html };
+  }
+  for (const path of fallbackPaths) {
+    const url = `${base}${path}`;
+    if (fetchedUrls.has(url)) continue;
+    fetchedUrls.add(url);
+    const html = await fetchPage(url);
+    if (html) return { url, html };
+  }
+  return null;
 }
 
 async function scrapeSite(baseUrl) {
@@ -74,22 +73,24 @@ async function scrapeSite(baseUrl) {
   const pages = [];
   const fetchedUrls = new Set();
 
+  // STEP 1 — homepage. A mailto right there is as good as it gets; stop immediately.
   const homeHtml = await fetchPage(base);
-  if (homeHtml) {
-    pages.push({ path: '/', ...extractFromHtml(homeHtml) });
-    fetchedUrls.add(base);
-  }
+  if (!homeHtml) return pages;
+  fetchedUrls.add(base);
+  const homeData = extractFromHtml(homeHtml);
+  pages.push({ path: '/', ...homeData });
+  if (homeData.mailtoEmails.length > 0) return pages;
 
-  const discovered = homeHtml ? discoverContactLinks(homeHtml, base + '/') : [];
-  const candidateUrls = [...discovered, ...FALLBACK_PATHS.map(p => `${base}${p}`)];
+  // STEP 2 — single highest-priority contact/about-style page.
+  const step2Links = discoverRankedLinks(homeHtml, base + '/', STEP2_LINK_PRIORITY);
+  const step2 = await pickAndFetchBestPage(step2Links, STEP2_FALLBACK_PATHS, base, fetchedUrls);
+  if (step2) pages.push({ path: step2.url, ...extractFromHtml(step2.html) });
+  if (pages.some((p) => p.mailtoEmails.length > 0)) return pages;
 
-  for (const url of candidateUrls) {
-    if (pages.length >= MAX_PAGES_TO_FETCH) break;
-    if (fetchedUrls.has(url)) continue;
-    fetchedUrls.add(url);
-    const html = await fetchPage(url);
-    if (html) pages.push({ path: url, ...extractFromHtml(html) });
-  }
+  // STEP 3 — one last narrow attempt (privacy/terms/imprint often list a legal/support email).
+  const step3Links = discoverRankedLinks(homeHtml, base + '/', STEP3_LINK_PRIORITY);
+  const step3 = await pickAndFetchBestPage(step3Links, STEP3_FALLBACK_PATHS, base, fetchedUrls);
+  if (step3) pages.push({ path: step3.url, ...extractFromHtml(step3.html) });
 
   return pages;
 }
@@ -107,12 +108,18 @@ async function pickContactWithGpt(lead, pages, mailtoEmails, telNumbers) {
       {
         role: 'system',
         content:
-          'You extract the best contact email, phone number, and owner/decision-maker name for a business from scraped website text. ' +
-          'Reply with a JSON object: {"email": string|null, "phone": string|null, "ownerName": string|null}. ' +
-          'Prefer a named person (owner/founder/director) over a generic info@/support@ address when both are present — ' +
-          'but a generic info@/support@ email on its own is a perfectly good result, do not withhold it while searching for a name. ' +
-          'For phone, prefer a mobile/direct line over a generic switchboard number if multiple are present. ' +
-          'Only return a value that actually appears in the provided text or mailto/tel links. If nothing usable is found for a field, return null for it.',
+          'You are an expert business contact extraction agent working from already-scraped website text ' +
+          '(a homepage plus up to two secondary pages picked for likely contact info). Extract the PRIMARY business contact.\n\n' +
+          'EMAIL — when multiple candidates are present, prefer in this order: ' +
+          '(1) a named owner\'s personal email, (2) founder email, (3) director email, (4) CEO email, ' +
+          '(5) sales email, (6) business/general email, (7) info@, (8) support@. ' +
+          'Never return noreply@, no-reply@, or donotreply@ addresses.\n\n' +
+          'PHONE — return ONLY a mobile/direct/WhatsApp/cell number. Reject fax, toll-free, switchboard, ' +
+          'reception, and landline numbers. If only a landline exists, return null for phone.\n\n' +
+          'OWNER NAME — return a real person\'s name only (e.g. "John Smith"). Never return a role or team ' +
+          'label like "Admin", "Sales Team", "Support", or "Reception". If no named person appears, return null.\n\n' +
+          'Only return a value that explicitly appears in the provided mailto/tel links or page text — never guess or infer. ' +
+          'Reply with a JSON object only: {"email": string|null, "phone": string|null, "ownerName": string|null}.',
       },
       {
         role: 'user',
