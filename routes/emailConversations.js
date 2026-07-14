@@ -30,6 +30,24 @@ function attachScores(messages, scoredActions) {
   return messages;
 }
 
+// GET /api/email-conversations/count — badge count: conversations where the lead replied
+// last and nothing has gone out since (mirrors /api/inbox/count's "waiting on us" idea).
+router.get('/count', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT COUNT(*) AS count FROM (
+        SELECT DISTINCT ON (lead_id) lead_id, direction
+        FROM email_logs
+        ORDER BY lead_id, COALESCE(sent_at, created_at) DESC
+      ) latest
+      WHERE direction = 'in'
+    `);
+    res.json({ count: parseInt(result.rows[0].count, 10) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/email-conversations — one row per lead with at least one email, newest first
 router.get('/', async (req, res) => {
   try {
