@@ -299,6 +299,14 @@ async function scrapeLeads(city, count, businessType = 'businesses', filterHasWe
       { params }
     );
 
+    // Google Places returns HTTP 200 even for quota/auth/request errors — the real signal is
+    // the `status` field. Silently treating those as "0 results" (as this used to) reports a
+    // misleading "no leads found" when the actual cause is e.g. a quota cap or a bad API key.
+    const apiStatus = searchResp.data.status;
+    if (apiStatus !== 'OK' && apiStatus !== 'ZERO_RESULTS') {
+      throw new Error(`Google Places API error: ${apiStatus}${searchResp.data.error_message ? ' — ' + searchResp.data.error_message : ''}`);
+    }
+
     const pageResults = searchResp.data.results || [];
     pageToken = searchResp.data.next_page_token || null;
     rawCount += pageResults.length;
@@ -425,6 +433,11 @@ async function scrapePlacesForWebsites(city, count, businessType = 'businesses')
       'https://maps.googleapis.com/maps/api/place/textsearch/json',
       { params }
     );
+
+    const apiStatus = searchResp.data.status;
+    if (apiStatus !== 'OK' && apiStatus !== 'ZERO_RESULTS') {
+      throw new Error(`Google Places API error: ${apiStatus}${searchResp.data.error_message ? ' — ' + searchResp.data.error_message : ''}`);
+    }
 
     const pageResults = searchResp.data.results || [];
     pageToken = searchResp.data.next_page_token || null;
