@@ -234,6 +234,10 @@ router.get('/', async (req, res) => {
          JOIN campaigns c ON c.id = ol.campaign_id
          WHERE ol.lead_id = hl.id
          ORDER BY ol.sent_at DESC LIMIT 1) AS last_campaign,
+        (SELECT s.name FROM lead_sequences ls JOIN sequences s ON s.id = ls.sequence_id
+         WHERE ls.lead_id = hl.id ORDER BY ls.created_at DESC LIMIT 1) AS sequence_name,
+        (SELECT ls.status FROM lead_sequences ls
+         WHERE ls.lead_id = hl.id ORDER BY ls.created_at DESC LIMIT 1) AS sequence_status,
         EXISTS(SELECT 1 FROM outreach_logs WHERE lead_id = hl.id) AS message_sent
       FROM hotel_leads hl
       ${where}
@@ -313,14 +317,23 @@ router.post('/bulk-domains', async (req, res) => {
 });
 
 // Update full lead
+// email_status is COALESCEd rather than overwritten unconditionally — it's an override path
+// for when mails.so returns 'risky'/'unknown' on a real, catch-all-hosted address (the automatic
+// verifier can't tell that apart from a genuine bounce); omitting it must leave the stored
+// verifier result untouched rather than nulling it out.
+const EMAIL_STATUS_VALUES = ['found', 'verified', 'unverifiable', 'unknown'];
 router.put('/:id', async (req, res) => {
-  const { hotel_name, owner_name, whatsapp_number, email, city, status } = req.body;
+  const { hotel_name, owner_name, whatsapp_number, email, city, status, email_status } = req.body;
+  if (email_status !== undefined && email_status !== null && !EMAIL_STATUS_VALUES.includes(email_status)) {
+    return res.status(400).json({ error: `email_status must be one of: ${EMAIL_STATUS_VALUES.join(', ')}` });
+  }
   try {
     const result = await pool.query(
       `UPDATE hotel_leads
-       SET hotel_name=$1, owner_name=$2, whatsapp_number=$3, email=$4, city=$5, status=$6, updated_at=NOW()
-       WHERE id=$7 RETURNING *`,
-      [hotel_name, owner_name, whatsapp_number, email, city, status, req.params.id]
+       SET hotel_name=$1, owner_name=$2, whatsapp_number=$3, email=$4, city=$5, status=$6,
+           email_status=COALESCE($7, email_status), updated_at=NOW()
+       WHERE id=$8 RETURNING *`,
+      [hotel_name, owner_name, whatsapp_number, email, city, status, email_status || null, req.params.id]
     );
     res.json(result.rows[0]);
   } catch (err) {
