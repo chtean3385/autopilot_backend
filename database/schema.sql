@@ -273,6 +273,22 @@ CREATE TABLE IF NOT EXISTS playbook_examples (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Cached per-lead website research + audit + drafted cold email (leadResearchService.js)
+CREATE TABLE IF NOT EXISTS lead_research (
+  id SERIAL PRIMARY KEY,
+  lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,
+  business_profile JSON,
+  website_audit JSON,
+  pain_points JSON,
+  opportunities JSON,
+  recommended_services JSON,
+  email_subject VARCHAR(500),
+  email_body TEXT,
+  confidence VARCHAR(20),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_research_lead_id ON lead_research(lead_id);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_leads_city ON hotel_leads(city);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON hotel_leads(status);
