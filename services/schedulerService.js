@@ -4,6 +4,8 @@ const OpenAI = require('openai');
 const pool = require('../config/db');
 const WABAService = require('./wabaService');
 const LeadService = require('./leadService');
+const { findEmail } = require('./enrichmentService');
+const SequenceService = require('./sequenceService');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -30,6 +32,14 @@ pool.query(`
   console.log('[Scheduler] agent_tasks table ready');
   // Fix 2: migrate pre-approval-gate tasks so cron doesn't run them without user review
   await pool.query(`UPDATE agent_tasks SET status='needs_approval' WHERE status='pending' AND parsed_params IS NULL`);
+  // Email-channel agent tasks: same table, extra columns (no campaign/template concept for email —
+  // discovery auto-enrolls straight into a sequence instead of a reviewed WhatsApp send step).
+  await pool.query(`ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS channel VARCHAR(20) DEFAULT 'whatsapp'`);
+  await pool.query(`ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS sequence_id INTEGER REFERENCES sequences(id)`);
+  await pool.query(`ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS group_id INTEGER REFERENCES lead_groups(id)`);
+  await pool.query(`ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS emails_found INTEGER DEFAULT 0`);
+  await pool.query(`ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS emails_verified INTEGER DEFAULT 0`);
+  await pool.query(`ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS leads_enrolled INTEGER DEFAULT 0`);
 }).catch(err => console.error('[Scheduler] Table init error:', err.message));
 
 // Refine the user's instruction using GPT.
@@ -136,6 +146,66 @@ Now respond with JSON only for the user's actual instruction:`
 async function parseInstruction(instruction) {
   const r = await refineInstruction(instruction);
   return r.parsed;
+}
+
+// Same idea as refineInstruction, but for the email channel: no WhatsApp bot system prompt
+// to generate, no website/review filters (a website is *required* for email discovery — no
+// website means there's nowhere to scrape a contact email from, so that's implicit, not a filter).
+async function refineEmailInstruction(instruction) {
+  try {
+    const res = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 500,
+      messages: [
+        {
+          role: 'system',
+          content: `You are a lead generation assistant for an Indian B2B cold-email outreach tool called Dreams Technology.
+
+What the tool CAN do:
+- Search any business type in any Indian city via Google Places
+- Only businesses with a website listed on Google are usable (their site gets scraped for a contact email — no website means no email can be found)
+- Scrape each business's website and use GPT to extract the best contact email + owner name
+- Verify each email with a deliverability checker before it's allowed into a sequence
+- Auto-enroll verified leads into a follow-up email sequence that sends and follows up forever until they reply or opt out
+
+What it CANNOT do:
+- Search outside India
+- Find emails for businesses without a website
+- Send WhatsApp messages or make calls
+
+Your job:
+1. Fix typos and grammar in the instruction — do NOT add words that are not in the original
+2. Extract business type, city, and count (how many leads to find) from the instruction
+3. Keep the user's original intent exactly — do NOT add filters or conditions they did not mention
+4. If city is completely missing, note it in refinementNote
+
+Respond with JSON only: {"refinedInstruction": string, "refinementNote": string, "parsed": {"businessType": string, "city": string, "count": number}, "canRun": boolean}`
+        },
+        { role: 'user', content: instruction }
+      ],
+      response_format: { type: 'json_object' },
+    });
+    const result = JSON.parse(res.choices[0].message.content);
+    return {
+      refinedInstruction: result.refinedInstruction || instruction,
+      refinementNote: result.refinementNote || '',
+      parsed: result.parsed || {},
+      canRun: result.canRun !== false,
+    };
+  } catch (err) {
+    console.error('[Scheduler] refineEmailInstruction error:', err.message);
+    const countMatch = instruction.match(/\b(\d+)\b/);
+    const count = countMatch ? parseInt(countMatch[1]) : 20;
+    const words = instruction.split(/\s+/);
+    const inIdx = words.findIndex(w => w.toLowerCase() === 'in');
+    const city = inIdx !== -1 ? words[inIdx + 1]?.replace(/[^a-zA-Z]/g, '') : '';
+    return {
+      refinedInstruction: instruction,
+      refinementNote: 'GPT unavailable — using instruction as-is.',
+      parsed: { businessType: 'businesses', city, count },
+      canRun: !!city,
+    };
+  }
 }
 
 // Normalize raw phone → 12-digit WhatsApp-ready Indian mobile (91XXXXXXXXXX)
@@ -306,6 +376,104 @@ async function scrapeLeads(city, count, businessType = 'businesses', filterHasWe
   };
 }
 
+// Runs fn over items with at most `limit` in flight at once (same pattern as routes/leads.js's
+// bulk-domains concurrency helper — kept local since it's a tiny, generic 10-liner).
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+// Email-channel equivalent of scrapeLeads: no phone/mobile requirement (email doesn't need one),
+// but a website IS required since that's the only way to find a contact email. Stops once we have
+// `count` businesses with a website OR Google runs out of pages.
+async function scrapePlacesForWebsites(city, count, businessType = 'businesses') {
+  const googleKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!googleKey) throw new Error('GOOGLE_PLACES_API_KEY not set');
+
+  const searchQuery = `${businessType} in ${city}`;
+  console.log(`[EmailScraper] Searching: "${searchQuery}" — need ${count} leads with a website`);
+
+  const extractCity = (address, fallback) => {
+    if (!address) return fallback || '';
+    const parts = address.split(',').map(s => s.trim()).filter(Boolean);
+    for (let i = parts.length - 2; i >= 0; i--) {
+      if (!/\d{4,}/.test(parts[i]) && parts[i].length > 2) return parts[i];
+    }
+    return fallback || '';
+  };
+
+  const candidates = [];
+  let rawCount = 0;
+  let noWebsiteCount = 0;
+  let pageToken = null;
+  let pageNum = 0;
+
+  do {
+    pageNum++;
+    const params = { query: searchQuery, key: googleKey, language: 'en', region: 'in' };
+    if (pageToken) params.pagetoken = pageToken;
+
+    const searchResp = await axios.get(
+      'https://maps.googleapis.com/maps/api/place/textsearch/json',
+      { params }
+    );
+
+    const pageResults = searchResp.data.results || [];
+    pageToken = searchResp.data.next_page_token || null;
+    rawCount += pageResults.length;
+
+    console.log(`[EmailScraper] Page ${pageNum}: ${pageResults.length} results from Google (${candidates.length}/${count} with website so far)`);
+
+    const detailed = await Promise.allSettled(
+      pageResults.map(r =>
+        axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
+          params: { place_id: r.place_id, fields: 'name,website', key: googleKey, language: 'en' }
+        })
+      )
+    );
+
+    for (let i = 0; i < pageResults.length; i++) {
+      if (candidates.length >= count) break;
+
+      const r = pageResults[i];
+      const detail = detailed[i].status === 'fulfilled' ? detailed[i].value.data.result : {};
+
+      if (!detail.website) {
+        noWebsiteCount++;
+        console.log(`[EmailScraper] Skip "${r.name}" — no website`);
+        continue;
+      }
+
+      candidates.push({
+        hotel_name: r.name || '',
+        website: detail.website,
+        city: extractCity(r.formatted_address, city),
+        business_category: businessType,
+      });
+    }
+
+    if (pageToken && candidates.length < count) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+
+  } while (pageToken && candidates.length < count);
+
+  console.log(`[EmailScraper] Done — Google returned ${rawCount} total | No website: ${noWebsiteCount} | With website: ${candidates.length}/${count} requested`);
+
+  return {
+    candidates,
+    stats: { rawFromGoogle: rawCount, noWebsite: noWebsiteCount, withWebsite: candidates.length },
+  };
+}
+
 // Save leads, skip duplicates by whatsapp_number or (business_name + city).
 // Returns array of saved lead IDs.
 async function saveLeads(leads) {
@@ -460,6 +628,107 @@ async function runTask(task) {
   }
 }
 
+// Email-channel equivalent of runTask, end-to-end and fully automatic (no preview/send-review
+// step — the owner decided auto-enroll is the right default): Places search for businesses with
+// a website → scrape each site for a contact email → verify + store (LeadService.addLeads does
+// the verification) → auto-enroll every verified lead into the sequence chosen when the task was
+// created. From here sequenceEmailWorker/emailReplyWorker take over forever with zero more clicks.
+async function runEmailTask(task) {
+  const taskId = task.id;
+
+  const claim = await pool.query(
+    `UPDATE agent_tasks SET status='running', started_at=NOW() WHERE id=$1 AND status='pending' RETURNING id`,
+    [taskId]
+  );
+  if (claim.rowCount === 0) {
+    console.log(`[Scheduler] Email task ${taskId} already claimed by another process — skipping`);
+    return;
+  }
+
+  try {
+    console.log(`[Scheduler] Email task ${taskId}: "${task.instruction}"`);
+
+    let parsedParams = task.parsed_params;
+    if (typeof parsedParams === 'string') parsedParams = JSON.parse(parsedParams);
+    if (!parsedParams || !parsedParams.city) {
+      const refined = await refineEmailInstruction(task.instruction);
+      parsedParams = refined.parsed;
+    }
+
+    const { city, count, businessType = 'businesses' } = parsedParams;
+    if (!city) throw new Error('City could not be determined from instruction. Please specify a city name.');
+    if (!task.sequence_id) throw new Error('No sequence selected for this task — pick one before approving.');
+
+    const leadCount = task.lead_count || count || 20;
+    console.log(`[Scheduler] Email params → businessType="${businessType}" city="${city}" count=${leadCount}`);
+
+    // 1. Find businesses with a website via Google Places
+    const { candidates, stats } = await scrapePlacesForWebsites(city, leadCount, businessType);
+
+    // 2. Scrape each site for a contact email (bounded concurrency, same as bulk-domains route)
+    const emailResults = await mapWithConcurrency(candidates, 4, async (c) => {
+      try {
+        const { email, ownerName } = await findEmail({ website: c.website, hotel_name: c.hotel_name });
+        return { ...c, email, ownerName };
+      } catch (err) {
+        return { ...c, email: null, ownerName: null };
+      }
+    });
+    const withEmail = emailResults.filter(r => r.email);
+
+    if (withEmail.length === 0) {
+      await pool.query(
+        `UPDATE agent_tasks SET status='done', completed_at=NOW(), leads_scraped=$1, emails_found=0,
+         emails_verified=0, leads_enrolled=0,
+         error_message=$2 WHERE id=$3`,
+        [stats.rawFromGoogle, `No emails found — Google returned ${stats.rawFromGoogle} results but ${stats.noWebsite} had no website, and none of the rest had a scrapeable contact email`, taskId]
+      );
+      return;
+    }
+
+    // 3. Store — LeadService.addLeads verifies each email and dedupes by email address
+    const toInsert = withEmail.map(r => ({
+      hotel_name: r.ownerName || r.hotel_name,
+      owner_name: r.ownerName || '',
+      email: r.email,
+      website: r.website,
+      city: r.city,
+      source: 'agent',
+      business_category: r.business_category,
+      channel: 'email',
+      email_source: 'agent',
+    }));
+    const insertResult = await LeadService.addLeads(toInsert);
+    const verifiedIds = insertResult.inserted.filter(l => l.email_status === 'verified').map(l => l.id);
+
+    // 4. Group (for the task's "view leads" panel) + auto-enroll verified leads into the sequence
+    const allSavedIds = insertResult.inserted.map(l => l.id);
+    const groupId = await upsertCityGroup(city, businessType, allSavedIds);
+
+    let enrolled = 0;
+    if (verifiedIds.length > 0) {
+      const enrollResult = await SequenceService.enrollLeads(task.sequence_id, verifiedIds);
+      enrolled = enrollResult.enrolled || 0;
+    }
+
+    await pool.query(
+      `UPDATE agent_tasks SET status='done', completed_at=NOW(),
+       leads_scraped=$1, emails_found=$2, leads_saved=$3, emails_verified=$4, leads_enrolled=$5, group_id=$6
+       WHERE id=$7`,
+      [stats.rawFromGoogle, withEmail.length, insertResult.added, verifiedIds.length, enrolled, groupId, taskId]
+    );
+
+    console.log(`[Scheduler] Email task ${taskId} done — found:${withEmail.length} saved:${insertResult.added} verified:${verifiedIds.length} enrolled:${enrolled}`);
+
+  } catch (err) {
+    console.error(`[Scheduler] Email task ${taskId} failed:`, err.message);
+    await pool.query(
+      `UPDATE agent_tasks SET status='failed', completed_at=NOW(), error_message=$1 WHERE id=$2`,
+      [err.message, taskId]
+    );
+  }
+}
+
 // Phase 2: send WhatsApp messages to leads in the task's campaign group.
 // Called by admin after reviewing the lead list.
 async function sendTask(taskId) {
@@ -519,24 +788,26 @@ async function sendTask(taskId) {
   }
 }
 
-// Follow up with leads that haven't responded.
-// Runs daily: sends follow-up every 2 days, up to 5 follow-ups (10 days total).
-// After 5 follow-ups with no response → mark as 'dead'.
+// Follow up with leads that haven't responded, and re-engage stalled conversations.
+// Runs daily: sends follow-up every 2 days, up to 6 template touches total.
+// 'new' leads (never replied) → 'dead' after the cap.
+// 'responded' leads (replied, then went quiet) → 'stalled' after the cap.
 async function runFollowUps() {
   console.log('[FollowUp] Checking leads for follow-up...');
 
   try {
     // Leads that:
-    // - status = 'new' (no response yet, not opted out, not dead)
+    // - status 'new' (never replied) or 'responded' (conversation went quiet)
     // - have at least 1 prior outreach
-    // - last outreach was >= 2 days ago
+    // - nothing sent to them in the last 2 days
+    // Cap counts template sends only — agent conversation replies don't count.
     const result = await pool.query(`
       SELECT hl.*,
-             COUNT(ol.id)::int      AS outreach_count,
+             COUNT(ol.id) FILTER (WHERE ol.message_type = 'template')::int AS template_count,
              MAX(ol.sent_at)        AS last_outreach
       FROM hotel_leads hl
       INNER JOIN outreach_logs ol ON ol.lead_id = hl.id
-      WHERE hl.status = 'new'
+      WHERE hl.status IN ('new', 'responded')
         AND hl.whatsapp_number IS NOT NULL
       GROUP BY hl.id
       HAVING MAX(ol.sent_at) <= NOW() - INTERVAL '2 days'
@@ -547,15 +818,16 @@ async function runFollowUps() {
     const template = await getApprovedTemplate(null);
 
     for (const lead of result.rows) {
-      const outreachCount = lead.outreach_count;
+      const outreachCount = lead.template_count;
 
-      // 1 initial + 5 follow-ups = 6 total contacts over 10 days
+      // 1 initial + 5 follow-ups = 6 template touches max
       if (outreachCount >= 6) {
+        const finalStatus = lead.status === 'responded' ? 'stalled' : 'dead';
         await pool.query(
-          `UPDATE hotel_leads SET status='dead', updated_at=NOW() WHERE id=$1`,
-          [lead.id]
+          `UPDATE hotel_leads SET status=$1, updated_at=NOW() WHERE id=$2`,
+          [finalStatus, lead.id]
         );
-        console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" → dead (${outreachCount} contacts, no response)`);
+        console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" → ${finalStatus} (${outreachCount} template sends, no response)`);
         continue;
       }
 
@@ -591,6 +863,8 @@ schedule.scheduleJob('* * * * *', async () => {
       const task = result.rows[0];
       if (task.status === 'scheduled_send') {
         await sendTask(task.id);
+      } else if (task.channel === 'email') {
+        await runEmailTask(task);
       } else {
         await runTask(task);
       }
@@ -602,11 +876,15 @@ schedule.scheduleJob('* * * * *', async () => {
   }
 });
 
-// Daily at 10:00 AM — follow up with non-responding leads
-schedule.scheduleJob('0 10 * * *', async () => {
+// Daily at 10:00 AM IST — follow up with non-responding leads
+// (explicit tz because Render/most hosts run the container clock in UTC)
+schedule.scheduleJob({ rule: '0 10 * * *', tz: 'Asia/Kolkata' }, async () => {
   await runFollowUps();
 });
 
 console.log('🤖 Agent scheduler started — checks every minute for tasks, daily follow-ups at 10AM');
 
-module.exports = { runTask, sendTask, parseInstruction, refineInstruction, runFollowUps };
+module.exports = {
+  runTask, sendTask, parseInstruction, refineInstruction, runFollowUps,
+  runEmailTask, refineEmailInstruction,
+};

@@ -155,6 +155,7 @@ app.use(express.json());
 
 // Routes
 app.use('/webhook', require('./routes/webhook'));
+app.use('/unsubscribe', require('./routes/unsubscribe'));
 app.use('/api/leads', require('./routes/leads'));
 app.use('/api/campaigns', require('./routes/campaigns'));
 app.use('/api/templates', require('./routes/templates'));
@@ -163,6 +164,11 @@ app.use('/api/inbox', require('./routes/inbox'));
 app.use('/api/agent', require('./routes/agent'));
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/settings', require('./routes/settings'));
+app.use('/api/email-senders', require('./routes/emailSenders'));
+app.use('/api/sequences', require('./routes/sequences'));
+app.use('/api/estimates', require('./routes/estimates'));
+app.use('/api/portfolio-items', require('./routes/portfolio'));
+app.use('/api/email-conversations', require('./routes/emailConversations'));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -171,6 +177,9 @@ app.get('/health', (req, res) => {
 
 // Start background workers
 require('./workers/campaignWorker');
+require('./workers/sequenceEmailWorker');
+require('./workers/emailReplyWorker');
+require('./workers/playbookInsightsWorker');
 require('./services/schedulerService');
 
 const PORT = process.env.PORT || 5000;

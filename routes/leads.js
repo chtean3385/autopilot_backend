@@ -3,10 +3,28 @@ const axios = require('axios');
 const multer = require('multer');
 const LeadService = require('../services/leadService');
 const { parseLeadsFile } = require('../services/importService');
+const { findEmail } = require('../services/enrichmentService');
 const pool = require('../config/db');
 const router = express.Router();
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+const MAX_BULK_DOMAINS = 50;
+const BULK_DOMAIN_CONCURRENCY = 4;
+
+// Runs fn over items with at most `limit` in flight at once.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
 
 // RAW debug: shows exact query + first result from Text Search + its Place Details
 router.get('/search-raw', async (req, res) => {
@@ -158,7 +176,7 @@ router.get('/search', async (req, res) => {
 
 // Get all leads — paginated, enriched with score + group + campaign + message_sent
 router.get('/', async (req, res) => {
-  const { city, status, q, page = 1, pageSize = 25 } = req.query;
+  const { city, status, q, channel, page = 1, pageSize = 25 } = req.query;
   const limit = Math.min(Math.max(Number(pageSize) || 25, 1), 100);
   const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
@@ -172,6 +190,7 @@ router.get('/', async (req, res) => {
 
   if (city) conditions.push(`hl.city ILIKE ${addParam(`%${city}%`)}`);
   if (status) conditions.push(`hl.status = ${addParam(status)}`);
+  if (channel) conditions.push(`hl.channel = ${addParam(channel)}`);
   if (q) {
     const p = addParam(`%${q}%`);
     conditions.push(`(hl.hotel_name ILIKE ${p} OR hl.whatsapp_number LIKE ${p} OR hl.owner_name ILIKE ${p})`);
@@ -248,6 +267,48 @@ router.post('/import/parse', upload.single('file'), async (req, res) => {
     console.error('[Import Parse]', err.message);
     res.status(400).json({ error: err.message || 'Failed to parse file.' });
   }
+});
+
+// Bulk domain list — owner pastes company domains/websites, agent scrapes each for a
+// contact email via enrichmentService and saves the found ones as channel='email' leads.
+router.post('/bulk-domains', async (req, res) => {
+  const { domains } = req.body;
+  if (!Array.isArray(domains) || domains.length === 0) {
+    return res.status(400).json({ error: 'No domains provided.' });
+  }
+  const cleaned = [...new Set(domains.map(d => String(d || '').trim()).filter(Boolean))];
+  if (cleaned.length === 0) return res.status(400).json({ error: 'No valid domains provided.' });
+  if (cleaned.length > MAX_BULK_DOMAINS) {
+    return res.status(400).json({ error: `Too many domains — max ${MAX_BULK_DOMAINS} per request.` });
+  }
+
+  const results = await mapWithConcurrency(cleaned, BULK_DOMAIN_CONCURRENCY, async (website) => {
+    try {
+      const { email, ownerName } = await findEmail({ website, hotel_name: website });
+      return { website, email, ownerName, found: !!email };
+    } catch (err) {
+      return { website, email: null, ownerName: null, found: false, error: err.message };
+    }
+  });
+
+  const toInsert = results.filter(r => r.found).map(r => ({
+    hotel_name: r.ownerName || r.website,
+    owner_name: r.ownerName || '',
+    email: r.email,
+    website: r.website,
+    whatsapp_number: '',
+    city: '',
+    source: 'domain_list',
+    channel: 'email',
+    email_source: 'domain_list',
+    email_status: 'found',
+  }));
+
+  const insertResult = toInsert.length > 0
+    ? await LeadService.addLeads(toInsert)
+    : { success: true, added: 0, skipped: 0, inserted: [], skippedList: [] };
+
+  res.json({ results, ...insertResult });
 });
 
 // Update full lead

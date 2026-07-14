@@ -12,14 +12,18 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.107.0",
     "axios": "^1.4.0",
+    "cheerio": "^1.2.0",
     "cors": "^2.8.5",
     "csv-parse": "^7.0.1",
     "dotenv": "^16.0.3",
     "exceljs": "^4.4.0",
     "express": "^4.18.2",
     "fast-xml-parser": "^5.9.3",
+    "imapflow": "^1.4.6",
+    "mailparser": "^3.9.14",
     "multer": "^2.2.0",
     "node-schedule": "^2.1.1",
+    "nodemailer": "^9.0.3",
     "openai": "^6.45.0",
     "pg": "^8.8.0"
   },

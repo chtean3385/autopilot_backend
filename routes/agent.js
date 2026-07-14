@@ -1,17 +1,28 @@
 const express = require('express');
 const pool = require('../config/db');
-const { runTask, sendTask, refineInstruction } = require('../services/schedulerService');
+const { runTask, sendTask, refineInstruction, refineEmailInstruction, runEmailTask, runFollowUps } = require('../services/schedulerService');
 const WABAService = require('../services/wabaService');
 const router = express.Router();
+
+// Manually trigger the daily follow-up job (testing / catch-up if the 10AM cron was missed)
+router.post('/run-followups', async (req, res) => {
+  try {
+    await runFollowUps();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // List all tasks (newest first)
 router.get('/tasks', async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT at.*, t.template_name, c.campaign_name
+      SELECT at.*, t.template_name, c.campaign_name, s.name AS sequence_name
       FROM agent_tasks at
       LEFT JOIN waba_templates t ON at.template_id = t.id
       LEFT JOIN campaigns c ON at.campaign_id = c.id
+      LEFT JOIN sequences s ON at.sequence_id = s.id
       ORDER BY at.created_at DESC
       LIMIT 50
     `);
@@ -21,20 +32,28 @@ router.get('/tasks', async (req, res) => {
   }
 });
 
-// Create task — GPT refines instruction, waits for user approval before running
+// Create task — GPT refines instruction, waits for user approval before running.
+// channel='email' requires sequence_id (auto-enrolled into it once leads are found+verified).
 router.post('/tasks', async (req, res) => {
-  const { instruction, template_id, lead_count, schedule, custom_time, filters } = req.body;
+  const { instruction, template_id, lead_count, schedule, custom_time, filters, channel, sequence_id } = req.body;
   if (!instruction?.trim()) return res.status(400).json({ error: 'Instruction is required' });
+  if (channel === 'email' && !sequence_id) {
+    return res.status(400).json({ error: 'sequence_id is required for email tasks' });
+  }
 
   try {
-    const refined = await refineInstruction(instruction.trim());
+    const refined = channel === 'email'
+      ? await refineEmailInstruction(instruction.trim())
+      : await refineInstruction(instruction.trim());
 
-    // Explicit UI filters always override what GPT parsed from text
-    const parsedParams = {
-      ...refined.parsed,
-      filterHasWebsite: filters?.filterHasWebsite === true ? true : (refined.parsed?.filterHasWebsite || false),
-      maxReviews: filters?.maxReviews || null,
-    };
+    // Explicit UI filters always override what GPT parsed from text (WhatsApp only)
+    const parsedParams = channel === 'email'
+      ? { ...refined.parsed }
+      : {
+          ...refined.parsed,
+          filterHasWebsite: filters?.filterHasWebsite === true ? true : (refined.parsed?.filterHasWebsite || false),
+          maxReviews: filters?.maxReviews || null,
+        };
 
     let runAt = new Date();
     if (schedule === 'custom' && custom_time) runAt = new Date(custom_time);
@@ -42,8 +61,8 @@ router.post('/tasks', async (req, res) => {
     const result = await pool.query(
       `INSERT INTO agent_tasks
          (instruction, refined_instruction, refinement_note, city, lead_count,
-          template_id, status, run_at, parsed_params, system_prompt)
-       VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9)
+          template_id, status, run_at, parsed_params, system_prompt, channel, sequence_id)
+       VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9, $10, $11)
        RETURNING *`,
       [
         instruction.trim(),
@@ -55,6 +74,8 @@ router.post('/tasks', async (req, res) => {
         runAt,
         JSON.stringify(parsedParams),
         refined.systemPrompt || null,
+        channel === 'email' ? 'email' : 'whatsapp',
+        channel === 'email' ? sequence_id : null,
       ]
     );
 
@@ -79,9 +100,13 @@ router.post('/tasks/:id/approve', async (req, res) => {
 
     const readyTask = updated.rows[0];
     // Fix 6: only fire immediately if the scheduled time has passed; otherwise let cron handle it
-    // Fix 1: runTask uses a CAS update so even if cron fires first, only one wins
+    // Fix 1: runTask/runEmailTask uses a CAS update so even if cron fires first, only one wins
     if (new Date(readyTask.run_at) <= new Date()) {
-      runTask(readyTask).catch(e => console.error('[Agent Route] runTask error:', e.message));
+      if (readyTask.channel === 'email') {
+        runEmailTask(readyTask).catch(e => console.error('[Agent Route] runEmailTask error:', e.message));
+      } else {
+        runTask(readyTask).catch(e => console.error('[Agent Route] runTask error:', e.message));
+      }
     }
 
     res.json({ success: true, task: readyTask });
@@ -101,7 +126,9 @@ router.post('/tasks/:id/revise', async (req, res) => {
     if (!task) return res.status(404).json({ error: 'Task not found' });
     if (task.status !== 'needs_approval') return res.status(400).json({ error: 'Task is not in approval state' });
 
-    const refined = await refineInstruction(instruction.trim());
+    const refined = task.channel === 'email'
+      ? await refineEmailInstruction(instruction.trim())
+      : await refineInstruction(instruction.trim());
 
     const updated = await pool.query(
       `UPDATE agent_tasks
@@ -129,10 +156,11 @@ router.post('/tasks/:id/revise', async (req, res) => {
 router.get('/tasks/:id', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT at.*, t.template_name, c.campaign_name
+      `SELECT at.*, t.template_name, c.campaign_name, s.name AS sequence_name
        FROM agent_tasks at
        LEFT JOIN waba_templates t ON at.template_id = t.id
        LEFT JOIN campaigns c ON at.campaign_id = c.id
+       LEFT JOIN sequences s ON at.sequence_id = s.id
        WHERE at.id = $1`,
       [req.params.id]
     );
@@ -143,15 +171,21 @@ router.get('/tasks/:id', async (req, res) => {
   }
 });
 
-// List leads captured for a preview-state task (for admin review before sending)
+// List leads captured by a task — for WhatsApp's preview-state admin review before sending,
+// or (for email tasks, which auto-enroll) just to see what a completed task actually found.
+// WhatsApp tasks reach their group via campaigns.group_id; email tasks store group_id directly.
+// Note: WhatsApp-channel leads repurpose the `email` column to hold the scraped website (legacy
+// behavior in scrapeLeads/saveLeads) — COALESCE keeps that working via `website` while
+// `contact_email` exposes the real address for email-channel leads without conflating the two.
 router.get('/tasks/:id/leads', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT hl.id, hl.hotel_name, hl.whatsapp_number, hl.phone, hl.city,
-              hl.business_category, hl.email AS website, hl.status, hl.created_at
+      `SELECT hl.id, hl.hotel_name, hl.whatsapp_number, hl.phone, hl.city, hl.channel,
+              hl.business_category, COALESCE(NULLIF(hl.website, ''), hl.email) AS website,
+              hl.email AS contact_email, hl.email_status, hl.status, hl.created_at
        FROM agent_tasks at
-       JOIN campaigns c ON at.campaign_id = c.id
-       JOIN lead_group_members lgm ON lgm.group_id = c.group_id
+       LEFT JOIN campaigns c ON at.campaign_id = c.id
+       JOIN lead_group_members lgm ON lgm.group_id = COALESCE(c.group_id, at.group_id)
        JOIN hotel_leads hl ON lgm.lead_id = hl.id
        WHERE at.id = $1
        ORDER BY hl.created_at DESC`,

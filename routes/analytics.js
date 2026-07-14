@@ -76,4 +76,70 @@ router.get('/health', async (req, res) => {
   }
 });
 
+// Email channel analytics: per-sender-domain health, per-sequence funnel, agent activity feed
+router.get('/email', async (req, res) => {
+  try {
+    const [senderHealthRes, sequenceFunnelRes, activityFeedRes] = await Promise.all([
+      pool.query(`
+        SELECT
+          es.id, es.label, es.from_email, es.sending_domain, es.provider, es.status,
+          COUNT(*) FILTER (WHERE el.direction = 'out')::int                              AS sent,
+          COUNT(*) FILTER (WHERE el.direction = 'out' AND el.error IS NULL)::int          AS delivered,
+          COUNT(*) FILTER (WHERE el.direction = 'out' AND el.opened_at IS NOT NULL)::int  AS opened,
+          COUNT(*) FILTER (WHERE el.direction = 'in')::int                                AS replied,
+          COUNT(*) FILTER (WHERE el.direction = 'out' AND el.bounced_at IS NOT NULL)::int AS bounced
+        FROM email_senders es
+        LEFT JOIN email_logs el ON el.sender_id = es.id
+        GROUP BY es.id, es.label, es.from_email, es.sending_domain, es.provider, es.status
+        ORDER BY es.created_at DESC
+      `),
+      pool.query(`
+        WITH log_stats AS (
+          SELECT sequence_id,
+            COUNT(*) FILTER (WHERE direction = 'out')::int                     AS sent,
+            COUNT(*) FILTER (WHERE direction = 'out' AND error IS NULL)::int   AS delivered,
+            COUNT(*) FILTER (WHERE direction = 'in')::int                      AS replied
+          FROM email_logs
+          GROUP BY sequence_id
+        ),
+        enrollment_stats AS (
+          SELECT sequence_id,
+            COUNT(DISTINCT lead_id)::int                                          AS leads_enrolled,
+            COUNT(DISTINCT lead_id) FILTER (WHERE status = 'dead')::int           AS dead,
+            COUNT(DISTINCT lead_id) FILTER (WHERE status = 'waiting_estimate')::int AS waiting_estimate
+          FROM lead_sequences
+          GROUP BY sequence_id
+        )
+        SELECT
+          s.id, s.name, s.active, s.daily_send_limit, s.recurring_interval_days,
+          COALESCE(en.leads_enrolled, 0)   AS leads_enrolled,
+          COALESCE(en.dead, 0)             AS dead,
+          COALESCE(en.waiting_estimate, 0) AS waiting_estimate,
+          COALESCE(ls.sent, 0)             AS sent,
+          COALESCE(ls.delivered, 0)        AS delivered,
+          COALESCE(ls.replied, 0)          AS replied
+        FROM sequences s
+        LEFT JOIN log_stats ls ON ls.sequence_id = s.id
+        LEFT JOIN enrollment_stats en ON en.sequence_id = s.id
+        ORDER BY s.created_at DESC
+      `),
+      pool.query(`
+        SELECT aa.id, aa.lead_id, aa.action, aa.detail, aa.score, aa.decision, aa.created_at, hl.hotel_name
+        FROM agent_actions aa
+        LEFT JOIN hotel_leads hl ON hl.id = aa.lead_id
+        ORDER BY aa.created_at DESC
+        LIMIT 50
+      `),
+    ]);
+
+    res.json({
+      senderHealth: senderHealthRes.rows,
+      sequenceFunnel: sequenceFunnelRes.rows,
+      activityFeed: activityFeedRes.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

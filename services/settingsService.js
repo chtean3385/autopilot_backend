@@ -10,6 +10,11 @@ const SETTINGS_DEFS = [
   { key: 'OPENAI_API_KEY',           category: 'OpenAI',          description: 'OpenAI API Key (agent brain)', sensitive: true },
   { key: 'DEMO_LINK',                category: 'App',             description: 'Demo booking link (used as {{4}} in templates)' },
   { key: 'OWNER_WHATSAPP',           category: 'App',             description: 'Your WhatsApp number in E.164 format (no +)' },
+  { key: 'HUNTER_API_KEY',           category: 'Email',           description: 'Hunter.io API key (email discovery fallback)', sensitive: true },
+  { key: 'VERIFIER_API_KEY',         category: 'Email',           description: 'mails.so / verifier API key (mandatory pre-send email verification)', sensitive: true },
+  { key: 'OWNER_NOTIFY_EMAIL',       category: 'Email',           description: 'Email address notified on pending approvals (estimates, low-score replies)' },
+  { key: 'UNSUBSCRIBE_SECRET',       category: 'Email',           description: 'Secret used to sign unsubscribe link tokens', sensitive: true },
+  { key: 'OWNER_WEBSITE_URL',        category: 'Portfolio',       description: 'Your business website — scraped and cached for context in portfolio auto-replies' },
 ];
 
 async function getSetting(key) {
