@@ -13,11 +13,19 @@ function normalizeUrl(website) {
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
+// A self-identifying bot UA (e.g. "...DreamsTechnologyBot/1.0") gets a flat 403 from plenty of
+// ordinary sites' basic WAF/anti-scraping rules — even ones with no real bot-detection intent,
+// just a blocklist on anything that doesn't look like a browser. A real browser UA (+ the Accept
+// headers a browser actually sends) gets through those the same way a human visiting would.
 async function fetchPage(url) {
   try {
     const { data } = await axios.get(url, {
       timeout: REQUEST_TIMEOUT_MS,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DreamsTechnologyBot/1.0)' },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
     });
     return typeof data === 'string' ? data : null;
   } catch {

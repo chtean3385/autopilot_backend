@@ -289,6 +289,17 @@ CREATE TABLE IF NOT EXISTS lead_research (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_research_lead_id ON lead_research(lead_id);
 
+-- Tracks the last run of each background scheduler/worker job (WhatsApp follow-ups,
+-- email sequence worker, ...) so the UI can show "last ran: X" and prove a Render-sleep
+-- window didn't silently swallow a scheduled run.
+CREATE TABLE IF NOT EXISTS scheduler_status (
+    job_name VARCHAR(50) PRIMARY KEY,
+    last_ran_at TIMESTAMP,
+    last_trigger VARCHAR(20),
+    last_summary JSON,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_leads_city ON hotel_leads(city);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON hotel_leads(status);

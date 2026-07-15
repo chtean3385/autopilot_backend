@@ -87,7 +87,7 @@ router.get('/thread/:leadId', async (req, res) => {
   try {
     const { leadId } = req.params;
 
-    const [leadRes, logsRes, seqRes, scoredActionsRes] = await Promise.all([
+    const [leadRes, logsRes, seqRes, scoredActionsRes, researchRes, actionsRes] = await Promise.all([
       pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId]),
       pool.query(
         `SELECT * FROM email_logs WHERE lead_id = $1 ORDER BY COALESCE(sent_at, created_at) ASC`,
@@ -101,6 +101,14 @@ router.get('/thread/:leadId', async (req, res) => {
         `SELECT created_at, score, decision FROM agent_actions
          WHERE lead_id = $1 AND action IN ('draft_sent', 'portfolio_sent', 'estimate_sent') AND score IS NOT NULL
          ORDER BY created_at ASC`,
+        [leadId]
+      ),
+      // What the site-research pass (scrape → pain points → audit) found for this lead, if any.
+      pool.query('SELECT * FROM lead_research WHERE lead_id = $1', [leadId]),
+      // Full agent_actions history — the actual "what did the agent do and when" log.
+      pool.query(
+        `SELECT id, action, detail, draft_text, score, decision, created_at
+         FROM agent_actions WHERE lead_id = $1 ORDER BY created_at ASC`,
         [leadId]
       ),
     ]);
@@ -121,7 +129,13 @@ router.get('/thread/:leadId', async (req, res) => {
     }));
     attachScores(messages, scoredActionsRes.rows);
 
-    res.json({ lead, messages, sequence: seqRes.rows[0] || null });
+    res.json({
+      lead,
+      messages,
+      sequence: seqRes.rows[0] || null,
+      research: researchRes.rows[0] || null,
+      actions: actionsRes.rows,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

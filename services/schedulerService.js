@@ -6,6 +6,8 @@ const WABAService = require('./wabaService');
 const LeadService = require('./leadService');
 const { findEmail } = require('./enrichmentService');
 const SequenceService = require('./sequenceService');
+const SchedulerStatusService = require('./schedulerStatusService');
+const { notifyAdmin } = require('./adminNotifyService');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -148,10 +150,29 @@ async function parseInstruction(instruction) {
   return r.parsed;
 }
 
+// Matches one or more bare URLs in free text (trailing sentence punctuation stripped).
+const URL_REGEX = /https?:\/\/[^\s,"'<>]+/gi;
+function extractUrls(instruction) {
+  const matches = instruction.match(URL_REGEX) || [];
+  return [...new Set(matches.map(u => u.replace(/[.,;:)\]]+$/, '')))];
+}
+
 // Same idea as refineInstruction, but for the email channel: no WhatsApp bot system prompt
 // to generate, no website/review filters (a website is *required* for email discovery — no
 // website means there's nowhere to scrape a contact email from, so that's implicit, not a filter).
 async function refineEmailInstruction(instruction) {
+  // A direct link means "scrape exactly this site" — skip the city-based Google Places
+  // search (and the GPT call) entirely rather than failing because no city was mentioned.
+  const directUrls = extractUrls(instruction);
+  if (directUrls.length > 0) {
+    return {
+      refinedInstruction: instruction,
+      refinementNote: `Direct link${directUrls.length > 1 ? 's' : ''} detected — scraping ${directUrls.length} site(s) directly instead of searching Google Places, so no city is needed.`,
+      parsed: { businessType: 'businesses', city: '', count: directUrls.length, directUrls },
+      canRun: true,
+    };
+  }
+
   try {
     const res = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -663,20 +684,28 @@ async function runEmailTask(task) {
 
     let parsedParams = task.parsed_params;
     if (typeof parsedParams === 'string') parsedParams = JSON.parse(parsedParams);
-    if (!parsedParams || !parsedParams.city) {
+    if (!parsedParams || (!parsedParams.city && !parsedParams.directUrls?.length)) {
       const refined = await refineEmailInstruction(task.instruction);
       parsedParams = refined.parsed;
     }
 
-    const { city, count, businessType = 'businesses' } = parsedParams;
-    if (!city) throw new Error('City could not be determined from instruction. Please specify a city name.');
+    const { city, count, businessType = 'businesses', directUrls } = parsedParams;
+    if (!city && !directUrls?.length) throw new Error('City could not be determined from instruction. Please specify a city name.');
     if (!task.sequence_id) throw new Error('No sequence selected for this task — pick one before approving.');
 
     const leadCount = task.lead_count || count || 20;
-    console.log(`[Scheduler] Email params → businessType="${businessType}" city="${city}" count=${leadCount}`);
 
-    // 1. Find businesses with a website via Google Places
-    const { candidates, stats } = await scrapePlacesForWebsites(city, leadCount, businessType);
+    // 1. Find businesses with a website — either the direct link(s) given in the instruction,
+    // or (the normal case) a Google Places search by city + business type.
+    let candidates, stats;
+    if (directUrls?.length) {
+      console.log(`[Scheduler] Email params → ${directUrls.length} direct URL(s), skipping Places search`);
+      candidates = directUrls.map(url => ({ hotel_name: url, website: url, city: city || '', business_category: businessType }));
+      stats = { rawFromGoogle: candidates.length, noWebsite: 0, withWebsite: candidates.length };
+    } else {
+      console.log(`[Scheduler] Email params → businessType="${businessType}" city="${city}" count=${leadCount}`);
+      ({ candidates, stats } = await scrapePlacesForWebsites(city, leadCount, businessType));
+    }
 
     // 2. Scrape each site for a contact email (bounded concurrency, same as bulk-domains route)
     const emailResults = await mapWithConcurrency(candidates, 4, async (c) => {
@@ -690,11 +719,14 @@ async function runEmailTask(task) {
     const withEmail = emailResults.filter(r => r.email);
 
     if (withEmail.length === 0) {
+      const failMsg = directUrls?.length
+        ? `No emails found — scraped ${directUrls.length} site(s) directly but none had a reachable contact email (mailto link or plain-text address in the static HTML — JS-rendered contact info can't be seen).`
+        : `No emails found — Google returned ${stats.rawFromGoogle} results but ${stats.noWebsite} had no website, and none of the rest had a scrapeable contact email`;
       await pool.query(
         `UPDATE agent_tasks SET status='done', completed_at=NOW(), leads_scraped=$1, emails_found=0,
          emails_verified=0, leads_enrolled=0,
          error_message=$2 WHERE id=$3`,
-        [stats.rawFromGoogle, `No emails found — Google returned ${stats.rawFromGoogle} results but ${stats.noWebsite} had no website, and none of the rest had a scrapeable contact email`, taskId]
+        [stats.rawFromGoogle, failMsg, taskId]
       );
       return;
     }
@@ -717,7 +749,7 @@ async function runEmailTask(task) {
 
     // 4. Group (for the task's "view leads" panel) + auto-enroll verified leads into the sequence
     const allSavedIds = insertResult.inserted.map(l => l.id);
-    const groupId = await upsertCityGroup(city, businessType, allSavedIds);
+    const groupId = await upsertCityGroup(city || 'Direct Links', businessType, allSavedIds);
 
     let enrolled = 0;
     if (verifiedIds.length > 0) {
@@ -806,8 +838,10 @@ async function sendTask(taskId) {
 // Runs daily: sends follow-up every 2 days, up to 6 template touches total.
 // 'new' leads (never replied) → 'dead' after the cap.
 // 'responded' leads (replied, then went quiet) → 'stalled' after the cap.
-async function runFollowUps() {
-  console.log('[FollowUp] Checking leads for follow-up...');
+async function runFollowUps(trigger = 'cron') {
+  console.log(`[FollowUp] Checking leads for follow-up... (trigger=${trigger})`);
+
+  const stats = { due: 0, sent: 0, expired: 0, failed: 0, noTemplate: 0 };
 
   try {
     // Leads that:
@@ -827,7 +861,8 @@ async function runFollowUps() {
       HAVING MAX(ol.sent_at) <= NOW() - INTERVAL '2 days'
     `);
 
-    console.log(`[FollowUp] ${result.rows.length} lead(s) due for follow-up or expiry`);
+    stats.due = result.rows.length;
+    console.log(`[FollowUp] ${stats.due} lead(s) due for follow-up or expiry`);
 
     const template = await getApprovedTemplate(null);
 
@@ -841,11 +876,13 @@ async function runFollowUps() {
           `UPDATE hotel_leads SET status=$1, updated_at=NOW() WHERE id=$2`,
           [finalStatus, lead.id]
         );
+        stats.expired++;
         console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" → ${finalStatus} (${outreachCount} template sends, no response)`);
         continue;
       }
 
       if (!template) {
+        stats.noTemplate++;
         console.warn('[FollowUp] No approved template — skipping follow-up sends');
         continue;
       }
@@ -853,14 +890,30 @@ async function runFollowUps() {
       const wabaResult = await WABAService.sendPersonalizedTemplate(lead, template);
       if (wabaResult.success) {
         await LeadService.logOutreach(lead.id, null, template.id, wabaResult.messageId);
+        stats.sent++;
         console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" — follow-up #${outreachCount} sent`);
       } else {
+        stats.failed++;
         console.warn(`[FollowUp] Lead ${lead.id} send failed: ${wabaResult.error}`);
       }
     }
   } catch (err) {
     console.error('[FollowUp] Error:', err.message);
+    stats.error = err.message;
   }
+
+  await SchedulerStatusService.recordRun('whatsapp_followups', trigger, stats);
+  await notifyAdmin(
+    `🕙 *WhatsApp Follow-ups ran* (${trigger === 'manual' ? 'manual trigger' : 'daily 10AM check'})\n\n` +
+    `Checked: ${stats.due} lead(s) due\n` +
+    `✅ Sent: ${stats.sent}\n` +
+    `⚰️ Expired (6-touch cap reached): ${stats.expired}\n` +
+    (stats.noTemplate ? `⚠️ Skipped — no approved template: ${stats.noTemplate}\n` : '') +
+    (stats.failed ? `⚠️ Send failures: ${stats.failed}\n` : '') +
+    (stats.error ? `❌ Error: ${stats.error}\n` : '')
+  );
+
+  return stats;
 }
 
 // Check every minute for pending tasks that are due
@@ -890,10 +943,10 @@ schedule.scheduleJob('* * * * *', async () => {
   }
 });
 
-// Daily at 10:00 AM IST — follow up with non-responding leads
+// Daily at 12:00 PM IST — follow up with non-responding leads
 // (explicit tz because Render/most hosts run the container clock in UTC)
-schedule.scheduleJob({ rule: '0 10 * * *', tz: 'Asia/Kolkata' }, async () => {
-  await runFollowUps();
+schedule.scheduleJob({ rule: '0 12 * * *', tz: 'Asia/Kolkata' }, async () => {
+  await runFollowUps('cron');
 });
 
 console.log('🤖 Agent scheduler started — checks every minute for tasks, daily follow-ups at 10AM');

@@ -1,14 +1,38 @@
 const express = require('express');
 const pool = require('../config/db');
 const { runTask, sendTask, refineInstruction, refineEmailInstruction, runEmailTask, runFollowUps } = require('../services/schedulerService');
+const { runSequenceWorker } = require('../workers/sequenceEmailWorker');
+const SchedulerStatusService = require('../services/schedulerStatusService');
 const WABAService = require('../services/wabaService');
 const router = express.Router();
 
-// Manually trigger the daily follow-up job (testing / catch-up if the 10AM cron was missed)
+// Manually trigger the daily WhatsApp follow-up job (catch-up if the cron tick was
+// missed — e.g. Render was asleep at the scheduled time and never woke for it).
 router.post('/run-followups', async (req, res) => {
   try {
-    await runFollowUps();
-    res.json({ success: true });
+    const stats = await runFollowUps('manual');
+    res.json({ success: true, ...stats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Manually trigger the email sequence worker (same catch-up rationale as above).
+router.post('/run-sequences', async (req, res) => {
+  try {
+    const stats = await runSequenceWorker('manual');
+    res.json({ success: true, ...stats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Last-run status for each background job, so the UI can show "last ran: X"
+// instead of relying on Render logs to prove a scheduled run actually fired.
+router.get('/scheduler-status', async (req, res) => {
+  try {
+    const rows = await SchedulerStatusService.getAllStatus();
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -177,16 +201,21 @@ router.get('/tasks/:id', async (req, res) => {
 // Note: WhatsApp-channel leads repurpose the `email` column to hold the scraped website (legacy
 // behavior in scrapeLeads/saveLeads) — COALESCE keeps that working via `website` while
 // `contact_email` exposes the real address for email-channel leads without conflating the two.
+// lead_research columns are only ever populated for email-channel leads (sequenceEmailWorker
+// researches+caches them on first contact) — LEFT JOIN so WhatsApp-task rows just come back null.
 router.get('/tasks/:id/leads', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT hl.id, hl.hotel_name, hl.whatsapp_number, hl.phone, hl.city, hl.channel,
               hl.business_category, COALESCE(NULLIF(hl.website, ''), hl.email) AS website,
-              hl.email AS contact_email, hl.email_status, hl.status, hl.created_at
+              hl.email AS contact_email, hl.email_status, hl.status, hl.created_at,
+              lr.pain_points, lr.opportunities, lr.confidence,
+              lr.email_subject AS drafted_subject, lr.email_body AS drafted_email
        FROM agent_tasks at
        LEFT JOIN campaigns c ON at.campaign_id = c.id
        JOIN lead_group_members lgm ON lgm.group_id = COALESCE(c.group_id, at.group_id)
        JOIN hotel_leads hl ON lgm.lead_id = hl.id
+       LEFT JOIN lead_research lr ON lr.lead_id = hl.id
        WHERE at.id = $1
        ORDER BY hl.created_at DESC`,
       [req.params.id]

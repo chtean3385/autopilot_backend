@@ -278,6 +278,13 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_research_lead_id ON lead_research(lead_id);
+    CREATE TABLE IF NOT EXISTS scheduler_status (
+      job_name VARCHAR(50) PRIMARY KEY,
+      last_ran_at TIMESTAMP,
+      last_trigger VARCHAR(20),
+      last_summary JSON,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE INDEX IF NOT EXISTS idx_leads_channel ON hotel_leads(channel);
     CREATE INDEX IF NOT EXISTS idx_senders_status ON email_senders(status);
     CREATE INDEX IF NOT EXISTS idx_lead_sequences_lead ON lead_sequences(lead_id);
