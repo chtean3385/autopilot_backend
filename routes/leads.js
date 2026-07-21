@@ -369,6 +369,22 @@ router.post('/:id/research', async (req, res) => {
   }
 });
 
+// Manual "Run Now": fire the lead's next sequence email immediately (test/inspection tool).
+// Same pipeline as the 15-min worker tick — research → compose → send → advance step — but
+// skips the next_run_at wait and the sequence daily cap. Required inline to avoid changing
+// worker start order at boot (server.js loads workers after routes).
+router.post('/:id/run-sequence', async (req, res) => {
+  try {
+    const { runSequenceForLead } = require('../workers/sequenceEmailWorker');
+    const result = await runSequenceForLead(Number(req.params.id));
+    if (result.outcome === 'busy') return res.status(409).json(result);
+    if (result.outcome === 'not_enrolled') return res.status(400).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Full research history for a lead, newest first — every past researchCompany() run, including
 // versions since replaced in lead_research by a ?force=true re-run.
 router.get('/:id/research/history', async (req, res) => {

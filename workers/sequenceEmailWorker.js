@@ -298,9 +298,59 @@ async function runSequenceWorker(trigger = 'cron') {
   return stats;
 }
 
+// Manual "Run Now" for one lead — the same pipeline as the cron tick (research → compose →
+// send → advance step/next_run_at), but ignores next_run_at and the sequence daily cap so a
+// test send can always go out. Suppression/bounce checks and sender capacity still apply.
+async function runSequenceForLead(leadId) {
+  if (isRunning) {
+    return { outcome: 'busy', message: 'Sequence worker is mid-run — try again in a minute.' };
+  }
+  isRunning = true;
+  try {
+    const result = await pool.query(
+      `SELECT ls.*, hl.email AS lead_email, hl.hotel_name, hl.owner_name, hl.city,
+              hl.business_category, hl.website, hl.email_status,
+              s.initial_gaps, s.recurring_interval_days, s.daily_send_limit, s.sent_today
+       FROM lead_sequences ls
+       JOIN hotel_leads hl ON hl.id = ls.lead_id
+       JOIN sequences s ON s.id = ls.sequence_id
+       WHERE ls.lead_id = $1 AND ls.status = 'active'
+       ORDER BY ls.updated_at DESC
+       LIMIT 1`,
+      [leadId]
+    );
+    if (result.rows.length === 0) {
+      return { outcome: 'not_enrolled', message: 'No active sequence enrollment — enroll the lead in a sequence first.' };
+    }
+    const row = result.rows[0];
+    const stepBefore = row.current_step;
+    // Empty cap tracker → processRow never sees a sequence-cap entry, so the daily cap is bypassed
+    const outcome = await processRow(row, new Map());
+
+    const stats = { due: 1, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, deferred: 0, failed: 0, leadId };
+    if (outcome === 'sent') stats.sent = 1;
+    else if (outcome === 'stopped') stats.stopped = 1;
+    else if (outcome === 'no_sender') stats.noSender = 1;
+    else if (outcome === 'deferred') stats.deferred = 1;
+    else if (outcome === 'failed') stats.failed = 1;
+    await SchedulerStatusService.recordRun('email_sequences', 'manual_lead', stats);
+
+    const messages = {
+      sent: `Step ${stepBefore + 1} sent to ${row.lead_email}.`,
+      stopped: 'Sequence was stopped — the lead is bounced, suppressed, or has no email.',
+      no_sender: 'No sender capacity right now (daily caps / warmup ramp) — try later or raise the sender cap.',
+      deferred: 'Email composition failed — it will retry automatically in 1 hour.',
+      failed: 'Send failed — check the email logs for the provider error.',
+    };
+    return { outcome, step: stepBefore + 1, email: row.lead_email, message: messages[outcome] || outcome };
+  } finally {
+    isRunning = false;
+  }
+}
+
 schedule.scheduleJob('*/15 * * * *', () => runSequenceWorker('cron'));
 
 console.log('📧 Sequence email worker started - checks every 15 minutes');
 
 // composeEmail exported for test/preview use — composing is side-effect-free (no send, no DB write).
-module.exports = { runSequenceWorker, composeEmail };
+module.exports = { runSequenceWorker, runSequenceForLead, composeEmail };
