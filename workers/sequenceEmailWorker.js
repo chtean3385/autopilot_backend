@@ -12,10 +12,16 @@ const { getOrCreateResearch } = require('../services/leadResearchService');
 const { trackedCompletion } = require('../utils/aiUsage');
 const { renderEmailBody } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
+const { checkSpamContent } = require('../utils/spamCheck');
+const { generateTrackingToken, buildPixelUrl, buildClickUrl } = require('../utils/emailTracking');
+const { getThreadHeaders } = require('../utils/emailThreading');
+const { isWithinSendWindow } = require('../utils/sendWindow');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const BATCH_SIZE = 50;
 const SEND_DELAY_MS = 1500;
+const COMPOSE_MAX_ATTEMPTS = 2; // 1 draft + 1 feedback-driven revision, bounded for a 50-lead batch
+const PRIOR_EMAILS_LIMIT = 5;
 
 let isRunning = false;
 
@@ -26,7 +32,53 @@ async function fetchPortfolioItems() {
   return result.rows;
 }
 
-function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research) {
+// Follow-up conversation memory: every prior email actually sent to this lead in this
+// sequence, oldest first, so composeEmail() can avoid repeating a subject/angle/wording
+// instead of composing each step blind. `body` in email_logs is the rendered HTML (footer,
+// pixel, links included) — stripHtmlToText below reduces it to a short plain excerpt.
+async function fetchPriorSentEmails(leadId) {
+  const result = await pool.query(
+    `SELECT subject, body FROM email_logs
+     WHERE lead_id = $1 AND direction = 'out' AND sequence_id IS NOT NULL AND error IS NULL
+     ORDER BY COALESCE(sent_at, created_at) DESC LIMIT $2`,
+    [leadId, PRIOR_EMAILS_LIMIT]
+  );
+  return result.rows.reverse();
+}
+
+function stripHtmlToText(html, maxLen = 220) {
+  const text = String(html || '')
+    .replace(/<img[^>]*>/gi, '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&middot;/gi, '·').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Cut at the unsubscribe footer ("Dreams Technology · Unsubscribe") so it isn't quoted back
+  // into the next prompt as if it were part of the message.
+  return text.split(' Dreams Technology ')[0].slice(0, maxLen);
+}
+
+function buildPriorEmailsText(priorEmails) {
+  if (!priorEmails.length) return '';
+  const list = priorEmails
+    .map((e, i) => `${i + 1}. Subject: "${e.subject}" — ${stripHtmlToText(e.body)}`)
+    .join('\n');
+  return `\n\nEmails ALREADY SENT to this lead earlier in this sequence (oldest first) — do NOT reuse ` +
+    `their subject line, opening angle, or wording. This email must read as a genuinely new, distinct ` +
+    `message, not a rehash:\n${list}`;
+}
+
+// Deterministic (non-AI) angle assignment: step N always gets angle[N % length], so
+// consecutive emails in a sequence never compete for the same angle, and a short sequence
+// naturally uses several different angles instead of the model picking the same one each time.
+function selectAngleForStep(emailAngles, stepNumber) {
+  if (!emailAngles.length) return { angle: null, others: [] };
+  const angle = emailAngles[stepNumber % emailAngles.length];
+  return { angle, others: emailAngles.filter((a) => a !== angle) };
+}
+
+function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback) {
   const portfolioText = portfolioItems.length
     ? `\n\nSome of our recent work you can reference if it fits naturally:\n` +
       portfolioItems.map(p => `- ${p.title}${p.url ? ` (${p.url})` : ''}${p.description ? `: ${p.description}` : ''}`).join('\n')
@@ -39,6 +91,8 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
   const emailAngles = Array.isArray(research?.email_angles) ? research.email_angles : [];
   const products = Array.isArray(research?.business?.products) ? research.business.products : [];
   const markets = Array.isArray(research?.business?.markets) ? research.business.markets : [];
+  const { angle: angleForStep, others: otherAngles } = selectAngleForStep(emailAngles, stepNumber);
+
   const researchText = (painPoints.length || recommendedServices.length || emailAngles.length)
     ? `\n\nWebsite research on THIS SPECIFIC lead (scraped from their own site — use this to make the ` +
       `email genuinely specific instead of generic; mention at least one real detail below):\n` +
@@ -46,13 +100,24 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
       (products.length ? `Products/services they offer: ${products.join('; ')}\n` : '') +
       (markets.length ? `Markets they serve: ${markets.join('; ')}\n` : '') +
       (recommendedServices.length ? `Relevant Dreams Technology services to weave in: ${recommendedServices.join('; ')}\n` : '') +
-      (emailAngles.length ? `Suggested talking points: ${emailAngles.join('; ')}\n` : '') +
+      (angleForStep ? `The specific angle to lead with in THIS email: ${angleForStep}\n` : '') +
+      (otherAngles.length ? `Other angles reserved for other emails in this sequence — do NOT use these here: ${otherAngles.join('; ')}\n` : '') +
       `Every claim you make about their business must trace back to something in this research — never invent details beyond it.`
     : '';
 
+  const priorEmailsText = buildPriorEmailsText(priorEmails);
+
+  // Three tiers instead of a flat first/follow-up split — a step-4 nudge should read very
+  // differently from a step-1 nudge, both in length and in how much it still "pitches."
   const stageNote = stepNumber === 0
-    ? 'This is the FIRST email in the sequence — introduce Dreams Technology briefly and warmly.'
-    : 'This is a FOLLOW-UP email — keep it short, acknowledge this is a gentle nudge, do not repeat the full pitch from scratch.';
+    ? 'This is the FIRST email in the sequence — introduce Dreams Technology briefly and warmly, and make the specific angle above the centerpiece of the email.'
+    : stepNumber === 1
+      ? 'This is the FIRST FOLLOW-UP — a brief, low-pressure nudge. Acknowledge you reached out before without repeating what you said last time; lead with the new angle above instead of restating the original pitch.'
+      : 'This is a LATER FOLLOW-UP — keep it very short (2-4 sentences), low-key, "just circling back" energy. Assume they are busy; give one simple, easy next step rather than re-pitching.';
+
+  const feedbackNote = feedback
+    ? `\n\nA previous draft needs improvement: ${feedback} Rewrite addressing this while keeping the message natural.`
+    : '';
 
   return `You are a sales copywriter for Dreams Technology, a business management software company in India, writing a cold outreach email to a business owner.
 
@@ -60,11 +125,11 @@ ${stageNote}
 
 Goals:
 - Get the owner interested in a free demo of our business management software (billing, records, customer management).
-- Keep it SHORT (3-6 sentences), professional, warm, no hype or spammy language.
+- Keep it SHORT (3-6 sentences for the first email or first follow-up; 2-4 sentences for later follow-ups), professional, warm, no hype or spammy language.
 - Never mention you are an AI.
-- Do not fabricate facts about the recipient's business beyond what's given below.${portfolioText}${playbookText}${notesText}${researchText}
+- Do not fabricate facts about the recipient's business beyond what's given below.${portfolioText}${playbookText}${notesText}${researchText}${priorEmailsText}${feedbackNote}
 
-Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between paragraphs (no HTML, no signature, no unsubscribe line — those are appended separately).`;
+Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between paragraphs (no HTML, no signature, no unsubscribe line — those are appended separately). The subject line must be different from any subject listed above.`;
 }
 
 // Cached per-lead (lead_research table, shared getOrCreateResearch in leadResearchService.js)
@@ -81,7 +146,7 @@ async function fetchResearchForLead(lead) {
   }
 }
 
-async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, research) {
+async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails = [], feedback = null) {
   const leadContext = `Business: ${lead.hotel_name}\nOwner: ${lead.owner_name || 'Unknown'}\nCity: ${lead.city || 'Unknown'}${lead.business_category ? `\nCategory: ${lead.business_category}` : ''}${lead.website ? `\nWebsite: ${lead.website}` : ''}`;
 
   const response = await trackedCompletion(client, {
@@ -89,7 +154,7 @@ async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, r
     max_tokens: 400,
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research) },
+      { role: 'system', content: buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback) },
       { role: 'user', content: leadContext },
     ],
   }, { purpose: 'sequence_email_compose', leadId: lead.lead_id ?? lead.id ?? null });
@@ -156,16 +221,55 @@ async function processRow(row, sequenceCapTracker) {
     return 'no_sender';
   }
 
-  const [portfolioItems, playbookContext, research] = await Promise.all([
+  const [portfolioItems, playbookContext, research, priorEmails] = await Promise.all([
     fetchPortfolioItems(),
     PlaybookService.getPlaybookContext(),
     fetchResearchForLead(row),
+    fetchPriorSentEmails(leadId),
   ]);
   const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(row.lead_email)}`;
 
   let composed;
+  let finalQualityScore = null;
   try {
-    composed = await composeEmail(row, row.current_step, portfolioItems, playbookContext, research);
+    // Combined spam-lint + quality-score gate: up to COMPOSE_MAX_ATTEMPTS drafts, feeding both
+    // the spam-trigger words and the quality reviewer's feedback back in as one revision note.
+    // Whatever the last attempt scores, it's sent — this is a lint/gate on WHAT gets written,
+    // never a hold on WHETHER the sequence fires (queuing 50 cold emails/tick to a human
+    // approval queue would just stall the channel). Every attempt is logged to agent_actions
+    // for visibility (AnalyticsView's activity feed already renders any action generically).
+    let feedback = null;
+    let spamResult, qualityResult;
+    for (let attempt = 1; attempt <= COMPOSE_MAX_ATTEMPTS; attempt++) {
+      composed = await composeEmail(row, row.current_step, portfolioItems, playbookContext, research, priorEmails, feedback);
+      spamResult = checkSpamContent(composed.subject, composed.body);
+      qualityResult = await ReplyQualityService.scoreColdEmail({
+        leadId, lead: row, subject: composed.subject, body: composed.body, stepNumber: row.current_step,
+      });
+
+      const passed = spamResult.clean && qualityResult.score >= ReplyQualityService.COLD_EMAIL_SCORE_THRESHOLD;
+      const isLastAttempt = attempt === COMPOSE_MAX_ATTEMPTS;
+
+      await pool.query(
+        `INSERT INTO agent_actions (lead_id, action, detail, draft_text, score, decision) VALUES ($1, 'cold_email_scored', $2, $3, $4, $5)`,
+        [
+          leadId,
+          JSON.stringify({ attempt, stepNumber: row.current_step, spamFlagged: spamResult.flagged, feedback: qualityResult.feedback, subject: composed.subject }),
+          composed.body,
+          qualityResult.score,
+          passed ? 'send' : (isLastAttempt ? 'send_low_quality' : 'revise'),
+        ]
+      );
+
+      finalQualityScore = qualityResult.score;
+      if (passed || isLastAttempt) break;
+
+      const feedbackParts = [];
+      if (!spamResult.clean) feedbackParts.push(`Avoid these spam-trigger phrases: ${spamResult.flagged.join(', ')}.`);
+      if (qualityResult.score < ReplyQualityService.COLD_EMAIL_SCORE_THRESHOLD) feedbackParts.push(qualityResult.feedback);
+      feedback = feedbackParts.join(' ');
+      console.log(`[SequenceEmail] Lead ${leadId} draft attempt ${attempt} scored ${qualityResult.score}/5 (spam-clean: ${spamResult.clean}) — recomposing`);
+    }
   } catch (err) {
     console.error(`[SequenceEmail] Compose failed for lead ${leadId}:`, err.message);
     await pool.query(
@@ -175,8 +279,17 @@ async function processRow(row, sequenceCapTracker) {
     return 'deferred';
   }
 
-  const { html, text } = renderEmailBody(composed.body, unsubscribeUrl);
-  const sendResult = await EmailSenderService.send(sender, { to: row.lead_email, subject: composed.subject, html, text });
+  // Follow-ups (step > 0) thread onto the conversation so far; a step-0 cold email has no
+  // logged messages yet, so getThreadHeaders returns nulls and it starts a fresh thread.
+  const trackingToken = generateTrackingToken();
+  const tracking = { pixelUrl: buildPixelUrl(trackingToken), trackUrl: (url) => buildClickUrl(trackingToken, url) };
+  const { inReplyTo, references } = await getThreadHeaders(leadId);
+
+  const { html, text } = renderEmailBody(composed.body, unsubscribeUrl, tracking);
+  const sendResult = await EmailSenderService.send(sender, {
+    to: row.lead_email, subject: composed.subject, html, text,
+    unsubscribeUrl, inReplyTo, references,
+  });
 
   if (!sendResult.success) {
     console.error(`[SequenceEmail] Send failed for lead ${leadId}:`, sendResult.error);
@@ -199,9 +312,9 @@ async function processRow(row, sequenceCapTracker) {
   const nextRunAt = computeNextRunAt(row, row.current_step);
 
   await pool.query(
-    `INSERT INTO email_logs (lead_id, sender_id, sequence_id, direction, subject, body, provider_message_id, sent_at)
-     VALUES ($1, $2, $3, 'out', $4, $5, $6, NOW())`,
-    [leadId, sender.id, sequenceId, composed.subject, html, sendResult.messageId]
+    `INSERT INTO email_logs (lead_id, sender_id, sequence_id, direction, subject, body, provider_message_id, tracking_token, sent_at)
+     VALUES ($1, $2, $3, 'out', $4, $5, $6, $7, NOW())`,
+    [leadId, sender.id, sequenceId, composed.subject, html, sendResult.messageId, trackingToken]
   );
 
   await pool.query(
@@ -215,8 +328,8 @@ async function processRow(row, sequenceCapTracker) {
   if (remainingCap !== undefined) sequenceCapTracker.set(sequenceId, remainingCap - 1);
 
   await pool.query(
-    `INSERT INTO agent_actions (lead_id, action, detail, draft_text, decision) VALUES ($1, 'draft_sent', $2, $3, 'send')`,
-    [leadId, JSON.stringify({ subject: composed.subject, sequenceId, senderId: sender.id }), composed.body]
+    `INSERT INTO agent_actions (lead_id, action, detail, draft_text, score, decision) VALUES ($1, 'draft_sent', $2, $3, $4, 'send')`,
+    [leadId, JSON.stringify({ subject: composed.subject, sequenceId, senderId: sender.id }), composed.body, finalQualityScore]
   );
 
   console.log(`[SequenceEmail] Sent step ${row.current_step + 1} to ${row.lead_email} via sender ${sender.id}`);
@@ -228,6 +341,22 @@ async function runSequenceWorker(trigger = 'cron') {
     console.log('[SequenceEmail] Previous run still in progress — skipping this tick');
     return { skipped: true, reason: 'already_running' };
   }
+
+  // Send window: every lead in this system is an India-based business (Google Places search
+  // is hard-locked to region:'in'), so IST business hours are the one recipient-timezone check
+  // needed — a 3am cold email hurts reply rate and looks automated. A 'manual' trigger (the
+  // "catch-up if the cron tick was missed" button in routes/agent.js) deliberately bypasses
+  // this, same as it already bypasses the daily send cap — that's the whole point of the button.
+  if (trigger !== 'manual') {
+    const window = await isWithinSendWindow();
+    if (!window.allowed) {
+      console.log(`[SequenceEmail] Outside send window (IST ${window.hourIst}:00, day ${window.dayIst}; window ${window.startHour}-${window.endHour}, days ${window.days.join(',')}) — skipping this tick`);
+      const stats = { skipped: true, reason: 'outside_send_window', ...window };
+      await SchedulerStatusService.recordRun('email_sequences', trigger, stats);
+      return stats;
+    }
+  }
+
   isRunning = true;
 
   const stats = { due: 0, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, deferred: 0, failed: 0 };
@@ -363,5 +492,6 @@ schedule.scheduleJob('*/15 * * * *', () => runSequenceWorker('cron'));
 
 console.log('📧 Sequence email worker started - checks every 15 minutes');
 
-// composeEmail exported for test/preview use — composing is side-effect-free (no send, no DB write).
-module.exports = { runSequenceWorker, runSequenceForLead, composeEmail };
+// composeEmail + the pure prompt-assembly helpers are exported for test/preview use — all
+// side-effect-free (no send, no DB write).
+module.exports = { runSequenceWorker, runSequenceForLead, composeEmail, selectAngleForStep, stripHtmlToText, buildPriorEmailsText };
