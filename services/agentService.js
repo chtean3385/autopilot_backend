@@ -2,6 +2,7 @@ const OpenAI = require('openai');
 const WABAService = require('./wabaService');
 const pool = require('../config/db');
 const settingsService = require('./settingsService');
+const { trackedCompletion } = require('../utils/aiUsage');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -166,9 +167,9 @@ async function getCampaignSystemPrompt(leadId) {
 // auto-reply is not a real reply from a person, and must never be answered — the sales agent
 // has no business "booking a stay" or discussing menus with the lead's own auto-responder.
 // Fails open (returns 'human') on any error so a classifier hiccup never silently drops a real lead.
-async function classifyIncomingMessage(incomingText) {
+async function classifyIncomingMessage(incomingText, leadId = null) {
   try {
-    const response = await client.chat.completions.create({
+    const response = await trackedCompletion(client, {
       model: 'gpt-4o-mini',
       max_tokens: 20,
       response_format: { type: 'json_object' },
@@ -187,7 +188,7 @@ async function classifyIncomingMessage(incomingText) {
         },
         { role: 'user', content: `Message: "${incomingText}"` },
       ],
-    });
+    }, { purpose: 'whatsapp_intent', leadId });
     const parsed = JSON.parse(response.choices[0].message.content);
     return parsed.type === 'auto_reply' ? 'auto_reply' : 'human';
   } catch (err) {
@@ -225,7 +226,7 @@ async function handleReply(lead, incomingText) {
   try {
     console.log(`[Agent] Processing reply from lead ${lead.id}: "${incomingText}"`);
 
-    const messageType = await classifyIncomingMessage(incomingText);
+    const messageType = await classifyIncomingMessage(incomingText, lead.id);
     if (messageType === 'auto_reply') {
       console.log(`[Agent] Lead ${lead.id} message looks like the business's own auto-responder, not a human — not replying: "${incomingText}"`);
       return;
@@ -242,14 +243,14 @@ async function handleReply(lead, incomingText) {
 
     const leadContext = `\n\nLead info:\nBusiness: ${lead.hotel_name}\nOwner: ${lead.owner_name}\nCity: ${lead.city}${lead.business_category ? `\nCategory: ${lead.business_category}` : ''}`;
 
-    const response = await client.chat.completions.create({
+    const response = await trackedCompletion(client, {
       model: 'gpt-4o-mini',
       max_tokens: 300,
       messages: [
         { role: 'system', content: systemPrompt + leadContext },
         ...history,
       ],
-    });
+    }, { purpose: 'whatsapp_reply_draft', leadId: lead.id });
 
     const fullReply = response.choices[0].message.content.trim();
 

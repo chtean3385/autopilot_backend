@@ -4,6 +4,7 @@ const multer = require('multer');
 const LeadService = require('../services/leadService');
 const { parseLeadsFile } = require('../services/importService');
 const { findEmail } = require('../services/enrichmentService');
+const { getOrCreateResearch } = require('../services/leadResearchService');
 const pool = require('../config/db');
 const router = express.Router();
 
@@ -346,6 +347,40 @@ router.put('/:id/status', async (req, res) => {
   const { status } = req.body;
   const result = await LeadService.updateLeadStatus(req.params.id, status);
   res.json(result);
+});
+
+// Get-or-create the AI research profile for a lead (one GPT-5.5 call, cached in lead_research,
+// every run also appended to lead_research_versions). ?force=true recomputes: lead_research is
+// updated in place, and the previous result survives as an older version in the history.
+router.post('/:id/research', async (req, res) => {
+  const force = req.query.force === 'true';
+  try {
+    const leadResult = await pool.query('SELECT * FROM hotel_leads WHERE id=$1', [req.params.id]);
+    const lead = leadResult.rows[0];
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    if (!lead.website) return res.status(400).json({ error: 'Lead has no website to research' });
+
+    const { research, wasCached } = await getOrCreateResearch(lead, { force });
+    if (!research) return res.status(502).json({ error: 'Research failed — could not crawl or analyze the site' });
+
+    res.json({ cached: wasCached, research });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Full research history for a lead, newest first — every past researchCompany() run, including
+// versions since replaced in lead_research by a ?force=true re-run.
+router.get('/:id/research/history', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM lead_research_versions WHERE lead_id=$1 ORDER BY version DESC`,
+      [req.params.id]
+    );
+    res.json({ versions: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Delete one lead

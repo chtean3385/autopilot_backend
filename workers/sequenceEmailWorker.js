@@ -8,13 +8,14 @@ const PlaybookService = require('../services/playbookService');
 const ReplyQualityService = require('../services/replyQualityService');
 const SchedulerStatusService = require('../services/schedulerStatusService');
 const { notifyAdmin } = require('../services/adminNotifyService');
-const { researchAndDraft } = require('../services/leadResearchService');
+const { getOrCreateResearch } = require('../services/leadResearchService');
+const { trackedCompletion } = require('../utils/aiUsage');
 const { renderEmailBody } = require('../utils/emailRender');
+const { getBackendUrl } = require('../utils/backendUrlConfig');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const BATCH_SIZE = 50;
 const SEND_DELAY_MS = 1500;
-const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
 
 let isRunning = false;
 
@@ -34,12 +35,18 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
   const notesText = ReplyQualityService.buildPlaybookNotesText(playbookContext?.notes);
 
   const painPoints = Array.isArray(research?.pain_points) ? research.pain_points : [];
-  const opportunities = Array.isArray(research?.opportunities) ? research.opportunities : [];
-  const researchText = (painPoints.length || opportunities.length)
+  const recommendedServices = Array.isArray(research?.recommended_services) ? research.recommended_services : [];
+  const emailAngles = Array.isArray(research?.email_angles) ? research.email_angles : [];
+  const products = Array.isArray(research?.business?.products) ? research.business.products : [];
+  const markets = Array.isArray(research?.business?.markets) ? research.business.markets : [];
+  const researchText = (painPoints.length || recommendedServices.length || emailAngles.length)
     ? `\n\nWebsite research on THIS SPECIFIC lead (scraped from their own site — use this to make the ` +
       `email genuinely specific instead of generic; mention at least one real detail below):\n` +
       (painPoints.length ? `Pain points observed: ${painPoints.join('; ')}\n` : '') +
-      (opportunities.length ? `Opportunities: ${opportunities.join('; ')}\n` : '') +
+      (products.length ? `Products/services they offer: ${products.join('; ')}\n` : '') +
+      (markets.length ? `Markets they serve: ${markets.join('; ')}\n` : '') +
+      (recommendedServices.length ? `Relevant Dreams Technology services to weave in: ${recommendedServices.join('; ')}\n` : '') +
+      (emailAngles.length ? `Suggested talking points: ${emailAngles.join('; ')}\n` : '') +
       `Every claim you make about their business must trace back to something in this research — never invent details beyond it.`
     : '';
 
@@ -60,38 +67,14 @@ Goals:
 Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between paragraphs (no HTML, no signature, no unsubscribe line — those are appended separately).`;
 }
 
-// Cached per-lead (lead_research table) so the site is only crawled + GPT-analyzed once ever,
-// not once per email in the sequence. Returns null (silently) if there's no website to crawl
-// or the crawl/GPT step fails — callers fall back to the generic prompt in that case.
-async function getOrCreateResearch(lead) {
-  if (!lead.website) return null;
+// Cached per-lead (lead_research table, shared getOrCreateResearch in leadResearchService.js)
+// so the site is only crawled + GPT-analyzed once per version, not once per email in the
+// sequence. Returns null (silently) if there's no website to crawl or the crawl/GPT step
+// fails — callers fall back to the generic prompt in that case.
+async function fetchResearchForLead(lead) {
   try {
-    const cached = await pool.query('SELECT * FROM lead_research WHERE lead_id = $1', [lead.lead_id]);
-    if (cached.rows[0]) return cached.rows[0];
-
-    const drafted = await researchAndDraft(lead);
-    if (!drafted) return null;
-
-    const inserted = await pool.query(
-      `INSERT INTO lead_research
-         (lead_id, business_profile, website_audit, pain_points, opportunities, recommended_services,
-          email_subject, email_body, confidence)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       ON CONFLICT (lead_id) DO NOTHING
-       RETURNING *`,
-      [
-        lead.lead_id,
-        JSON.stringify(drafted.businessProfile),
-        JSON.stringify(drafted.websiteAudit),
-        JSON.stringify(drafted.painPoints),
-        JSON.stringify(drafted.opportunities),
-        JSON.stringify(drafted.recommendedServices),
-        drafted.emailSubject,
-        drafted.emailBody,
-        drafted.confidence,
-      ]
-    );
-    return inserted.rows[0] || null;
+    const { research } = await getOrCreateResearch(lead);
+    return research;
   } catch (err) {
     console.error(`[SequenceEmail] Research failed for lead ${lead.lead_id}:`, err.message);
     return null;
@@ -101,7 +84,7 @@ async function getOrCreateResearch(lead) {
 async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, research) {
   const leadContext = `Business: ${lead.hotel_name}\nOwner: ${lead.owner_name || 'Unknown'}\nCity: ${lead.city || 'Unknown'}${lead.business_category ? `\nCategory: ${lead.business_category}` : ''}${lead.website ? `\nWebsite: ${lead.website}` : ''}`;
 
-  const response = await client.chat.completions.create({
+  const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
     max_tokens: 400,
     response_format: { type: 'json_object' },
@@ -109,7 +92,7 @@ async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, r
       { role: 'system', content: buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research) },
       { role: 'user', content: leadContext },
     ],
-  });
+  }, { purpose: 'sequence_email_compose', leadId: lead.lead_id ?? lead.id ?? null });
 
   const parsed = JSON.parse(response.choices[0].message.content);
   const subject = (parsed.subject || '').trim() || 'Quick question';
@@ -176,9 +159,9 @@ async function processRow(row, sequenceCapTracker) {
   const [portfolioItems, playbookContext, research] = await Promise.all([
     fetchPortfolioItems(),
     PlaybookService.getPlaybookContext(),
-    getOrCreateResearch(row),
+    fetchResearchForLead(row),
   ]);
-  const unsubscribeUrl = `${BACKEND_URL}/unsubscribe?token=${SuppressionService.generateToken(row.lead_email)}`;
+  const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(row.lead_email)}`;
 
   let composed;
   try {
@@ -319,4 +302,5 @@ schedule.scheduleJob('*/15 * * * *', () => runSequenceWorker('cron'));
 
 console.log('📧 Sequence email worker started - checks every 15 minutes');
 
-module.exports = { runSequenceWorker };
+// composeEmail exported for test/preview use — composing is side-effect-free (no send, no DB write).
+module.exports = { runSequenceWorker, composeEmail };

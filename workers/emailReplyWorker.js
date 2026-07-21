@@ -8,6 +8,7 @@ const ReplyQualityService = require('../services/replyQualityService');
 const PortfolioReplyService = require('../services/portfolioReplyService');
 const PlaybookService = require('../services/playbookService');
 const { logAgentAction, notifyOwner, sendOrQueueReply } = require('../services/replyDeliveryService');
+const { trackedCompletion } = require('../utils/aiUsage');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const HISTORY_LIMIT = 20;
@@ -56,7 +57,7 @@ async function classifyIntent({ lead, incomingMessage, conversationHistory }) {
   const historyText = ReplyQualityService.buildHistoryText(conversationHistory);
   const userContent = `${ReplyQualityService.buildLeadContext(lead)}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nLead's latest message:\n${incomingMessage}`;
 
-  const response = await client.chat.completions.create({
+  const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
     max_tokens: 60,
     response_format: { type: 'json_object' },
@@ -74,7 +75,7 @@ async function classifyIntent({ lead, incomingMessage, conversationHistory }) {
       },
       { role: 'user', content: userContent },
     ],
-  });
+  }, { purpose: 'email_intent', leadId: lead?.id ?? null });
 
   const parsed = JSON.parse(response.choices[0].message.content);
   return INTENTS.includes(parsed.intent) ? parsed.intent : 'question';

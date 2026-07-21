@@ -209,8 +209,8 @@ router.get('/tasks/:id/leads', async (req, res) => {
       `SELECT hl.id, hl.hotel_name, hl.whatsapp_number, hl.phone, hl.city, hl.channel,
               hl.business_category, COALESCE(NULLIF(hl.website, ''), hl.email) AS website,
               hl.email AS contact_email, hl.email_status, hl.status, hl.created_at,
-              lr.pain_points, lr.opportunities, lr.confidence,
-              lr.email_subject AS drafted_subject, lr.email_body AS drafted_email
+              lr.pain_points, lr.recommended_services, lr.confidence,
+              lr.company, lr.summary, lr.confidence_breakdown
        FROM agent_tasks at
        LEFT JOIN campaigns c ON at.campaign_id = c.id
        JOIN lead_group_members lgm ON lgm.group_id = COALESCE(c.group_id, at.group_id)

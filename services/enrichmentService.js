@@ -1,5 +1,6 @@
 const OpenAI = require('openai');
 const { normalizeUrl, fetchPage, loadClean, cleanText, extractMailtoTel, discoverRankedLinks } = require('../utils/siteCrawler');
+const { trackedCompletion } = require('../utils/aiUsage');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -100,7 +101,7 @@ async function pickContactWithGpt(lead, pages, mailtoEmails, telNumbers) {
     .map((p) => `--- ${p.path} ---\nFooter: ${p.footerText}\nBody: ${p.bodyText}`)
     .join('\n\n');
 
-  const response = await client.chat.completions.create({
+  const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
     max_tokens: 250,
     response_format: { type: 'json_object' },
@@ -126,7 +127,7 @@ async function pickContactWithGpt(lead, pages, mailtoEmails, telNumbers) {
         content: `Business: ${lead.hotel_name || 'unknown'}\nMailto links found: ${mailtoEmails.join(', ') || 'none'}\nTel links found: ${telNumbers.join(', ') || 'none'}\n\nScraped site text:\n${scrapedText}`,
       },
     ],
-  });
+  }, { purpose: 'email_enrichment', leadId: lead.id ?? null });
 
   return JSON.parse(response.choices[0].message.content);
 }

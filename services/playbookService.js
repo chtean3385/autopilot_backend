@@ -1,5 +1,6 @@
 const OpenAI = require('openai');
 const pool = require('../config/db');
+const { trackedCompletion } = require('../utils/aiUsage');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const FEW_SHOT_LIMIT = 5;
@@ -103,7 +104,7 @@ async function runWeeklyInsights() {
     ...summary.actionCounts.map(a => `- ${a.action}${a.decision ? ` (${a.decision})` : ''}: ${a.count}`),
   ].join('\n');
 
-  const response = await client.chat.completions.create({
+  const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
     max_tokens: 200,
     response_format: { type: 'json_object' },
@@ -118,7 +119,7 @@ async function runWeeklyInsights() {
       },
       { role: 'user', content: summaryText },
     ],
-  });
+  }, { purpose: 'playbook_insights' });
 
   const parsed = JSON.parse(response.choices[0].message.content);
   const insight = (parsed.insight || '').trim();

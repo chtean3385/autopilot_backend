@@ -5,9 +5,9 @@ const SuppressionService = require('../services/suppressionService');
 const { logAgentAction } = require('../services/replyDeliveryService');
 const PlaybookService = require('../services/playbookService');
 const { escapeHtml, unsubscribeFooterHtml, renderEmailBody } = require('../utils/emailRender');
+const { getBackendUrl } = require('../utils/backendUrlConfig');
 
 const router = express.Router();
-const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
 
 async function getApproval(approvalId) {
   const result = await pool.query(
@@ -158,7 +158,7 @@ router.post('/:approvalId/approve', async (req, res) => {
     const sender = await EmailSenderService.getSenderForLead(approval.lead_id);
     if (!sender) return res.status(400).json({ success: false, error: 'No active email sender available to send from' });
 
-    const unsubscribeUrl = `${BACKEND_URL}/unsubscribe?token=${SuppressionService.generateToken(approval.lead_email)}`;
+    const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(approval.lead_email)}`;
     const leadSeq = await getLeadSequence(approval.lead_id);
 
     let subject, html, text, actionLabel;

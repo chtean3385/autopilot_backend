@@ -7,6 +7,7 @@ const SETTINGS_DEFS = [
   { key: 'WABA_API_VERSION',         category: 'WhatsApp (WABA)', description: 'Meta Graph API version (e.g. v18.0)' },
   { key: 'WEBHOOK_VERIFY_TOKEN',     category: 'WhatsApp (WABA)', description: 'Meta Webhook verification token' },
   { key: 'GOOGLE_PLACES_API_KEY',    category: 'Google',          description: 'Google Places API Key', sensitive: true },
+  { key: 'PAGESPEED_API_KEY',        category: 'Google',          description: 'Google PageSpeed Insights API key (website speed score in lead research)', sensitive: true },
   { key: 'OPENAI_API_KEY',           category: 'OpenAI',          description: 'OpenAI API Key (agent brain)', sensitive: true },
   { key: 'DEMO_LINK',                category: 'App',             description: 'Demo booking link (used as {{4}} in templates)' },
   { key: 'OWNER_WHATSAPP',           category: 'App',             description: 'Your WhatsApp number in E.164 format (no +)' },

@@ -1,5 +1,6 @@
 const OpenAI = require('openai');
 const pool = require('../config/db');
+const { trackedCompletion } = require('../utils/aiUsage');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -66,7 +67,7 @@ async function draftReply(context, revisionFeedback) {
   const historyText = buildHistoryText(conversationHistory);
   const userContent = `${buildLeadContext(lead)}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nLead's latest message:\n${incomingMessage}`;
 
-  const response = await client.chat.completions.create({
+  const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
     max_tokens: 400,
     response_format: { type: 'json_object' },
@@ -74,7 +75,7 @@ async function draftReply(context, revisionFeedback) {
       { role: 'system', content: buildDraftSystemPrompt(playbookExamples, revisionFeedback, portfolioItems, serviceContext, playbookNotes) },
       { role: 'user', content: userContent },
     ],
-  });
+  }, { purpose: 'reply_draft', leadId: context.leadId ?? null });
 
   const parsed = JSON.parse(response.choices[0].message.content);
   return (parsed.text || '').trim();
@@ -85,7 +86,7 @@ async function scoreReply(context, draftText) {
   const historyText = buildHistoryText(conversationHistory);
   const userContent = `${buildLeadContext(lead)}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nLead's latest message:\n${incomingMessage}\n\nDraft reply to score:\n${draftText}`;
 
-  const response = await client.chat.completions.create({
+  const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
     max_tokens: 150,
     response_format: { type: 'json_object' },
@@ -100,7 +101,7 @@ async function scoreReply(context, draftText) {
       },
       { role: 'user', content: userContent },
     ],
-  });
+  }, { purpose: 'reply_score', leadId: context.leadId ?? null });
 
   const parsed = JSON.parse(response.choices[0].message.content);
   const score = Number.parseInt(parsed.score, 10);

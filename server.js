@@ -151,6 +151,8 @@ async function initDB() {
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS website VARCHAR(500);
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_status VARCHAR(30) DEFAULT 'unknown';
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_source VARCHAR(50);
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_verify_attempts INT DEFAULT 0;
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS last_verify_attempt_at TIMESTAMP;
     CREATE UNIQUE INDEX IF NOT EXISTS hotel_leads_email_unique_idx
       ON hotel_leads (LOWER(email))
       WHERE email IS NOT NULL AND email <> '';
@@ -212,6 +214,8 @@ async function initDB() {
       error TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP;
+    CREATE INDEX IF NOT EXISTS idx_email_logs_provider_message_id ON email_logs(provider_message_id);
     CREATE TABLE IF NOT EXISTS agent_actions (
       id SERIAL PRIMARY KEY,
       lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,
@@ -264,20 +268,81 @@ async function initDB() {
       active BOOLEAN DEFAULT TRUE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'lead_research' AND column_name = 'business_profile'
+      ) THEN
+        DROP TABLE lead_research;
+      END IF;
+    END $$;
     CREATE TABLE IF NOT EXISTS lead_research (
       id SERIAL PRIMARY KEY,
       lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,
-      business_profile JSON,
-      website_audit JSON,
+      company JSON,
+      summary TEXT,
+      business JSON,
+      technology JSON,
       pain_points JSON,
-      opportunities JSON,
       recommended_services JSON,
-      email_subject VARCHAR(500),
-      email_body TEXT,
-      confidence VARCHAR(20),
+      opportunity_score JSON,
+      email_angles JSON,
+      decision_makers JSON,
+      confidence INT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_research_lead_id ON lead_research(lead_id);
+    ALTER TABLE lead_research ADD COLUMN IF NOT EXISTS confidence_breakdown JSON;
+    ALTER TABLE lead_research ADD COLUMN IF NOT EXISTS schema_version INT DEFAULT 1;
+    CREATE TABLE IF NOT EXISTS lead_research_versions (
+      id SERIAL PRIMARY KEY,
+      lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,
+      version INT NOT NULL,
+      company JSON,
+      summary TEXT,
+      business JSON,
+      technology JSON,
+      pain_points JSON,
+      recommended_services JSON,
+      opportunity_score JSON,
+      email_angles JSON,
+      decision_makers JSON,
+      confidence INT,
+      confidence_breakdown JSON,
+      schema_version INT DEFAULT 2,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_research_versions_lead_version ON lead_research_versions(lead_id, version);
+    CREATE INDEX IF NOT EXISTS idx_lead_research_versions_lead_created ON lead_research_versions(lead_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS ai_usage_logs (
+      id SERIAL PRIMARY KEY,
+      lead_id INT REFERENCES hotel_leads(id) ON DELETE SET NULL,
+      purpose VARCHAR(50) NOT NULL,
+      model VARCHAR(80),
+      prompt_tokens INT,
+      completion_tokens INT,
+      total_tokens INT,
+      cost_usd NUMERIC(12,6),
+      duration_ms INT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_created ON ai_usage_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_purpose ON ai_usage_logs(purpose, created_at DESC);
+    CREATE TABLE IF NOT EXISTS proposals (
+      id SERIAL PRIMARY KEY,
+      lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,
+      proposal JSON,
+      timeline JSON,
+      quotation JSON,
+      architecture JSON,
+      current_vs_future JSON,
+      roi JSON,
+      status VARCHAR(20) DEFAULT 'draft',
+      sent_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_lead_id ON proposals(lead_id);
     CREATE TABLE IF NOT EXISTS scheduler_status (
       job_name VARCHAR(50) PRIMARY KEY,
       last_ran_at TIMESTAMP,
@@ -310,6 +375,7 @@ app.use(express.json());
 
 // Routes
 app.use('/webhook', require('./routes/webhook'));
+app.use('/webhooks/brevo', require('./routes/brevoWebhook'));
 app.use('/unsubscribe', require('./routes/unsubscribe'));
 app.use('/api/leads', require('./routes/leads'));
 app.use('/api/campaigns', require('./routes/campaigns'));
@@ -324,6 +390,7 @@ app.use('/api/sequences', require('./routes/sequences'));
 app.use('/api/estimates', require('./routes/estimates'));
 app.use('/api/portfolio-items', require('./routes/portfolio'));
 app.use('/api/email-conversations', require('./routes/emailConversations'));
+app.use('/api/proposals', require('./routes/proposals'));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -334,6 +401,7 @@ app.get('/health', (req, res) => {
 require('./workers/campaignWorker');
 require('./workers/sequenceEmailWorker');
 require('./workers/emailReplyWorker');
+require('./workers/emailVerificationWorker');
 require('./workers/playbookInsightsWorker');
 require('./services/schedulerService');
 

@@ -8,6 +8,7 @@ const { findEmail } = require('./enrichmentService');
 const SequenceService = require('./sequenceService');
 const SchedulerStatusService = require('./schedulerStatusService');
 const { notifyAdmin } = require('./adminNotifyService');
+const { trackedCompletion } = require('../utils/aiUsage');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -49,7 +50,7 @@ pool.query(`
 // canRun=false only if the city is completely missing and unfixable.
 async function refineInstruction(instruction) {
   try {
-    const res = await openai.chat.completions.create({
+    const res = await trackedCompletion(openai, {
       model: 'gpt-4o-mini',
       max_tokens: 900,
       messages: [
@@ -118,7 +119,7 @@ Now respond with JSON only for the user's actual instruction:`
         { role: 'user', content: instruction }
       ],
       response_format: { type: 'json_object' },
-    });
+    }, { purpose: 'task_refine_instruction' });
     const result = JSON.parse(res.choices[0].message.content);
     return {
       refinedInstruction: result.refinedInstruction || instruction,
@@ -174,7 +175,7 @@ async function refineEmailInstruction(instruction) {
   }
 
   try {
-    const res = await openai.chat.completions.create({
+    const res = await trackedCompletion(openai, {
       model: 'gpt-4o-mini',
       max_tokens: 500,
       messages: [
@@ -205,7 +206,7 @@ Respond with JSON only: {"refinedInstruction": string, "refinementNote": string,
         { role: 'user', content: instruction }
       ],
       response_format: { type: 'json_object' },
-    });
+    }, { purpose: 'email_task_refine_instruction' });
     const result = JSON.parse(res.choices[0].message.content);
     return {
       refinedInstruction: result.refinedInstruction || instruction,

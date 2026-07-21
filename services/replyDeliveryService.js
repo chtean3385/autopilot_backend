@@ -3,8 +3,7 @@ const EmailSenderService = require('./emailSenderService');
 const SuppressionService = require('./suppressionService');
 const WABAService = require('./wabaService');
 const { renderEmailBody, escapeHtml } = require('../utils/emailRender');
-
-const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+const { getBackendUrl } = require('../utils/backendUrlConfig');
 
 async function logAgentAction(leadId, action, { detail, draftText, score, decision } = {}) {
   await pool.query(
@@ -54,7 +53,7 @@ async function rescheduleFollowUp(leadSeq) {
 // draft, or queue it for human review if the judge scored it too low.
 async function sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentActionLabel }) {
   if (result.decision === 'send') {
-    const unsubscribeUrl = `${BACKEND_URL}/unsubscribe?token=${SuppressionService.generateToken(lead.email)}`;
+    const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(lead.email)}`;
     const { html, text } = renderEmailBody(result.text, unsubscribeUrl);
     const sendResult = await EmailSenderService.send(sender, { to: lead.email, subject, html, text });
 

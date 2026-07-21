@@ -142,4 +142,74 @@ router.get('/email', async (req, res) => {
   }
 });
 
+// GPT usage/billing rollups from ai_usage_logs (written by utils/aiUsage.js trackedCompletion).
+// cost_usd can be NULL for models missing from the pricing map — SUM() skips NULLs, so totals
+// are "cost of priced calls"; token counts are always complete.
+router.get('/ai-usage', async (req, res) => {
+  try {
+    const [totalsRes, byPurposeRes, byModelRes, byDayRes, recentRes] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*)::int                                                        AS calls,
+          COALESCE(SUM(prompt_tokens), 0)::bigint                              AS prompt_tokens,
+          COALESCE(SUM(completion_tokens), 0)::bigint                          AS completion_tokens,
+          COALESCE(SUM(total_tokens), 0)::bigint                               AS total_tokens,
+          SUM(cost_usd)                                                        AS cost_usd,
+          ROUND(AVG(duration_ms))::int                                         AS avg_duration_ms,
+          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int AS calls_30d,
+          SUM(cost_usd) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') AS cost_usd_30d,
+          COALESCE(SUM(total_tokens) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days'), 0)::bigint AS total_tokens_30d
+        FROM ai_usage_logs
+      `),
+      pool.query(`
+        SELECT purpose,
+          COUNT(*)::int                               AS calls,
+          COALESCE(SUM(prompt_tokens), 0)::bigint     AS prompt_tokens,
+          COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens,
+          SUM(cost_usd)                               AS cost_usd,
+          ROUND(AVG(duration_ms))::int                AS avg_duration_ms
+        FROM ai_usage_logs
+        GROUP BY purpose
+        ORDER BY SUM(cost_usd) DESC NULLS LAST
+      `),
+      pool.query(`
+        SELECT model,
+          COUNT(*)::int                               AS calls,
+          COALESCE(SUM(prompt_tokens), 0)::bigint     AS prompt_tokens,
+          COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens,
+          SUM(cost_usd)                               AS cost_usd,
+          ROUND(AVG(duration_ms))::int                AS avg_duration_ms
+        FROM ai_usage_logs
+        GROUP BY model
+        ORDER BY SUM(cost_usd) DESC NULLS LAST
+      `),
+      pool.query(`
+        SELECT DATE(created_at) AS day, COUNT(*)::int AS calls, SUM(cost_usd) AS cost_usd
+        FROM ai_usage_logs
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY DATE(created_at)
+        ORDER BY day DESC
+      `),
+      pool.query(`
+        SELECT u.id, u.purpose, u.model, u.prompt_tokens, u.completion_tokens, u.total_tokens,
+               u.cost_usd, u.duration_ms, u.created_at, hl.hotel_name
+        FROM ai_usage_logs u
+        LEFT JOIN hotel_leads hl ON hl.id = u.lead_id
+        ORDER BY u.created_at DESC
+        LIMIT 50
+      `),
+    ]);
+
+    res.json({
+      totals: totalsRes.rows[0],
+      byPurpose: byPurposeRes.rows,
+      byModel: byModelRes.rows,
+      byDay: byDayRes.rows,
+      recent: recentRes.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

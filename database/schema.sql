@@ -12,8 +12,10 @@ CREATE TABLE IF NOT EXISTS hotel_leads (
     estimated_rooms INT,
     channel VARCHAR(20) DEFAULT 'whatsapp', -- 'whatsapp', 'email', 'linkedin'
     website VARCHAR(500),
-    email_status VARCHAR(30) DEFAULT 'unknown', -- unknown | found | verified | bounced | unsubscribed
+    email_status VARCHAR(30) DEFAULT 'unknown', -- unknown | found | verified | unverifiable | bounced | unsubscribed
     email_source VARCHAR(50), -- scraped | domain_list | import | hunter | snov | linkedin
+    email_verify_attempts INT DEFAULT 0, -- hourly re-verification worker attempt counter (max 3)
+    last_verify_attempt_at TIMESTAMP,
     status VARCHAR(50) DEFAULT 'new', -- 'new', 'interested', 'demo_qualified', 'responded', 'no_response'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -200,6 +202,7 @@ CREATE TABLE IF NOT EXISTS email_logs (
     body TEXT,
     provider_message_id VARCHAR(255),
     sent_at TIMESTAMP,
+    delivered_at TIMESTAMP,
     opened_at TIMESTAMP,
     clicked_at TIMESTAMP,
     bounced_at TIMESTAMP,
@@ -273,21 +276,83 @@ CREATE TABLE IF NOT EXISTS playbook_examples (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Cached per-lead website research + audit + drafted cold email (leadResearchService.js)
+-- Cached per-lead company research (one GPT-5.5 call, researchCompany() in leadResearchService.js) —
+-- email drafting, reply QA, and intent classification stay on gpt-4o-mini elsewhere and just read this.
 CREATE TABLE IF NOT EXISTS lead_research (
   id SERIAL PRIMARY KEY,
   lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,
-  business_profile JSON,
-  website_audit JSON,
+  company JSON,
+  summary TEXT,
+  business JSON,
+  technology JSON,
   pain_points JSON,
-  opportunities JSON,
   recommended_services JSON,
-  email_subject VARCHAR(500),
-  email_body TEXT,
-  confidence VARCHAR(20),
+  opportunity_score JSON,
+  email_angles JSON,
+  decision_makers JSON,
+  confidence INT,
+  confidence_breakdown JSON,
+  schema_version INT DEFAULT 1,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_research_lead_id ON lead_research(lead_id);
+
+-- Append-only history of every researchCompany() run (lead_research keeps only the current one;
+-- see migrate_lead_research_v3.sql). Never updated or pruned.
+CREATE TABLE IF NOT EXISTS lead_research_versions (
+  id SERIAL PRIMARY KEY,
+  lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,
+  version INT NOT NULL,
+  company JSON,
+  summary TEXT,
+  business JSON,
+  technology JSON,
+  pain_points JSON,
+  recommended_services JSON,
+  opportunity_score JSON,
+  email_angles JSON,
+  decision_makers JSON,
+  confidence INT,
+  confidence_breakdown JSON,
+  schema_version INT DEFAULT 2,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_research_versions_lead_version ON lead_research_versions(lead_id, version);
+CREATE INDEX IF NOT EXISTS idx_lead_research_versions_lead_created ON lead_research_versions(lead_id, created_at DESC);
+
+-- Third Sprint: Proposal Generator. One AI-generated sales proposal per lead (regenerable cache,
+-- same pattern as lead_research), grounded in that lead's lead_research row. See proposalService.js.
+CREATE TABLE IF NOT EXISTS proposals (
+  id SERIAL PRIMARY KEY,
+  lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,
+  proposal JSON,
+  timeline JSON,
+  quotation JSON,
+  architecture JSON,
+  current_vs_future JSON,
+  roi JSON,
+  status VARCHAR(20) DEFAULT 'draft', -- 'draft', 'sent'
+  sent_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_lead_id ON proposals(lead_id);
+
+-- Per-call GPT usage/billing log (utils/aiUsage.js trackedCompletion). lead_id is
+-- ON DELETE SET NULL — billing history survives lead deletion, unlike agent_actions.
+CREATE TABLE IF NOT EXISTS ai_usage_logs (
+  id SERIAL PRIMARY KEY,
+  lead_id INT REFERENCES hotel_leads(id) ON DELETE SET NULL,
+  purpose VARCHAR(50) NOT NULL,
+  model VARCHAR(80),
+  prompt_tokens INT,
+  completion_tokens INT,
+  total_tokens INT,
+  cost_usd NUMERIC(12,6),
+  duration_ms INT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_created ON ai_usage_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_purpose ON ai_usage_logs(purpose, created_at DESC);
 
 -- Tracks the last run of each background scheduler/worker job (WhatsApp follow-ups,
 -- email sequence worker, ...) so the UI can show "last ran: X" and prove a Render-sleep
@@ -314,6 +379,7 @@ CREATE INDEX IF NOT EXISTS idx_lead_sequences_sender ON lead_sequences(sender_id
 CREATE INDEX IF NOT EXISTS idx_lead_sequences_status ON lead_sequences(status);
 CREATE INDEX IF NOT EXISTS idx_email_logs_lead ON email_logs(lead_id);
 CREATE INDEX IF NOT EXISTS idx_email_logs_sender ON email_logs(sender_id);
+CREATE INDEX IF NOT EXISTS idx_email_logs_provider_message_id ON email_logs(provider_message_id);
 CREATE INDEX IF NOT EXISTS idx_agent_actions_lead ON agent_actions(lead_id);
 CREATE INDEX IF NOT EXISTS idx_pending_approvals_lead ON pending_approvals(lead_id);
 CREATE INDEX IF NOT EXISTS idx_pending_approvals_status ON pending_approvals(status);

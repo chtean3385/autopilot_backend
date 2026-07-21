@@ -10,8 +10,17 @@ function isValidResult(result) {
   return result === 'deliverable';
 }
 
+// Free-mail providers reject non-existent recipients at SMTP time, so an address that
+// exists on these domains is near-always deliverable. Auto-verifying them saves API
+// quota and avoids the catch-all 'unverifiable' trap that blocks real addresses.
+const FREE_MAIL_AUTO_VERIFY = /@(gmail\.com|googlemail\.com)$/i;
+
 // Normalized shape so MillionVerifier/Hunter can be swapped in behind the same interface.
 async function verifyEmail(email) {
+  if (FREE_MAIL_AUTO_VERIFY.test(String(email).trim())) {
+    return { valid: true, status: 'deliverable', source: 'freemail_auto' };
+  }
+
   const apiKey = await getSetting('VERIFIER_API_KEY');
   if (!apiKey) {
     console.error('[EmailVerifier] verifyEmail error: VERIFIER_API_KEY not configured');
