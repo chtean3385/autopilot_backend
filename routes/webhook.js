@@ -128,31 +128,22 @@ router.post('/whatsapp', async (req, res) => {
               continue;
             }
 
-            const isDemo = /\bDEMO\b|interested|yes|want|need|sure/i.test(msgText);
-            const newLeadStatus = isDemo ? 'demo_qualified' : 'responded';
-
-            // Update the most recent outreach log for this lead
+            // Record the raw inbound on the most recent outreach log. Status and demo
+            // qualification are decided by the agent AFTER its auto-responder check —
+            // a hotel's own WhatsApp greeting bot must never flip lead status (the old
+            // keyword regex here marked auto-replies demo_qualified, which also removed
+            // the lead from the daily follow-up pool).
             await pool.query(
               `UPDATE outreach_logs
                SET response_received = true,
                    response_text = $1,
-                   response_received_at = NOW(),
-                   qualified_for_demo = $2,
-                   lead_status_after = $3
+                   response_received_at = NOW()
                WHERE id = (
-                 SELECT id FROM outreach_logs WHERE lead_id = $4
+                 SELECT id FROM outreach_logs WHERE lead_id = $2
                  ORDER BY sent_at DESC LIMIT 1
                )`,
-              [msgText, isDemo, newLeadStatus, leadId]
+              [msgText, leadId]
             );
-
-            // Update lead status
-            await pool.query(
-              `UPDATE hotel_leads SET status = $1, updated_at = NOW() WHERE id = $2`,
-              [newLeadStatus, leadId]
-            );
-
-            console.log(`[Webhook] Lead ${leadId} → ${newLeadStatus} (demo: ${isDemo})`);
 
             // AI agent auto-replies to qualify the lead
             const leadRow = await pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId]);

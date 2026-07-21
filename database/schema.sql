@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS outreach_logs (
     response_received_at TIMESTAMP,
     qualified_for_demo BOOLEAN DEFAULT FALSE,
     lead_status_after VARCHAR(50), -- 'interested', 'demo_qualified', etc
+    is_auto_reply BOOLEAN DEFAULT FALSE, -- response_text was the business's own WhatsApp auto-responder, not a human
     error_message TEXT
 );
 

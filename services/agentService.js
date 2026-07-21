@@ -197,12 +197,27 @@ async function classifyIncomingMessage(incomingText, leadId = null) {
   }
 }
 
+// Stamp the outreach_logs row holding the response the webhook just recorded.
+async function markLatestResponse(leadId, setClause, params) {
+  await pool.query(
+    `UPDATE outreach_logs SET ${setClause}
+     WHERE id = (
+       SELECT id FROM outreach_logs
+       WHERE lead_id = $1 AND response_received = true
+       ORDER BY response_received_at DESC NULLS LAST LIMIT 1
+     )`,
+    [leadId, ...params]
+  );
+}
+
 async function getConversationHistory(leadId) {
+  // Auto-responder texts are excluded — they'd read as the lead saying "thank you for
+  // contacting us", and GPT would answer the lead's greeting bot instead of the human.
   const result = await pool.query(
     `SELECT
        message_type,
        message_text,
-       response_text,
+       CASE WHEN is_auto_reply THEN NULL ELSE response_text END AS response_text,
        sent_at
      FROM outreach_logs
      WHERE lead_id = $1
@@ -229,7 +244,22 @@ async function handleReply(lead, incomingText) {
     const messageType = await classifyIncomingMessage(incomingText, lead.id);
     if (messageType === 'auto_reply') {
       console.log(`[Agent] Lead ${lead.id} message looks like the business's own auto-responder, not a human — not replying: "${incomingText}"`);
+      // Flag it so it never counts as a real response: excluded from GPT history,
+      // no status change, and the lead stays in the daily template follow-up pool.
+      await markLatestResponse(lead.id, `is_auto_reply = TRUE, lead_status_after = 'auto_reply'`, []);
       return;
+    }
+
+    // A human replied — mark it before drafting, so the lead reads 'responded' even if
+    // the GPT call or send fails below. QUALIFIED/NOT_INTERESTED refine this further down.
+    // 'stalled'/'dead' leads that come back to life re-enter the follow-up pool here;
+    // demo_qualified / not_interested / opted_out are never downgraded by a mere reply.
+    await markLatestResponse(lead.id, `lead_status_after = 'responded'`, []);
+    if (['new', 'stalled', 'dead'].includes(lead.status)) {
+      await pool.query(
+        `UPDATE hotel_leads SET status = 'responded', updated_at = NOW() WHERE id = $1`,
+        [lead.id]
+      );
     }
 
     const [systemPrompt, history] = await Promise.all([
@@ -278,6 +308,7 @@ async function handleReply(lead, incomingText) {
         `UPDATE hotel_leads SET status = 'demo_qualified', updated_at = NOW() WHERE id = $1`,
         [lead.id]
       );
+      await markLatestResponse(lead.id, `qualified_for_demo = TRUE, lead_status_after = 'demo_qualified'`, []);
       await notifyOwner(lead, incomingText);
       console.log(`[Agent] Lead ${lead.id} QUALIFIED — owner notified`);
     } else if (status === 'NOT_INTERESTED') {
@@ -285,6 +316,7 @@ async function handleReply(lead, incomingText) {
         `UPDATE hotel_leads SET status = 'not_interested', updated_at = NOW() WHERE id = $1`,
         [lead.id]
       );
+      await markLatestResponse(lead.id, `lead_status_after = 'not_interested'`, []);
       console.log(`[Agent] Lead ${lead.id} marked NOT_INTERESTED`);
     }
 
