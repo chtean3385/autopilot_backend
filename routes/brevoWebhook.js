@@ -48,6 +48,12 @@ async function stopSequencesForLead(leadId, reason) {
 // Transactional → Settings → Webhook, URL: {BACKEND_URL}/webhooks/brevo?token={BREVO_WEBHOOK_TOKEN},
 // or use Brevo's "Token" authentication method (sent as Authorization: Bearer <token>).
 // Select events: delivered, hard bounce, soft bounce, blocked, invalid email, spam, opened, clicked, unsubscribed
+
+// Browser-friendly check — Brevo itself always POSTs
+router.get('/', (req, res) => {
+  res.json({ ok: true, note: 'Brevo webhook is live — events are received via POST' });
+});
+
 router.post('/', async (req, res) => {
   const expectedToken = process.env.BREVO_WEBHOOK_TOKEN;
   if (expectedToken) {
