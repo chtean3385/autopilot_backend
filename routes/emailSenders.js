@@ -36,7 +36,7 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ success: false, error: 'from_email is required' });
     }
     const sender = await EmailSenderService.create(req.body);
-    res.json({ success: true, sender });
+    res.json({ success: true, sender: mask(sender, req.query.reveal === '1') });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -46,7 +46,7 @@ router.put('/:id', async (req, res) => {
   try {
     const sender = await EmailSenderService.update(req.params.id, req.body);
     if (!sender) return res.status(404).json({ success: false, error: 'Sender not found' });
-    res.json({ success: true, sender });
+    res.json({ success: true, sender: mask(sender, req.query.reveal === '1') });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -56,7 +56,7 @@ router.post('/:id/pause', async (req, res) => {
   try {
     const sender = await EmailSenderService.pause(req.params.id);
     if (!sender) return res.status(404).json({ success: false, error: 'Sender not found' });
-    res.json({ success: true, sender });
+    res.json({ success: true, sender: mask(sender, req.query.reveal === '1') });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -66,7 +66,7 @@ router.post('/:id/activate', async (req, res) => {
   try {
     const sender = await EmailSenderService.activate(req.params.id);
     if (!sender) return res.status(404).json({ success: false, error: 'Sender not found' });
-    res.json({ success: true, sender });
+    res.json({ success: true, sender: mask(sender, req.query.reveal === '1') });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
