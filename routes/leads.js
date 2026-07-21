@@ -130,7 +130,7 @@ router.get('/search', async (req, res) => {
         return {
           hotel_name: r.name || '',
           owner_name: '',
-          email: detail.website || '',
+          website: detail.website || '',
           whatsapp_number: phone.replace(/\D/g, ''),
           phone,
           city: extractCity(r.formatted_address, city),
@@ -158,7 +158,7 @@ router.get('/search', async (req, res) => {
     const places = (response.data.places || []).map(p => ({
       hotel_name: p.title,
       owner_name: '',
-      email: p.website || '',
+      website: p.website || '',
       whatsapp_number: rawPhone(p).replace(/\D/g, ''),
       phone: rawPhone(p),
       city: extractCity(p.address, city),
@@ -177,7 +177,7 @@ router.get('/search', async (req, res) => {
 
 // Get all leads — paginated, enriched with score + group + campaign + message_sent
 router.get('/', async (req, res) => {
-  const { city, status, q, channel, page = 1, pageSize = 25 } = req.query;
+  const { city, status, q, channel, sequenceEnrollment, page = 1, pageSize = 25 } = req.query;
   const limit = Math.min(Math.max(Number(pageSize) || 25, 1), 100);
   const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
@@ -195,6 +195,14 @@ router.get('/', async (req, res) => {
   if (q) {
     const p = addParam(`%${q}%`);
     conditions.push(`(hl.hotel_name ILIKE ${p} OR hl.whatsapp_number LIKE ${p} OR hl.owner_name ILIKE ${p})`);
+  }
+  // Finds leads never enrolled in any sequence (any status — active/paused/waiting/dead all
+  // count as "has been enrolled at some point") so the owner can spot untouched leads and
+  // bulk-select them into "✉️ Enroll in Sequence". No bind param needed — pure EXISTS subquery.
+  if (sequenceEnrollment === 'unassigned') {
+    conditions.push(`NOT EXISTS (SELECT 1 FROM lead_sequences ls WHERE ls.lead_id = hl.id)`);
+  } else if (sequenceEnrollment === 'enrolled') {
+    conditions.push(`EXISTS (SELECT 1 FROM lead_sequences ls WHERE ls.lead_id = hl.id)`);
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';

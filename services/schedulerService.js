@@ -382,7 +382,7 @@ async function scrapeLeads(city, count, businessType = 'businesses', filterHasWe
       leads.push({
         hotel_name: r.name || '',
         owner_name: r.name || '',
-        email: detail.website || '',
+        website: detail.website || '',
         whatsapp_number: mobile,
         phone: rawPhone,
         city: extractCity(r.formatted_address, city),
@@ -529,11 +529,11 @@ async function saveLeads(leads) {
 
       const result = await pool.query(
         `INSERT INTO hotel_leads
-           (hotel_name, owner_name, email, whatsapp_number, city, phone, source, business_category, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'new')
+           (hotel_name, owner_name, email, whatsapp_number, city, phone, source, business_category, website, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'new')
          RETURNING id`,
-        [lead.hotel_name, lead.owner_name, lead.email, lead.whatsapp_number,
-         lead.city, lead.phone, lead.source, lead.business_category || null]
+        [lead.hotel_name, lead.owner_name, lead.email || '', lead.whatsapp_number,
+         lead.city, lead.phone, lead.source, lead.business_category || null, lead.website || '']
       );
       if (result.rows[0]) savedIds.push(result.rows[0].id);
     } catch (err) {
