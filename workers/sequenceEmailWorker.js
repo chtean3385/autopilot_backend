@@ -342,6 +342,17 @@ async function runSequenceForLead(leadId) {
       deferred: 'Email composition failed — it will retry automatically in 1 hour.',
       failed: 'Send failed — check the email logs for the provider error.',
     };
+    if (outcome === 'no_sender') {
+      // Spell out exactly which sender is blocked and why — "no capacity" alone is useless
+      const senders = (await pool.query('SELECT * FROM email_senders')).rows;
+      messages.no_sender = senders.length
+        ? 'No sender capacity: ' + senders.map(s => {
+            const cap = EmailSenderService.effectiveDailyCap(s);
+            const warmupNote = s.warmup_started_at && cap < s.daily_cap ? ` (warmup, full cap ${s.daily_cap})` : '';
+            return `${s.from_email} — ${s.status}, sent ${s.sent_today}/${cap} today${warmupNote}`;
+          }).join(' · ') + '. Raise the daily cap in Settings → Email Senders, or wait for the midnight-UTC reset.'
+        : 'No email senders configured — add one in Settings → Email Senders.';
+    }
     return { outcome, step: stepBefore + 1, email: row.lead_email, message: messages[outcome] || outcome };
   } finally {
     isRunning = false;
