@@ -45,12 +45,18 @@ async function stopSequencesForLead(leadId, reason) {
 }
 
 // Brevo transactional webhook — configure in Brevo dashboard:
-// Transactional → Settings → Webhook, URL: {BACKEND_URL}/webhooks/brevo?token={BREVO_WEBHOOK_TOKEN}
+// Transactional → Settings → Webhook, URL: {BACKEND_URL}/webhooks/brevo?token={BREVO_WEBHOOK_TOKEN},
+// or use Brevo's "Token" authentication method (sent as Authorization: Bearer <token>).
 // Select events: delivered, hard bounce, soft bounce, blocked, invalid email, spam, opened, clicked, unsubscribed
 router.post('/', async (req, res) => {
   const expectedToken = process.env.BREVO_WEBHOOK_TOKEN;
-  if (expectedToken && req.query.token !== expectedToken) {
-    return res.status(401).json({ error: 'Invalid token' });
+  if (expectedToken) {
+    const auth = req.get('authorization') || '';
+    const headerToken = auth.replace(/^Bearer\s+/i, '').trim();
+    const provided = req.query.token || headerToken;
+    if (provided !== expectedToken) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
   }
 
   // Always ack fast — Brevo retries on non-2xx, and a processing bug shouldn't
