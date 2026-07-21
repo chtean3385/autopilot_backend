@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS hotel_leads (
     email_verify_attempts INT DEFAULT 0, -- hourly re-verification worker attempt counter (max 3)
     last_verify_attempt_at TIMESTAMP,
     status VARCHAR(50) DEFAULT 'new', -- 'new', 'interested', 'demo_qualified', 'responded', 'no_response'
+    archived_at TIMESTAMP, -- inbox conversation archived (hidden from main list); NULL = not archived
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

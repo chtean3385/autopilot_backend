@@ -24,6 +24,7 @@ router.get('/', async (req, res) => {
         hl.whatsapp_number,
         hl.city,
         hl.status AS lead_status,
+        hl.archived_at,
         c.campaign_name,
         t.template_name
       FROM outreach_logs ol
@@ -145,14 +146,32 @@ router.post('/reply', async (req, res) => {
   }
 });
 
-// GET /api/inbox/count — unread badge count
+// PUT /api/inbox/:leadId/archive — archive/unarchive a conversation.
+// UI organization only: does not touch lead status, sending, or follow-ups.
+router.put('/:leadId/archive', async (req, res) => {
+  const { archived } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE hotel_leads SET archived_at = ${archived ? 'NOW()' : 'NULL'} WHERE id = $1 RETURNING id, archived_at`,
+      [req.params.leadId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Lead not found' });
+    res.json({ success: true, archived_at: result.rows[0].archived_at });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/inbox/count — unread badge count (archived conversations don't count)
 router.get('/count', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT COUNT(*) AS count
-      FROM outreach_logs
-      WHERE response_received = true
-        AND (lead_status_after IS NULL OR lead_status_after = 'responded')
+      FROM outreach_logs ol
+      JOIN hotel_leads hl ON hl.id = ol.lead_id
+      WHERE ol.response_received = true
+        AND (ol.lead_status_after IS NULL OR ol.lead_status_after = 'responded')
+        AND hl.archived_at IS NULL
     `);
     res.json({ count: parseInt(result.rows[0].count, 10) });
   } catch (err) {

@@ -40,6 +40,7 @@ async function initDB() {
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS parameter_mapping JSON;
     ALTER TABLE outreach_logs ADD COLUMN IF NOT EXISTS message_text TEXT;
     ALTER TABLE outreach_logs ADD COLUMN IF NOT EXISTS is_auto_reply BOOLEAN DEFAULT FALSE;
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
     CREATE TABLE IF NOT EXISTS lead_groups (
       id SERIAL PRIMARY KEY,
       name VARCHAR(255) NOT NULL UNIQUE,
