@@ -42,7 +42,8 @@ async function getServiceContext() {
 
 // Assembles a portfolio reply from portfolio_items + cached site content, scores it via the
 // quality gate, and sends (or queues for human review) — leaving the sequence to continue.
-async function sendPortfolioReply({ lead, leadSeq, sender, incomingMessage, subject, conversationHistory }) {
+// `inReplyTo` (the inbound email's message id) flows through to the threading headers.
+async function sendPortfolioReply({ lead, leadSeq, sender, incomingMessage, subject, conversationHistory, inReplyTo }) {
   const [portfolioItems, serviceContext, playbookContext] = await Promise.all([
     fetchPortfolioItems(),
     getServiceContext(),
@@ -54,7 +55,7 @@ async function sendPortfolioReply({ lead, leadSeq, sender, incomingMessage, subj
     playbookExamples: playbookContext.fewShotExamples, playbookNotes: playbookContext.notes,
   });
 
-  await sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentActionLabel: 'portfolio_sent' });
+  await sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentActionLabel: 'portfolio_sent', inReplyTo });
 }
 
 module.exports = { sendPortfolioReply, fetchPortfolioItems, getServiceContext };

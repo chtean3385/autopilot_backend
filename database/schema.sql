@@ -203,6 +203,7 @@ CREATE TABLE IF NOT EXISTS email_logs (
     subject VARCHAR(500),
     body TEXT,
     provider_message_id VARCHAR(255),
+    tracking_token VARCHAR(64), -- self-hosted open/click pixel+redirect token (routes/tracking.js)
     sent_at TIMESTAMP,
     delivered_at TIMESTAMP,
     opened_at TIMESTAMP,
@@ -211,6 +212,7 @@ CREATE TABLE IF NOT EXISTS email_logs (
     error TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_email_logs_tracking_token ON email_logs(tracking_token);
 
 -- Agent decision log (visible in Analytics)
 CREATE TABLE IF NOT EXISTS agent_actions (

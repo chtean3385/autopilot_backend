@@ -92,10 +92,10 @@ async function handleNotInterested(lead, leadSeq) {
   await logAgentAction(lead.id, 'sequence_stopped', { detail: { reason: 'not_interested' }, decision: 'not_interested' });
 }
 
-async function handleWantsEstimate(lead, leadSeq, sender, incomingText, subject, conversationHistory) {
+async function handleWantsEstimate(lead, leadSeq, sender, incomingText, subject, conversationHistory, messageId) {
   await pool.query(
     `INSERT INTO pending_approvals (type, lead_id, payload, status) VALUES ('estimate', $1, $2, 'pending')`,
-    [lead.id, JSON.stringify({ incomingMessage: incomingText, subject })]
+    [lead.id, JSON.stringify({ incomingMessage: incomingText, subject, inReplyTo: messageId || null })]
   );
   if (leadSeq) {
     await pool.query(
@@ -128,13 +128,13 @@ async function handleWantsEstimate(lead, leadSeq, sender, incomingText, subject,
   );
 }
 
-async function handleQuestion(lead, leadSeq, sender, incomingText, subject, conversationHistory) {
+async function handleQuestion(lead, leadSeq, sender, incomingText, subject, conversationHistory, messageId) {
   const { fewShotExamples, notes } = await PlaybookService.getPlaybookContext();
   const result = await ReplyQualityService.draftAndScore({
     leadId: lead.id, lead, incomingMessage: incomingText, conversationHistory,
     playbookExamples: fewShotExamples, playbookNotes: notes,
   });
-  await sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentActionLabel: 'draft_sent' });
+  await sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentActionLabel: 'draft_sent', inReplyTo: messageId });
 }
 
 async function handleIncomingMessage(sender, { fromAddress, subject, text, messageId, date }) {
@@ -173,11 +173,11 @@ async function handleIncomingMessage(sender, { fromAddress, subject, text, messa
       await handleNotInterested(lead, leadSeq);
       break;
     case 'wants_estimate':
-      await handleWantsEstimate(lead, leadSeq, sender, text, subject, conversationHistory);
+      await handleWantsEstimate(lead, leadSeq, sender, text, subject, conversationHistory, messageId);
       break;
     case 'wants_portfolio':
       await PortfolioReplyService.sendPortfolioReply({
-        lead, leadSeq, sender, incomingMessage: text, subject: replySubject, conversationHistory,
+        lead, leadSeq, sender, incomingMessage: text, subject: replySubject, conversationHistory, inReplyTo: messageId,
       });
       break;
     case 'auto_reply':
@@ -185,7 +185,7 @@ async function handleIncomingMessage(sender, { fromAddress, subject, text, messa
       break;
     case 'question':
     default:
-      await handleQuestion(lead, leadSeq, sender, text, replySubject, conversationHistory);
+      await handleQuestion(lead, leadSeq, sender, text, replySubject, conversationHistory, messageId);
       break;
   }
 

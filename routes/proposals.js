@@ -7,6 +7,8 @@ const SuppressionService = require('../services/suppressionService');
 const { logAgentAction } = require('../services/replyDeliveryService');
 const { escapeHtml, unsubscribeFooterHtml } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
+const { generateTrackingToken, buildPixelUrl } = require('../utils/emailTracking');
+const { getThreadHeaders } = require('../utils/emailThreading');
 
 const router = express.Router();
 
@@ -177,17 +179,24 @@ router.post('/:id/send', async (req, res) => {
     if (!sender) return res.status(400).json({ error: 'No active email sender available to send from' });
 
     const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(row.lead_email)}`;
+    const trackingToken = generateTrackingToken();
     const subject = `Proposal for ${row.hotel_name} — Dreams Technology`;
-    const html = `${buildProposalHtml(row.hotel_name, row)}\n${unsubscribeFooterHtml(unsubscribeUrl)}`;
+    const html = `${buildProposalHtml(row.hotel_name, row)}\n${unsubscribeFooterHtml(unsubscribeUrl, buildPixelUrl(trackingToken))}`;
     const text = `${buildProposalText(row.hotel_name, row)}\n\n—\nDreams Technology\nDon't want these emails? Unsubscribe: ${unsubscribeUrl}`;
 
-    const sendResult = await EmailSenderService.send(sender, { to: row.lead_email, subject, html, text });
+    // Proposals are usually sent mid-conversation from the thread view — thread onto it
+    const thread = await getThreadHeaders(row.lead_id);
+
+    const sendResult = await EmailSenderService.send(sender, {
+      to: row.lead_email, subject, html, text,
+      unsubscribeUrl, inReplyTo: thread.inReplyTo, references: thread.references,
+    });
     if (!sendResult.success) return res.status(502).json({ error: sendResult.error });
 
     await pool.query(
-      `INSERT INTO email_logs (lead_id, sender_id, direction, subject, body, provider_message_id, sent_at)
-       VALUES ($1, $2, 'out', $3, $4, $5, NOW())`,
-      [row.lead_id, sender.id, subject, html, sendResult.messageId]
+      `INSERT INTO email_logs (lead_id, sender_id, direction, subject, body, provider_message_id, tracking_token, sent_at)
+       VALUES ($1, $2, 'out', $3, $4, $5, $6, NOW())`,
+      [row.lead_id, sender.id, subject, html, sendResult.messageId, trackingToken]
     );
     await pool.query(`UPDATE proposals SET status='sent', sent_at=NOW() WHERE id=$1`, [row.id]);
     await logAgentAction(row.lead_id, 'proposal_sent', { detail: { subject }, decision: 'send' });

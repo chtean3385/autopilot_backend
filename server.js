@@ -159,6 +159,13 @@ async function initDB() {
       ON hotel_leads (LOWER(email))
       WHERE email IS NOT NULL AND email <> '';
 
+    -- Bugfix backfill (database/migrate_fix_whatsapp_website.sql): the WhatsApp scraper and the
+    -- manual "Search Leads" preview used to store the Places website URL into the email column
+    -- instead of the website column. Idempotent -- after the first run no row matches this WHERE.
+    UPDATE hotel_leads
+      SET website = email, email = '', email_status = 'unknown', updated_at = NOW()
+      WHERE email ~* '^https?://' AND (website IS NULL OR website = '');
+
     CREATE TABLE IF NOT EXISTS email_senders (
       id SERIAL PRIMARY KEY,
       label VARCHAR(100) NOT NULL,
@@ -217,7 +224,9 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP;
+    ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS tracking_token VARCHAR(64);
     CREATE INDEX IF NOT EXISTS idx_email_logs_provider_message_id ON email_logs(provider_message_id);
+    CREATE INDEX IF NOT EXISTS idx_email_logs_tracking_token ON email_logs(tracking_token);
     CREATE TABLE IF NOT EXISTS agent_actions (
       id SERIAL PRIMARY KEY,
       lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,
@@ -379,6 +388,7 @@ app.use(express.json());
 app.use('/webhook', require('./routes/webhook'));
 app.use('/webhooks/brevo', require('./routes/brevoWebhook'));
 app.use('/unsubscribe', require('./routes/unsubscribe'));
+app.use('/t', require('./routes/tracking'));
 app.use('/api/leads', require('./routes/leads'));
 app.use('/api/campaigns', require('./routes/campaigns'));
 app.use('/api/templates', require('./routes/templates'));

@@ -151,9 +151,22 @@ class EmailSenderService {
     return this.pickSenderForRotation();
   }
 
-  static async send(sender, { to, subject, html, text }) {
+  // Optional extras beyond the body:
+  // - unsubscribeUrl → RFC 8058 List-Unsubscribe + one-click POST headers (Gmail/Yahoo bulk-sender
+  //   requirement; POST /unsubscribe?token=... already unsubscribes without confirmation)
+  // - inReplyTo/references → RFC 5322 threading headers so replies/follow-ups land in the
+  //   recipient's existing conversation (built by utils/emailThreading.js)
+  static async send(sender, { to, subject, html, text, unsubscribeUrl, inReplyTo, references }) {
     try {
       let messageId;
+
+      const extraHeaders = {};
+      if (unsubscribeUrl) {
+        extraHeaders['List-Unsubscribe'] = `<${unsubscribeUrl}>`;
+        extraHeaders['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click';
+      }
+      if (inReplyTo) extraHeaders['In-Reply-To'] = inReplyTo;
+      if (references) extraHeaders['References'] = references;
 
       if (sender.provider === 'brevo') {
         const response = await axios.post(
@@ -164,6 +177,7 @@ class EmailSenderService {
             subject,
             htmlContent: html,
             textContent: text || undefined,
+            ...(Object.keys(extraHeaders).length > 0 ? { headers: extraHeaders } : {}),
           },
           { headers: { 'api-key': sender.api_key, 'Content-Type': 'application/json' } }
         );
@@ -182,6 +196,7 @@ class EmailSenderService {
           subject,
           html,
           text,
+          headers: Object.keys(extraHeaders).length > 0 ? extraHeaders : undefined,
         });
         messageId = info.messageId;
       } else {

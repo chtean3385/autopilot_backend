@@ -4,6 +4,8 @@ const SuppressionService = require('./suppressionService');
 const WABAService = require('./wabaService');
 const { renderEmailBody, escapeHtml } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
+const { generateTrackingToken, buildPixelUrl, buildClickUrl } = require('../utils/emailTracking');
+const { getThreadHeaders } = require('../utils/emailThreading');
 
 async function logAgentAction(leadId, action, { detail, draftText, score, decision } = {}) {
   await pool.query(
@@ -50,18 +52,26 @@ async function rescheduleFollowUp(leadSeq) {
 }
 
 // Shared tail for any GPT-drafted reply (portfolio, question, etc.): send the quality-gated
-// draft, or queue it for human review if the judge scored it too low.
-async function sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentActionLabel }) {
+// draft, or queue it for human review if the judge scored it too low. `inReplyTo` is the raw
+// provider message id of the inbound email being answered — it drives the threading headers
+// and is carried in the queued payload so a later human-approved send still threads correctly.
+async function sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentActionLabel, inReplyTo }) {
   if (result.decision === 'send') {
     const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(lead.email)}`;
-    const { html, text } = renderEmailBody(result.text, unsubscribeUrl);
-    const sendResult = await EmailSenderService.send(sender, { to: lead.email, subject, html, text });
+    const trackingToken = generateTrackingToken();
+    const tracking = { pixelUrl: buildPixelUrl(trackingToken), trackUrl: (url) => buildClickUrl(trackingToken, url) };
+    const thread = await getThreadHeaders(lead.id, inReplyTo);
+    const { html, text } = renderEmailBody(result.text, unsubscribeUrl, tracking);
+    const sendResult = await EmailSenderService.send(sender, {
+      to: lead.email, subject, html, text,
+      unsubscribeUrl, inReplyTo: thread.inReplyTo, references: thread.references,
+    });
 
     if (sendResult.success) {
       await pool.query(
-        `INSERT INTO email_logs (lead_id, sender_id, sequence_id, direction, subject, body, provider_message_id, sent_at)
-         VALUES ($1, $2, $3, 'out', $4, $5, $6, NOW())`,
-        [lead.id, sender.id, leadSeq?.sequence_id || null, subject, html, sendResult.messageId]
+        `INSERT INTO email_logs (lead_id, sender_id, sequence_id, direction, subject, body, provider_message_id, tracking_token, sent_at)
+         VALUES ($1, $2, $3, 'out', $4, $5, $6, $7, NOW())`,
+        [lead.id, sender.id, leadSeq?.sequence_id || null, subject, html, sendResult.messageId, trackingToken]
       );
       await logAgentAction(lead.id, sentActionLabel, { detail: { subject }, draftText: result.text, score: result.score, decision: 'send' });
       if (leadSeq && leadSeq.status === 'active') {
@@ -80,7 +90,7 @@ async function sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentAc
 
   await pool.query(
     `INSERT INTO pending_approvals (type, lead_id, payload, status) VALUES ('low_score_reply', $1, $2, 'pending')`,
-    [lead.id, JSON.stringify({ draftText: result.text, score: result.score, subject })]
+    [lead.id, JSON.stringify({ draftText: result.text, score: result.score, subject, inReplyTo: inReplyTo || null })]
   );
   await notifyOwner(
     sender,

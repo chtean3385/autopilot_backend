@@ -6,6 +6,8 @@ const { logAgentAction } = require('../services/replyDeliveryService');
 const PlaybookService = require('../services/playbookService');
 const { escapeHtml, unsubscribeFooterHtml, renderEmailBody } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
+const { generateTrackingToken, buildPixelUrl, buildClickUrl } = require('../utils/emailTracking');
+const { getThreadHeaders } = require('../utils/emailThreading');
 
 const router = express.Router();
 
@@ -160,8 +162,10 @@ router.post('/:approvalId/approve', async (req, res) => {
 
     const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(approval.lead_email)}`;
     const leadSeq = await getLeadSequence(approval.lead_id);
+    const trackingToken = generateTrackingToken();
+    const tracking = { pixelUrl: buildPixelUrl(trackingToken), trackUrl: (url) => buildClickUrl(trackingToken, url) };
 
-    let subject, html, text, actionLabel;
+    let subject, html, text, actionLabel, threadInReplyTo;
 
     if (approval.type === 'estimate') {
       const estimateResult = await pool.query('SELECT * FROM estimates WHERE approval_id = $1', [approval.id]);
@@ -172,9 +176,10 @@ router.post('/:approvalId/approve', async (req, res) => {
       }
       const payload = typeof approval.payload === 'string' ? JSON.parse(approval.payload || '{}') : (approval.payload || {});
       subject = payload.subject ? `Re: ${payload.subject.replace(/^re:\s*/i, '')}` : 'Your estimate from Dreams Technology';
-      html = `${buildEstimateHtml(approval, lineItems, Number(estimate.total), req.body.notes)}\n${unsubscribeFooterHtml(unsubscribeUrl)}`;
+      html = `${buildEstimateHtml(approval, lineItems, Number(estimate.total), req.body.notes)}\n${unsubscribeFooterHtml(unsubscribeUrl, tracking.pixelUrl)}`;
       text = `${buildEstimateText(approval, lineItems, Number(estimate.total), req.body.notes)}\n\n—\nDreams Technology\nDon't want these emails? Unsubscribe: ${unsubscribeUrl}`;
       actionLabel = 'estimate_sent';
+      threadInReplyTo = payload.inReplyTo || null;
     } else if (approval.type === 'low_score_reply') {
       const payload = typeof approval.payload === 'string' ? JSON.parse(approval.payload || '{}') : (approval.payload || {});
       const draftText = req.body.draft_text || payload.draftText;
@@ -183,24 +188,32 @@ router.post('/:approvalId/approve', async (req, res) => {
       if (req.body.draft_text && req.body.draft_text !== payload.draftText) {
         await PlaybookService.captureCorrection({ leadId: approval.lead_id, before: payload.draftText, after: draftText });
       }
-      const rendered = renderEmailBody(draftText, unsubscribeUrl);
+      const rendered = renderEmailBody(draftText, unsubscribeUrl, tracking);
       subject = payload.subject ? (/^re:/i.test(payload.subject) ? payload.subject : `Re: ${payload.subject}`) : 'Re: your message';
       html = rendered.html;
       text = rendered.text;
       actionLabel = 'draft_sent';
+      threadInReplyTo = payload.inReplyTo || null;
     } else {
       return res.status(400).json({ success: false, error: `Unsupported approval type: ${approval.type}` });
     }
 
-    const sendResult = await EmailSenderService.send(sender, { to: approval.lead_email, subject, html, text });
+    // Older pending rows predate the inReplyTo payload field — getThreadHeaders then falls
+    // back to the lead's latest logged message, which still threads the conversation sanely.
+    const thread = await getThreadHeaders(approval.lead_id, threadInReplyTo);
+
+    const sendResult = await EmailSenderService.send(sender, {
+      to: approval.lead_email, subject, html, text,
+      unsubscribeUrl, inReplyTo: thread.inReplyTo, references: thread.references,
+    });
     if (!sendResult.success) {
       return res.status(502).json({ success: false, error: sendResult.error });
     }
 
     await pool.query(
-      `INSERT INTO email_logs (lead_id, sender_id, sequence_id, direction, subject, body, provider_message_id, sent_at)
-       VALUES ($1, $2, $3, 'out', $4, $5, $6, NOW())`,
-      [approval.lead_id, sender.id, leadSeq?.sequence_id || null, subject, html, sendResult.messageId]
+      `INSERT INTO email_logs (lead_id, sender_id, sequence_id, direction, subject, body, provider_message_id, tracking_token, sent_at)
+       VALUES ($1, $2, $3, 'out', $4, $5, $6, $7, NOW())`,
+      [approval.lead_id, sender.id, leadSeq?.sequence_id || null, subject, html, sendResult.messageId, trackingToken]
     );
 
     if (approval.type === 'estimate') {
