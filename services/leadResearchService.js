@@ -17,13 +17,13 @@ const { logAgentAction } = require('./replyDeliveryService');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Highest-value call in the pipeline — this is the ONE GPT call per lead that produces reusable
-// business intelligence (email drafting/reply QA/intent classification stay on gpt-4o-mini,
-// unchanged, elsewhere). 'gpt-5.5' verified as a live model id on this account 2026-07-21
-// (client.models.list — snapshot gpt-5.5-2026-04-23). If it's ever retired, the fallback below
-// is tried once before giving up.
-const RESEARCH_MODEL = 'gpt-5.5';
-const RESEARCH_MODEL_FALLBACK = 'gpt-5.1';
+// This is the ONE GPT call per lead that produces reusable business intelligence (email
+// drafting/reply QA/intent classification stay on gpt-4o-mini too, unchanged, elsewhere).
+// Was 'gpt-5.5' briefly (2026-07-21) as "highest-value call in the pipeline" — reverted
+// 2026-07-23: at ~$0.076/lead (vs a fraction of a cent on gpt-4o-mini) it didn't scale with
+// lead volume. If gpt-4o-mini is ever retired, the fallback below is tried once before giving up.
+const RESEARCH_MODEL = 'gpt-4o-mini';
+const RESEARCH_MODEL_FALLBACK = 'gpt-4o';
 
 // Bump when the GPT JSON contract / sanitized shape changes. Rows with schema_version 1 (or the
 // column NULL/defaulted) predate confidence_breakdown and the richer business fields.
