@@ -429,4 +429,25 @@ router.post('/delete-bulk', async (req, res) => {
   }
 });
 
+// Bulk version of PUT /:id's email_status override — for clearing a whole batch of leads
+// stuck at 'unknown'/'unverifiable' at once (e.g. mails.so can't resolve a catch-all domain)
+// once the admin has confirmed the addresses by hand, so they become eligible for sequence
+// enrollment (SequenceService.enrollLeads only takes email_status === 'verified').
+router.post('/bulk-email-status', async (req, res) => {
+  const { ids, email_status } = req.body;
+  if (!ids?.length) return res.status(400).json({ error: 'No ids provided' });
+  if (!EMAIL_STATUS_VALUES.includes(email_status)) {
+    return res.status(400).json({ error: `email_status must be one of: ${EMAIL_STATUS_VALUES.join(', ')}` });
+  }
+  try {
+    const result = await pool.query(
+      'UPDATE hotel_leads SET email_status=$1, updated_at=NOW() WHERE id = ANY($2::int[])',
+      [email_status, ids]
+    );
+    res.json({ success: true, updated: result.rowCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
