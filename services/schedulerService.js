@@ -12,6 +12,12 @@ const { trackedCompletion } = require('../utils/aiUsage');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// Without an explicit timeout, axios waits forever on a stalled response — no OS-level cap
+// kicks in once a connection is established. Every Google Places call below hit this: one
+// stalled request left the whole agent task stuck in 'running' status with no way to recover
+// short of a manual DB fix. Same fix applied to emailVerifierService.js's mails.so call.
+const GOOGLE_PLACES_TIMEOUT_MS = 15000;
+
 // Auto-create table on startup
 pool.query(`
   CREATE TABLE IF NOT EXISTS agent_tasks (
@@ -45,14 +51,20 @@ pool.query(`
   await pool.query(`ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS leads_enrolled INTEGER DEFAULT 0`);
 }).catch(err => console.error('[Scheduler] Table init error:', err.message));
 
+// One instruction can expand into several per-city tasks — an explicit multi-city list, a state
+// name ("Gujarat"), "N cities in <state>", or a country name ("India"). Hard cap regardless of
+// what GPT returns, so one submitted line can never flood the approval queue.
+const MAX_EXPANDED_TASKS = 15;
+
 // Refine the user's instruction using GPT.
-// Returns { refinedInstruction, refinementNote, parsed, canRun }
-// canRun=false only if the city is completely missing and unfixable.
+// Returns { tasks: [{ refinedInstruction, businessType, city, count, filterHasWebsite }, ...], refinementNote, systemPrompt, canRun }
+// tasks.length is normally 1 (one city) — more than 1 when the instruction named a state/country/list.
+// canRun=false only if no city (or state/country) could be determined at all.
 async function refineInstruction(instruction) {
   try {
     const res = await trackedCompletion(openai, {
       model: 'gpt-4o-mini',
-      max_tokens: 900,
+      max_tokens: 1500,
       messages: [
         {
           role: 'system',
@@ -70,13 +82,20 @@ What it CANNOT do:
 - Search outside India
 - Send emails or make calls
 
-Your job:
-1. Fix typos and grammar in the instruction — do NOT add words that are not in the original
-2. Extract business type, city, and count from the instruction
-3. Keep the user's original intent exactly — do NOT add filters or conditions they did not mention
-4. CRITICAL: filterHasWebsite must be true ONLY when the user explicitly says "no website", "without website", "don't have website", "without a website listing" or very similar. If they did NOT mention website at all, set filterHasWebsite: false. Do NOT assume or add this filter by default.
-5. If city is completely missing, note it in refinementNote
-6. Generate a WhatsApp bot system prompt tailored to the specific business type for qualifying leads
+The instruction describes ONE round of searching, but may name one city, several cities, a whole
+state, or the whole country. Break it down into one task per city:
+1. Fix typos and grammar — do NOT add words that are not in the original.
+2. One specific city named → exactly ONE task for it.
+3. Several cities named explicitly (e.g. "Ahmedabad and Surat", "Mumbai, Pune, Nagpur") → one task per named city.
+4. An Indian STATE named (e.g. "Gujarat") with no specific cities listed:
+   - If the instruction also says how many cities (e.g. "10 cities in Gujarat"), pick that many major/well-known business cities in that state.
+   - Otherwise pick a sensible default of 5-8 major business cities in that state.
+5. INDIA (the whole country) named with no cities listed → pick a sensible default set of major business cities spread across different states, capped at ${MAX_EXPANDED_TASKS}.
+6. Every generated task reuses the SAME businessType, per-city count, and filterHasWebsite as the original instruction. If the user said "50 hotels each city", every task gets count=50 — never divide the count across cities.
+7. Never output more than ${MAX_EXPANDED_TASKS} tasks — pick the most well-known cities if you must cut down.
+8. CRITICAL: filterHasWebsite must be true ONLY when the user explicitly says "no website", "without website", "don't have website", "without a website listing" or very similar. If they did NOT mention website at all, set filterHasWebsite: false for every task. Do NOT assume or add this filter by default.
+9. If no city, state, or country can be determined at all, set canRun to false and return a single task with an empty city, and explain why in refinementNote.
+10. Generate ONE WhatsApp bot system prompt tailored to the business type — shared across all generated tasks.
 
 The systemPrompt you generate must:
 - Be for a WhatsApp sales bot representing Dreams Technology (Indian business software company)
@@ -86,32 +105,45 @@ The systemPrompt you generate must:
 - NEVER say it is an AI
 - End every reply with exactly one tag on a new line: [CONTINUE], [QUALIFIED], or [NOT_INTERESTED]
 
-Example — user says "find 30 IT companies in Gandhinagar" (NO website mention):
+Respond with JSON only, in exactly this shape:
 {
-  "refinedInstruction": "Find 30 IT companies in Gandhinagar and send WhatsApp outreach today",
+  "refinementNote": string,
+  "systemPrompt": string,
+  "canRun": boolean,
+  "tasks": [
+    { "refinedInstruction": string, "businessType": string, "city": string, "count": number, "filterHasWebsite": boolean }
+  ]
+}
+
+Example — user says "find 30 IT companies in Gandhinagar" (single city, NO website mention):
+{
   "refinementNote": "Fixed typos. No website filter applied as user did not mention it.",
-  "parsed": {
-    "businessType": "IT companies",
-    "city": "Gandhinagar",
-    "count": 30,
-    "filterHasWebsite": false
-  },
   "systemPrompt": "...",
-  "canRun": true
+  "canRun": true,
+  "tasks": [
+    { "refinedInstruction": "Find 30 IT companies in Gandhinagar and send WhatsApp outreach today", "businessType": "IT companies", "city": "Gandhinagar", "count": 30, "filterHasWebsite": false }
+  ]
 }
 
 Example — user says "find dental clinics in Mumbai who don't have website" (explicit website mention):
 {
-  "refinedInstruction": "Find 30 dental clinics in Mumbai without a website and send WhatsApp outreach today",
   "refinementNote": "Website filter applied — will skip clinics that already have a website listed on Google.",
-  "parsed": {
-    "businessType": "dental clinics",
-    "city": "Mumbai",
-    "count": 30,
-    "filterHasWebsite": true
-  },
   "systemPrompt": "...",
-  "canRun": true
+  "canRun": true,
+  "tasks": [
+    { "refinedInstruction": "Find 30 dental clinics in Mumbai without a website and send WhatsApp outreach today", "businessType": "dental clinics", "city": "Mumbai", "count": 30, "filterHasWebsite": true }
+  ]
+}
+
+Example — user says "find 50 hotels each city in 10 cities in Gujarat" (state, explicit per-city count and city count):
+{
+  "refinementNote": "Expanded Gujarat into 10 major business cities, 50 hotels each, no website filter mentioned.",
+  "systemPrompt": "...",
+  "canRun": true,
+  "tasks": [
+    { "refinedInstruction": "Find 50 hotels in Ahmedabad and send WhatsApp outreach today", "businessType": "hotels", "city": "Ahmedabad", "count": 50, "filterHasWebsite": false },
+    { "refinedInstruction": "Find 50 hotels in Surat and send WhatsApp outreach today", "businessType": "hotels", "city": "Surat", "count": 50, "filterHasWebsite": false }
+  ]
 }
 
 Now respond with JSON only for the user's actual instruction:`
@@ -121,25 +153,35 @@ Now respond with JSON only for the user's actual instruction:`
       response_format: { type: 'json_object' },
     }, { purpose: 'task_refine_instruction' });
     const result = JSON.parse(res.choices[0].message.content);
+    let tasks = Array.isArray(result.tasks) && result.tasks.length > 0 ? result.tasks : [{}];
+    let refinementNote = result.refinementNote || '';
+    if (tasks.length > MAX_EXPANDED_TASKS) {
+      tasks = tasks.slice(0, MAX_EXPANDED_TASKS);
+      refinementNote += ` (capped at ${MAX_EXPANDED_TASKS} cities)`;
+    }
     return {
-      refinedInstruction: result.refinedInstruction || instruction,
-      refinementNote: result.refinementNote || '',
-      parsed: result.parsed || {},
+      tasks: tasks.map(t => ({
+        refinedInstruction: t.refinedInstruction || instruction,
+        businessType: t.businessType || 'businesses',
+        city: t.city || '',
+        count: t.count || 20,
+        filterHasWebsite: !!t.filterHasWebsite,
+      })),
+      refinementNote,
       systemPrompt: result.systemPrompt || null,
       canRun: result.canRun !== false,
     };
   } catch (err) {
     console.error('[Scheduler] refineInstruction error:', err.message);
-    // Fallback: basic parse, send back as-is
+    // Fallback: basic single-task parse, send back as-is
     const countMatch = instruction.match(/\b(\d+)\b/);
     const count = countMatch ? parseInt(countMatch[1]) : 20;
     const words = instruction.split(/\s+/);
     const inIdx = words.findIndex(w => w.toLowerCase() === 'in');
     const city = inIdx !== -1 ? words[inIdx + 1]?.replace(/[^a-zA-Z]/g, '') : '';
     return {
-      refinedInstruction: instruction,
+      tasks: [{ refinedInstruction: instruction, businessType: 'businesses', city, count, filterHasWebsite: false }],
       refinementNote: 'GPT unavailable — using instruction as-is.',
-      parsed: { businessType: 'businesses', city, count },
       systemPrompt: null,
       canRun: !!city,
     };
@@ -148,7 +190,7 @@ Now respond with JSON only for the user's actual instruction:`
 
 async function parseInstruction(instruction) {
   const r = await refineInstruction(instruction);
-  return r.parsed;
+  return r.tasks[0];
 }
 
 // Matches one or more bare URLs in free text (trailing sentence punctuation stripped).
@@ -158,18 +200,19 @@ function extractUrls(instruction) {
   return [...new Set(matches.map(u => u.replace(/[.,;:)\]]+$/, '')))];
 }
 
-// Same idea as refineInstruction, but for the email channel: no WhatsApp bot system prompt
-// to generate, no website/review filters (a website is *required* for email discovery — no
-// website means there's nowhere to scrape a contact email from, so that's implicit, not a filter).
+// Same idea as refineInstruction (including multi-city/state/country expansion into one task
+// per city), but for the email channel: no WhatsApp bot system prompt to generate, no
+// website/review filters (a website is *required* for email discovery — no website means
+// there's nowhere to scrape a contact email from, so that's implicit, not a filter).
+// Returns { tasks: [{ refinedInstruction, businessType, city, count, directUrls? }, ...], refinementNote, canRun }
 async function refineEmailInstruction(instruction) {
   // A direct link means "scrape exactly this site" — skip the city-based Google Places
   // search (and the GPT call) entirely rather than failing because no city was mentioned.
   const directUrls = extractUrls(instruction);
   if (directUrls.length > 0) {
     return {
-      refinedInstruction: instruction,
+      tasks: [{ refinedInstruction: instruction, businessType: 'businesses', city: '', count: directUrls.length, directUrls }],
       refinementNote: `Direct link${directUrls.length > 1 ? 's' : ''} detected — scraping ${directUrls.length} site(s) directly instead of searching Google Places, so no city is needed.`,
-      parsed: { businessType: 'businesses', city: '', count: directUrls.length, directUrls },
       canRun: true,
     };
   }
@@ -177,7 +220,7 @@ async function refineEmailInstruction(instruction) {
   try {
     const res = await trackedCompletion(openai, {
       model: 'gpt-4o-mini',
-      max_tokens: 500,
+      max_tokens: 1200,
       messages: [
         {
           role: 'system',
@@ -195,23 +238,45 @@ What it CANNOT do:
 - Find emails for businesses without a website
 - Send WhatsApp messages or make calls
 
-Your job:
-1. Fix typos and grammar in the instruction — do NOT add words that are not in the original
-2. Extract business type, city, and count (how many leads to find) from the instruction
-3. Keep the user's original intent exactly — do NOT add filters or conditions they did not mention
-4. If city is completely missing, note it in refinementNote
+The instruction describes ONE round of searching, but may name one city, several cities, a whole
+state, or the whole country. Break it down into one task per city:
+1. Fix typos and grammar — do NOT add words that are not in the original.
+2. One specific city named → exactly ONE task for it.
+3. Several cities named explicitly → one task per named city.
+4. An Indian STATE named (e.g. "Gujarat") with no specific cities listed:
+   - If the instruction also says how many cities (e.g. "10 cities in Gujarat"), pick that many major/well-known business cities in that state.
+   - Otherwise pick a sensible default of 5-8 major business cities in that state.
+5. INDIA (the whole country) named with no cities listed → pick a sensible default set of major business cities spread across different states, capped at ${MAX_EXPANDED_TASKS}.
+6. Every generated task reuses the SAME businessType and per-city count as the original instruction. If the user said "50 businesses each city", every task gets count=50 — never divide the count across cities.
+7. Never output more than ${MAX_EXPANDED_TASKS} tasks — pick the most well-known cities if you must cut down.
+8. If no city, state, or country can be determined at all, set canRun to false and return a single task with an empty city, and explain why in refinementNote.
 
-Respond with JSON only: {"refinedInstruction": string, "refinementNote": string, "parsed": {"businessType": string, "city": string, "count": number}, "canRun": boolean}`
+Respond with JSON only, in exactly this shape:
+{
+  "refinementNote": string,
+  "canRun": boolean,
+  "tasks": [ { "refinedInstruction": string, "businessType": string, "city": string, "count": number } ]
+}`
         },
         { role: 'user', content: instruction }
       ],
       response_format: { type: 'json_object' },
     }, { purpose: 'email_task_refine_instruction' });
     const result = JSON.parse(res.choices[0].message.content);
+    let tasks = Array.isArray(result.tasks) && result.tasks.length > 0 ? result.tasks : [{}];
+    let refinementNote = result.refinementNote || '';
+    if (tasks.length > MAX_EXPANDED_TASKS) {
+      tasks = tasks.slice(0, MAX_EXPANDED_TASKS);
+      refinementNote += ` (capped at ${MAX_EXPANDED_TASKS} cities)`;
+    }
     return {
-      refinedInstruction: result.refinedInstruction || instruction,
-      refinementNote: result.refinementNote || '',
-      parsed: result.parsed || {},
+      tasks: tasks.map(t => ({
+        refinedInstruction: t.refinedInstruction || instruction,
+        businessType: t.businessType || 'businesses',
+        city: t.city || '',
+        count: t.count || 20,
+      })),
+      refinementNote,
       canRun: result.canRun !== false,
     };
   } catch (err) {
@@ -222,9 +287,8 @@ Respond with JSON only: {"refinedInstruction": string, "refinementNote": string,
     const inIdx = words.findIndex(w => w.toLowerCase() === 'in');
     const city = inIdx !== -1 ? words[inIdx + 1]?.replace(/[^a-zA-Z]/g, '') : '';
     return {
-      refinedInstruction: instruction,
+      tasks: [{ refinedInstruction: instruction, businessType: 'businesses', city, count }],
       refinementNote: 'GPT unavailable — using instruction as-is.',
-      parsed: { businessType: 'businesses', city, count },
       canRun: !!city,
     };
   }
@@ -318,7 +382,7 @@ async function scrapeLeads(city, count, businessType = 'businesses', filterHasWe
 
     const searchResp = await axios.get(
       'https://maps.googleapis.com/maps/api/place/textsearch/json',
-      { params }
+      { params, timeout: GOOGLE_PLACES_TIMEOUT_MS }
     );
 
     // Google Places returns HTTP 200 even for quota/auth/request errors — the real signal is
@@ -344,7 +408,8 @@ async function scrapeLeads(city, count, businessType = 'businesses', filterHasWe
             fields: 'name,formatted_phone_number,international_phone_number,website',
             key: googleKey,
             language: 'en',
-          }
+          },
+          timeout: GOOGLE_PLACES_TIMEOUT_MS,
         })
       )
     );
@@ -453,7 +518,7 @@ async function scrapePlacesForWebsites(city, count, businessType = 'businesses')
 
     const searchResp = await axios.get(
       'https://maps.googleapis.com/maps/api/place/textsearch/json',
-      { params }
+      { params, timeout: GOOGLE_PLACES_TIMEOUT_MS }
     );
 
     const apiStatus = searchResp.data.status;
@@ -470,7 +535,8 @@ async function scrapePlacesForWebsites(city, count, businessType = 'businesses')
     const detailed = await Promise.allSettled(
       pageResults.map(r =>
         axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
-          params: { place_id: r.place_id, fields: 'name,website', key: googleKey, language: 'en' }
+          params: { place_id: r.place_id, fields: 'name,website', key: googleKey, language: 'en' },
+          timeout: GOOGLE_PLACES_TIMEOUT_MS,
         })
       )
     );
@@ -687,7 +753,7 @@ async function runEmailTask(task) {
     if (typeof parsedParams === 'string') parsedParams = JSON.parse(parsedParams);
     if (!parsedParams || (!parsedParams.city && !parsedParams.directUrls?.length)) {
       const refined = await refineEmailInstruction(task.instruction);
-      parsedParams = refined.parsed;
+      parsedParams = refined.tasks[0];
     }
 
     const { city, count, businessType = 'businesses', directUrls } = parsedParams;

@@ -56,7 +56,10 @@ router.get('/tasks', async (req, res) => {
   }
 });
 
-// Create task — GPT refines instruction, waits for user approval before running.
+// Create task(s) — GPT refines the instruction, waits for user approval before running.
+// One instruction can expand into several tasks (a state/country name, or several cities named
+// in one line) — refineInstruction/refineEmailInstruction return one entry per city, and each
+// gets its own agent_tasks row (its own approval card, independently editable/deletable/runnable).
 // channel='email' requires sequence_id (auto-enrolled into it once leads are found+verified).
 router.post('/tasks', async (req, res) => {
   const { instruction, template_id, lead_count, schedule, custom_time, filters, channel, sequence_id } = req.body;
@@ -70,40 +73,46 @@ router.post('/tasks', async (req, res) => {
       ? await refineEmailInstruction(instruction.trim())
       : await refineInstruction(instruction.trim());
 
-    // Explicit UI filters always override what GPT parsed from text (WhatsApp only)
-    const parsedParams = channel === 'email'
-      ? { ...refined.parsed }
-      : {
-          ...refined.parsed,
-          filterHasWebsite: filters?.filterHasWebsite === true ? true : (refined.parsed?.filterHasWebsite || false),
-          maxReviews: filters?.maxReviews || null,
-        };
-
     let runAt = new Date();
     if (schedule === 'custom' && custom_time) runAt = new Date(custom_time);
 
-    const result = await pool.query(
-      `INSERT INTO agent_tasks
-         (instruction, refined_instruction, refinement_note, city, lead_count,
-          template_id, status, run_at, parsed_params, system_prompt, channel, sequence_id)
-       VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9, $10, $11)
-       RETURNING *`,
-      [
-        instruction.trim(),
-        refined.refinedInstruction,
-        refined.refinementNote,
-        parsedParams.city || null,
-        lead_count || parsedParams.count || 20,
-        template_id || null,
-        runAt,
-        JSON.stringify(parsedParams),
-        refined.systemPrompt || null,
-        channel === 'email' ? 'email' : 'whatsapp',
-        channel === 'email' ? sequence_id : null,
-      ]
-    );
+    const tasks = [];
+    for (const t of refined.tasks) {
+      // Explicit UI filters always override what GPT parsed from text (WhatsApp only)
+      const parsedParams = channel === 'email'
+        ? { businessType: t.businessType, city: t.city, count: t.count, directUrls: t.directUrls }
+        : {
+            businessType: t.businessType,
+            city: t.city,
+            count: t.count,
+            filterHasWebsite: filters?.filterHasWebsite === true ? true : (t.filterHasWebsite || false),
+            maxReviews: filters?.maxReviews || null,
+          };
 
-    res.json({ success: true, task: result.rows[0] });
+      const result = await pool.query(
+        `INSERT INTO agent_tasks
+           (instruction, refined_instruction, refinement_note, city, lead_count,
+            template_id, status, run_at, parsed_params, system_prompt, channel, sequence_id)
+         VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9, $10, $11)
+         RETURNING *`,
+        [
+          instruction.trim(),
+          t.refinedInstruction,
+          refined.refinementNote,
+          parsedParams.city || null,
+          lead_count || parsedParams.count || 20,
+          template_id || null,
+          runAt,
+          JSON.stringify(parsedParams),
+          refined.systemPrompt || null,
+          channel === 'email' ? 'email' : 'whatsapp',
+          channel === 'email' ? sequence_id : null,
+        ]
+      );
+      tasks.push(result.rows[0]);
+    }
+
+    res.json({ success: true, tasks, task: tasks[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -139,7 +148,10 @@ router.post('/tasks/:id/approve', async (req, res) => {
   }
 });
 
-// User edits and resubmits — GPT re-refines, waits for approval again
+// User edits and resubmits — GPT re-refines, waits for approval again.
+// If the edited text now expands to multiple cities (e.g. changed to name a state), this row
+// keeps the first city and sibling needs_approval rows are created for the rest — same pattern
+// as a fresh multi-city submission in POST /tasks.
 router.post('/tasks/:id/revise', async (req, res) => {
   const { instruction } = req.body;
   if (!instruction?.trim()) return res.status(400).json({ error: 'instruction is required' });
@@ -154,6 +166,11 @@ router.post('/tasks/:id/revise', async (req, res) => {
       ? await refineEmailInstruction(instruction.trim())
       : await refineInstruction(instruction.trim());
 
+    const toParsedParams = (t) => task.channel === 'email'
+      ? { businessType: t.businessType, city: t.city, count: t.count, directUrls: t.directUrls }
+      : { businessType: t.businessType, city: t.city, count: t.count, filterHasWebsite: t.filterHasWebsite, maxReviews: null };
+
+    const [first, ...rest] = refined.tasks;
     const updated = await pool.query(
       `UPDATE agent_tasks
        SET instruction=$1, refined_instruction=$2, refinement_note=$3,
@@ -162,15 +179,37 @@ router.post('/tasks/:id/revise', async (req, res) => {
        RETURNING *`,
       [
         instruction.trim(),
-        refined.refinedInstruction,
+        first.refinedInstruction,
         refined.refinementNote,
-        refined.parsed?.city || null,
-        JSON.stringify(refined.parsed),
+        first.city || null,
+        JSON.stringify(toParsedParams(first)),
         task.id,
       ]
     );
 
-    res.json({ success: true, task: updated.rows[0] });
+    for (const t of rest) {
+      await pool.query(
+        `INSERT INTO agent_tasks
+           (instruction, refined_instruction, refinement_note, city, lead_count,
+            template_id, status, run_at, parsed_params, system_prompt, channel, sequence_id)
+         VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9, $10, $11)`,
+        [
+          instruction.trim(),
+          t.refinedInstruction,
+          refined.refinementNote,
+          t.city || null,
+          t.count || 20,
+          task.template_id,
+          task.run_at,
+          JSON.stringify(toParsedParams(t)),
+          task.system_prompt,
+          task.channel,
+          task.sequence_id,
+        ]
+      );
+    }
+
+    res.json({ success: true, task: updated.rows[0], additionalTasksCreated: rest.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

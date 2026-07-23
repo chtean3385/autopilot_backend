@@ -28,9 +28,14 @@ async function verifyEmail(email) {
   }
 
   try {
+    // Without a timeout, a stalled mails.so response hangs this call forever — and since
+    // LeadService.addLeads awaits verifyEmail() one lead at a time in a loop, one stuck call
+    // blocks every remaining lead behind it, which blocks the whole agent task (it never
+    // resolves OR throws, so the task sits in 'running' status indefinitely).
     const response = await axios.post(`${MAILS_SO_BASE_URL}/validate`, null, {
       params: { email },
       headers: { 'x-mails-api-key': apiKey },
+      timeout: 15000,
     });
 
     const result = response.data?.data?.result || 'unknown';
