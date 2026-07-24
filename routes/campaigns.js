@@ -7,11 +7,11 @@ const router = express.Router();
 
 // Create campaign (supports target_city or group_id)
 router.post('/', async (req, res) => {
-  const { campaign_name, template_id, target_city, group_id, target_type, target_lead_status } = req.body;
+  const { campaign_name, template_id, target_city, group_id, target_type, target_lead_status, agent_id } = req.body;
   const query = `
     INSERT INTO campaigns
-    (campaign_name, template_id, target_city, group_id, target_type, target_lead_status, status, created_by)
-    VALUES ($1, $2, $3, $4, $5, $6, 'draft', 'admin')
+    (campaign_name, template_id, target_city, group_id, target_type, target_lead_status, agent_id, status, created_by)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', 'admin')
     RETURNING *;
   `;
   try {
@@ -21,7 +21,7 @@ router.post('/', async (req, res) => {
       target_city || null,
       group_id || null,
       target_type || (group_id ? 'group' : 'city'),
-      target_lead_status || 'new'
+      target_lead_status || 'new', agent_id || null
     ]);
     res.json({ success: true, campaign: result.rows[0] });
   } catch (error) {
@@ -73,6 +73,11 @@ router.post('/:id/launch', async (req, res) => {
     const campaignResult = await pool.query('SELECT * FROM campaigns WHERE id = $1', [campaignId]);
     const campaign = campaignResult.rows[0];
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (!campaign.agent_id && !campaign.system_prompt) {
+      return res.status(400).json({
+        error: 'Campaign needs a Sales Agent before launch. Create a configured agent, then assign it to this campaign.',
+      });
+    }
 
     // Block launch if WABA quality is RED
     const health = await WABAService.getAccountHealth();
@@ -166,12 +171,12 @@ router.put('/:id', async (req, res) => {
     if (existing.rows[0].status !== 'draft') {
       return res.status(400).json({ error: 'Only draft campaigns can be edited' });
     }
-    const { campaign_name, template_id, target_city, group_id, target_type, target_lead_status } = req.body;
+    const { campaign_name, template_id, target_city, group_id, target_type, target_lead_status, agent_id } = req.body;
     const result = await pool.query(
       `UPDATE campaigns
-       SET campaign_name=$1, template_id=$2, target_city=$3, group_id=$4, target_type=$5, target_lead_status=$6
-       WHERE id=$7 RETURNING *`,
-      [campaign_name, template_id || null, target_city || null, group_id || null, target_type, target_lead_status || 'new', req.params.id]
+       SET campaign_name=$1, template_id=$2, target_city=$3, group_id=$4, target_type=$5, target_lead_status=$6, agent_id=$7
+       WHERE id=$8 RETURNING *`,
+      [campaign_name, template_id || null, target_city || null, group_id || null, target_type, target_lead_status || 'new', agent_id || null, req.params.id]
     );
     res.json({ success: true, campaign: result.rows[0] });
   } catch (err) {
