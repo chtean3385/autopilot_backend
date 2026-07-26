@@ -189,8 +189,11 @@ router.delete('/:id', async (req, res) => {
   try {
     const existing = await pool.query('SELECT status FROM campaigns WHERE id = $1', [req.params.id]);
     if (!existing.rows[0]) return res.status(404).json({ error: 'Campaign not found' });
-    // Remove outreach logs first to satisfy FK constraint
+    // Remove/unlink dependent rows first to satisfy FK constraints
     await pool.query('DELETE FROM outreach_logs WHERE campaign_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM daily_analytics WHERE campaign_id = $1', [req.params.id]);
+    await pool.query('UPDATE demo_bookings SET campaign_id = NULL WHERE campaign_id = $1', [req.params.id]);
+    await pool.query('UPDATE agent_tasks SET campaign_id = NULL WHERE campaign_id = $1', [req.params.id]);
     await pool.query('DELETE FROM campaigns WHERE id = $1', [req.params.id]);
     res.json({ success: true });
   } catch (err) {

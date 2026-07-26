@@ -61,7 +61,7 @@ router.post('/:id/stages', async (req, res) => {
   try { const r=await pool.query(`INSERT INTO agent_stage_rules (agent_id,stage_key,stage_name,objective,stage_order,active) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,[req.params.id,b.stage_key.trim(),b.stage_name.trim(),b.objective.trim(),Number(b.stage_order)||1,b.active!==false]); res.status(201).json(r.rows[0]); } catch(err){res.status(500).json({error:err.message});}
 });
 
-router.delete('/:id', async (req,res) => { try { const r=await pool.query('DELETE FROM sales_agents WHERE id=$1 RETURNING id',[req.params.id]); if(!r.rows[0]) return res.status(404).json({error:'Sales agent not found'}); res.json({success:true}); } catch(err){res.status(500).json({error:err.message});} });
+router.delete('/:id', async (req,res) => { try { await pool.query('UPDATE campaigns SET agent_id = NULL WHERE agent_id = $1', [req.params.id]); const r=await pool.query('DELETE FROM sales_agents WHERE id=$1 RETURNING id',[req.params.id]); if(!r.rows[0]) return res.status(404).json({error:'Sales agent not found'}); res.json({success:true}); } catch(err){res.status(500).json({error:err.message});} });
 
 router.put('/:id/knowledge/:knowledgeId', async (req, res) => {
   const b = req.body || {}; if (!b.title?.trim() || !b.content?.trim()) return res.status(400).json({ error: 'title and content are required' });
