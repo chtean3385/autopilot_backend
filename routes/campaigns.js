@@ -138,9 +138,13 @@ router.post('/:id/launch', async (req, res) => {
       });
     }
 
-    // Send messages
+    // Send messages — skip leads with no usable WhatsApp number instead of letting Meta reject them
     const results = [];
     for (const lead of leads) {
+      if (!lead.whatsapp_number || !lead.whatsapp_number.trim()) {
+        results.push({ lead_id: lead.id, hotel: lead.hotel_name, status: 'skipped', error: 'No WhatsApp number on file' });
+        continue;
+      }
       const wabaResult = await WABAService.sendPersonalizedTemplate(lead, template);
       if (wabaResult.success) {
         await LeadService.logOutreach(lead.id, campaignId, template.id, wabaResult.messageId);
@@ -157,7 +161,8 @@ router.post('/:id/launch', async (req, res) => {
 
     const sent = results.filter(r => r.status === 'sent').length;
     const failed = results.filter(r => r.status === 'failed');
-    res.json({ success: true, campaign_id: campaignId, sent, failed_count: failed.length, results });
+    const skipped = results.filter(r => r.status === 'skipped');
+    res.json({ success: true, campaign_id: campaignId, sent, failed_count: failed.length, skipped_count: skipped.length, results });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
