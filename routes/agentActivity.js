@@ -2,12 +2,13 @@ const express = require('express');
 const pool = require('../config/db');
 const router = express.Router();
 
-// GET /api/agent-activity — cross-lead feed of everything the agent has done, newest first.
-// Currently sourced from agent_actions, which only the email pipeline writes to today
-// (cold_email_scored, draft_sent, sequence_stopped, etc. — see workers/sequenceEmailWorker.js,
-// services/replyDeliveryService.js, services/replyQualityService.js, services/leadResearchService.js).
-// The WhatsApp reply pipeline (services/salesAgentService.js) doesn't log here yet, so this feed
-// is email-channel-only for now.
+// GET /api/agent-activity — cross-lead, cross-channel feed of everything the agent has done,
+// newest first. Sourced from agent_actions, written by both the email pipeline
+// (cold_email_scored, draft_sent, sequence_stopped, etc. — workers/sequenceEmailWorker.js,
+// services/replyDeliveryService.js, services/replyQualityService.js, services/leadResearchService.js)
+// and the WhatsApp pipeline (whatsapp_reply_sent, whatsapp_demo_qualified, whatsapp_reply_failed,
+// etc. — services/salesAgentService.js, routes/webhook.js). hl.channel on each row tells the
+// frontend which channel a given action belongs to.
 router.get('/', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 300);

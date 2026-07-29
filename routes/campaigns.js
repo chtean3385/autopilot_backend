@@ -5,6 +5,12 @@ const TemplateService = require('../services/templateService');
 const pool = require('../config/db');
 const router = express.Router();
 
+// In-process guard against launching the same campaign twice concurrently — a double-click,
+// a slow-network retry, or two admins clicking at once would otherwise both pass the checks
+// below and both send, since the "not yet contacted" lead query has no DB-level lock between
+// read and send. This is what produced the same template hitting one number 3-4x in a minute.
+const launchingCampaigns = new Set();
+
 // Create campaign (supports target_city or group_id)
 router.post('/', async (req, res) => {
   const { campaign_name, template_id, target_city, group_id, target_type, target_lead_status, agent_id } = req.body;
@@ -70,6 +76,11 @@ router.get('/', async (req, res) => {
 // Launch campaign
 router.post('/:id/launch', async (req, res) => {
   const campaignId = req.params.id;
+
+  if (launchingCampaigns.has(campaignId)) {
+    return res.status(409).json({ error: 'This campaign is already sending — please wait for it to finish before launching again.' });
+  }
+  launchingCampaigns.add(campaignId);
 
   try {
     const campaignResult = await pool.query('SELECT * FROM campaigns WHERE id = $1', [campaignId]);
@@ -167,6 +178,8 @@ router.post('/:id/launch', async (req, res) => {
     res.json({ success: true, campaign_id: campaignId, sent, failed_count: failed.length, skipped_count: skipped.length, results });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  } finally {
+    launchingCampaigns.delete(campaignId);
   }
 });
 

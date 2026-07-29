@@ -850,7 +850,16 @@ async function sendTask(taskId) {
   if (!task) throw new Error('Task not found');
   if (task.status !== 'preview' && task.status !== 'scheduled_send') throw new Error('Task is not in preview state');
 
-  await pool.query(`UPDATE agent_tasks SET status='running' WHERE id=$1`, [taskId]);
+  // Compare-and-swap, same as runTask's Fix 1 above — without this, the every-minute cron
+  // (picking up a due 'scheduled_send' task) and a manual /tasks/:id/send click could both
+  // pass the check above and both loop through the same batch, sending every template twice.
+  const claim = await pool.query(
+    `UPDATE agent_tasks SET status='running' WHERE id=$1 AND status IN ('preview', 'scheduled_send') RETURNING id`,
+    [taskId]
+  );
+  if (claim.rowCount === 0) {
+    throw new Error(`Task ${taskId} is already being sent by another process`);
+  }
 
   try {
     const campResult = await pool.query(`SELECT * FROM campaigns WHERE id=$1`, [task.campaign_id]);
@@ -919,7 +928,10 @@ async function runFollowUps(trigger = 'cron') {
     const result = await pool.query(`
       SELECT hl.*,
              COUNT(ol.id) FILTER (WHERE ol.message_type = 'template')::int AS template_count,
-             MAX(ol.sent_at)        AS last_outreach
+             MAX(ol.sent_at)        AS last_outreach,
+             (SELECT campaign_id FROM outreach_logs ol2
+              WHERE ol2.lead_id = hl.id AND ol2.campaign_id IS NOT NULL
+              ORDER BY ol2.sent_at DESC LIMIT 1)                            AS last_campaign_id
       FROM hotel_leads hl
       INNER JOIN outreach_logs ol ON ol.lead_id = hl.id
       WHERE hl.status IN ('new', 'responded')
@@ -956,7 +968,10 @@ async function runFollowUps(trigger = 'cron') {
 
       const wabaResult = await WABAService.sendPersonalizedTemplate(lead, template);
       if (wabaResult.success) {
-        await LeadService.logOutreach(lead.id, null, template.id, wabaResult.messageId);
+        // Carry forward whichever campaign last contacted this lead — logging null here (the old
+        // behavior) erases campaign traceability, which is what resolveAgent() needs to find the
+        // right Sales Agent when the lead eventually replies.
+        await LeadService.logOutreach(lead.id, lead.last_campaign_id || null, template.id, wabaResult.messageId);
         stats.sent++;
         console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" — follow-up #${outreachCount} sent`);
       } else {

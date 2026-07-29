@@ -84,9 +84,13 @@ router.get('/thread/:leadId', async (req, res) => {
           wamid: log.waba_message_id,
         });
       } else {
-        // Template outreach message
+        // Template outreach message — show the actual body (with the {{1}} name variable filled
+        // in) instead of just "[template_name]", so a thread with several template touches reads
+        // like a real conversation instead of a wall of identical bracket tags.
         const outText = log.template_name
-          ? `[${log.template_name}]`
+          ? (log.body_text
+              ? log.body_text.replace(/\{\{1\}\}/g, lead.owner_name || lead.hotel_name || 'there')
+              : `[${log.template_name}]`)
           : (log.message_text || '[Message sent]');
         messages.push({
           id: `out-${log.id}`,
@@ -133,11 +137,12 @@ router.post('/reply', async (req, res) => {
     const result = await WABAService.sendTextMessage(lead.whatsapp_number, message.trim());
     if (!result.success) return res.status(502).json({ error: result.error });
 
-    // Log the outbound reply
+    // Log the outbound reply — message_text is what the thread view actually renders, without
+    // it a manual reply shows as a blank "[Message sent]" placeholder instead of what was typed.
     await pool.query(
-      `INSERT INTO outreach_logs (lead_id, waba_message_id, message_type, sent_at)
-       VALUES ($1, $2, 'reply', NOW())`,
-      [lead_id, result.messageId]
+      `INSERT INTO outreach_logs (lead_id, waba_message_id, message_type, message_text, sent_at)
+       VALUES ($1, $2, 'reply', $3, NOW())`,
+      [lead_id, result.messageId, message.trim()]
     );
 
     res.json({ success: true, messageId: result.messageId });

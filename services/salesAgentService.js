@@ -117,18 +117,78 @@ function agentInstructions(agent) {
   ].filter(Boolean).join('\n\n');
 }
 
+function normalizeIndianMobile(raw) {
+  if (!raw) return null;
+  let digits = String(raw).replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+  else if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+  return /^[6-9]\d{9}$/.test(digits) ? '91' + digits : null;
+}
+
 async function draftReply({ agent, lead, campaign, memory, intent, stage, knowledge, message }) {
   const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini', max_tokens: 380, response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: `${agentInstructions(agent)}\n\nYou are an experienced human B2B sales executive. Use only the supplied context and knowledge. Never mention AI. Keep the reply to 2-3 short sentences, ask at most one question, and move toward the current objective. Never answer a business's customer booking request; ask for the owner or operations manager instead. Return only JSON: {"reply":"...","status":"CONTINUE|WARM|COLD|QUALIFIED|NOT_INTERESTED","memory":{"summary":"...","current_stage":"configured stage key or current key","lead_score":0-100,"pain_points":[],"interested_features":[],"decision_maker":"...","objections":[],"budget":"...","timeline":"...","next_objective":"..."}}` },
+      { role: 'system', content: `${agentInstructions(agent)}\n\nYou are an experienced human B2B sales executive. Use only the supplied context and knowledge. Never mention AI. Keep the reply to 2-3 short sentences, ask at most one question, and move toward the current objective. Never answer a business's customer booking request; ask for the owner or operations manager instead.\n\nRedirect handling: if the contact tells you to reach someone else — a different phone number, another branch, or a head/main office — read carefully whether they gave you a phone number for that contact.\n- If they DID give a number for that other contact, set redirect_phone to it (digits, any format they used) and redirect_label to a short 2-4 word description of who it is (e.g. "Head Office", "Rajkot Branch", "Manager Direct"), and mention in your reply that you'll also reach out there.\n- If they mention another branch/head office/person but do NOT give a number, do not end the conversation — ask them for that contact's phone number in your reply, and leave redirect_phone/redirect_label null.\nOnly set redirect_phone when a real phone number is actually present in their message.\n\nReturn only JSON: {"reply":"...","status":"CONTINUE|WARM|COLD|QUALIFIED|NOT_INTERESTED","redirect_phone":"digits or null","redirect_label":"short label or null","memory":{"summary":"...","current_stage":"configured stage key or current key","lead_score":0-100,"pain_points":[],"interested_features":[],"decision_maker":"...","objections":[],"budget":"...","timeline":"...","next_objective":"..."}}` },
       { role: 'user', content: `${buildContext({ lead, campaign, memory, intent, stage, knowledge })}\n\nLatest inbound message: ${message}` },
     ],
   }, { purpose: 'sales_agent_reply', leadId: lead.id });
   const parsed = json(response.choices[0].message.content, {});
   const reply = String(parsed.reply || '').trim().replace(/\s+/g, ' ');
   if (!reply) throw new Error('Sales agent returned no reply');
-  return { reply: reply.slice(0, 1000), status: ['CONTINUE', 'WARM', 'COLD', 'QUALIFIED', 'NOT_INTERESTED'].includes(parsed.status) ? parsed.status : 'CONTINUE', memory: parsed.memory || {} };
+  return {
+    reply: reply.slice(0, 1000),
+    status: ['CONTINUE', 'WARM', 'COLD', 'QUALIFIED', 'NOT_INTERESTED'].includes(parsed.status) ? parsed.status : 'CONTINUE',
+    memory: parsed.memory || {},
+    redirectPhone: normalizeIndianMobile(parsed.redirect_phone),
+    redirectLabel: (parsed.redirect_label && String(parsed.redirect_label).trim().slice(0, 40)) || null,
+  };
+}
+
+// A redirect ("call our head office on 9876543210") means a second decision-maker exists at a
+// number that's never messaged us — WhatsApp only allows free-form replies within an existing
+// customer-initiated session, so we can't just text them. Instead: create a new lead (same
+// business, suffixed name so it's clearly linked) and kick it off the normal template-send path,
+// same as any other first contact. Never touch the original conversation on failure.
+async function handleRedirectContact(lead, redirectPhone, redirectLabel, campaign) {
+  try {
+    const existing = await pool.query('SELECT id FROM hotel_leads WHERE whatsapp_number = $1', [redirectPhone]);
+    if (existing.rows.length > 0) return { created: false, reason: 'already exists' };
+
+    const suffix = redirectLabel || 'Alt Contact';
+    const newLead = await pool.query(
+      `INSERT INTO hotel_leads (hotel_name, owner_name, whatsapp_number, city, source, status, channel, business_category)
+       VALUES ($1, $2, $3, $4, 'agent_redirect', 'new', 'whatsapp', $5) RETURNING *`,
+      [`${lead.hotel_name} (${suffix})`, lead.owner_name || '', redirectPhone, lead.city || '', lead.business_category || null]
+    );
+    const created = newLead.rows[0];
+
+    const templateResult = await pool.query(
+      campaign?.template_id
+        ? `SELECT * FROM waba_templates WHERE id = $1 AND status = 'approved'`
+        : `SELECT * FROM waba_templates WHERE status = 'approved' ORDER BY created_at DESC LIMIT 1`,
+      campaign?.template_id ? [campaign.template_id] : []
+    );
+    const template = templateResult.rows[0];
+    if (template) {
+      const wabaResult = await WABAService.sendPersonalizedTemplate(created, template);
+      if (wabaResult.success) {
+        await pool.query(
+          `INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, sent_at)
+           VALUES ($1, $2, $3, $4, 'template', NOW())`,
+          [created.id, campaign?.id || null, template.id, wabaResult.messageId]
+        );
+      }
+    }
+    await logAgentAction(lead.id, 'whatsapp_redirect_lead_created', {
+      detail: { new_lead_id: created.id, new_hotel_name: created.hotel_name, phone: redirectPhone, label: suffix },
+      decision: 'created',
+    });
+    return { created: true, leadId: created.id };
+  } catch (err) {
+    console.error('[Agent] handleRedirectContact failed:', err.message);
+    return { created: false, reason: err.message };
+  }
 }
 
 async function saveMemory(leadId, agentId, update) {
@@ -139,6 +199,20 @@ async function saveMemory(leadId, agentId, update) {
      ON CONFLICT (lead_id, agent_id) DO UPDATE SET summary=EXCLUDED.summary, current_stage=EXCLUDED.current_stage, lead_score=EXCLUDED.lead_score, pain_points=EXCLUDED.pain_points, interested_features=EXCLUDED.interested_features, decision_maker=EXCLUDED.decision_maker, objections=EXCLUDED.objections, budget=EXCLUDED.budget, timeline=EXCLUDED.timeline, next_objective=EXCLUDED.next_objective, updated_at=NOW()`,
     [leadId, agentId, clean.summary || null, clean.current_stage || null, Number(clean.lead_score) || 0, JSON.stringify(clean.pain_points), JSON.stringify(clean.interested_features), clean.decision_maker || null, JSON.stringify(clean.objections), clean.budget || null, clean.timeline || null, clean.next_objective || null]
   );
+}
+
+// Mirrors the email pipeline's agent_actions logging (services/replyDeliveryService.js,
+// workers/sequenceEmailWorker.js) so the Live Feed can show WhatsApp activity too, not just
+// email. Never let a logging failure break the actual reply — this is purely observational.
+async function logAgentAction(leadId, action, { detail, draftText, decision } = {}) {
+  try {
+    await pool.query(
+      `INSERT INTO agent_actions (lead_id, action, detail, draft_text, decision) VALUES ($1,$2,$3,$4,$5)`,
+      [leadId, action, detail ? JSON.stringify(detail) : null, draftText ?? null, decision ?? null]
+    );
+  } catch (err) {
+    console.error('[Agent] logAgentAction failed:', err.message);
+  }
 }
 
 async function notifyOwner(lead, lastMessage) {
@@ -153,7 +227,10 @@ async function handleReply(lead, incomingText) {
   if (!agent) throw new Error('No sales agent is assigned to this campaign. Create an agent and assign it before enabling replies.');
   const memory = await getMemory(lead.id, agent.id);
   const { intent } = await detectIntent({ agent, leadId: lead.id, message: incomingText, memory });
-  if (intent === 'STOP') return { skipped: true, reason: 'stop' };
+  if (intent === 'STOP') {
+    await logAgentAction(lead.id, 'whatsapp_sequence_stopped', { detail: { reason: 'stop_intent' }, decision: 'stop' });
+    return { skipped: true, reason: 'stop' };
+  }
   const stage = await getStage(agent.id, memory, intent);
   const knowledge = await getKnowledge(agent.id, stage?.stage_key, intent);
   const result = await draftReply({ agent, lead, campaign, memory, intent, stage, knowledge, message: incomingText });
@@ -163,9 +240,20 @@ async function handleReply(lead, incomingText) {
     SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, result.reply]);
   await saveMemory(lead.id, agent.id, { ...memory, ...result.memory, current_stage: result.memory.current_stage || stage?.stage_key || memory.current_stage });
   await pool.query(`UPDATE outreach_logs SET lead_status_after=$1, qualified_for_demo=$2 WHERE id=(SELECT id FROM outreach_logs WHERE lead_id=$3 AND response_received=TRUE ORDER BY response_received_at DESC NULLS LAST LIMIT 1)`, [result.status.toLowerCase(), result.status === 'QUALIFIED', lead.id]);
-  if (result.status === 'QUALIFIED') { await pool.query(`UPDATE hotel_leads SET status='demo_qualified', updated_at=NOW() WHERE id=$1`, [lead.id]); await notifyOwner(lead, incomingText); }
-  if (result.status === 'NOT_INTERESTED') await pool.query(`UPDATE hotel_leads SET status='not_interested', updated_at=NOW() WHERE id=$1`, [lead.id]);
+  await logAgentAction(lead.id, 'whatsapp_reply_sent', { detail: { intent, stage: stage?.stage_key || null }, draftText: result.reply, decision: result.status.toLowerCase() });
+  if (result.status === 'QUALIFIED') {
+    await pool.query(`UPDATE hotel_leads SET status='demo_qualified', updated_at=NOW() WHERE id=$1`, [lead.id]);
+    await logAgentAction(lead.id, 'whatsapp_demo_qualified', { decision: 'qualified' });
+    await notifyOwner(lead, incomingText);
+  }
+  if (result.status === 'NOT_INTERESTED') {
+    await pool.query(`UPDATE hotel_leads SET status='not_interested', updated_at=NOW() WHERE id=$1`, [lead.id]);
+    await logAgentAction(lead.id, 'whatsapp_not_interested', { decision: 'not_interested' });
+  }
+  if (result.redirectPhone) {
+    await handleRedirectContact(lead, result.redirectPhone, result.redirectLabel, campaign);
+  }
   return { ...result, intent, stage: stage?.stage_key || null };
 }
 
-module.exports = { handleReply };
+module.exports = { handleReply, logAgentAction };

@@ -124,6 +124,7 @@ router.post('/whatsapp', async (req, res) => {
               await WABAService.sendTextMessage(fromPhone,
                 'You have been unsubscribed. We will not contact you again. Thank you.'
               ).catch(() => {});
+              agentService.logAgentAction(leadId, 'whatsapp_opted_out', { detail: { message: msgText }, decision: 'opted_out' }).catch(() => {});
               console.log(`[Webhook] Lead ${leadId} → opted_out`);
               continue;
             }
@@ -150,10 +151,15 @@ router.post('/whatsapp', async (req, res) => {
             if (leadRow.rows[0]) {
               if (!process.env.OPENAI_API_KEY) {
                 console.error('[Agent] ❌ OPENAI_API_KEY not set — agent cannot reply. Add it to Render env vars.');
+                agentService.logAgentAction(leadId, 'whatsapp_reply_failed', { detail: { error: 'OPENAI_API_KEY not set' }, decision: 'error' }).catch(() => {});
               } else {
-                agentService.handleReply(leadRow.rows[0], msgText).catch(e =>
-                  console.error('[Agent] handleReply failed:', e.message)
-                );
+                agentService.handleReply(leadRow.rows[0], msgText).catch(e => {
+                  console.error('[Agent] handleReply failed:', e.message);
+                  // Logged so a failure shows up in the Live Feed instead of only a Render
+                  // log line nobody's watching — this exact silent-failure pattern is why
+                  // leads went unanswered for days before anyone noticed.
+                  agentService.logAgentAction(leadId, 'whatsapp_reply_failed', { detail: { error: e.message }, decision: 'error' }).catch(() => {});
+                });
               }
             }
           }
