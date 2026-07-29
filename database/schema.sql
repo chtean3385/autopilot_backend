@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sales_agents (
     objection_handling TEXT,
     response_rules TEXT,
     active BOOLEAN NOT NULL DEFAULT TRUE,
+    auto_generated BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

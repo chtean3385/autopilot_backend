@@ -31,16 +31,31 @@ async function resolveAgent(leadId) {
     if (result.rows[0]) return { agent: result.rows[0], campaign: context };
   }
   // Compatibility for campaigns created before sales_agents existed. The prompt still
-  // comes from the database; new campaigns should always attach an agent_id.
+  // comes from the database; new campaigns should always attach an agent_id. Flagged
+  // auto_generated so the no-lineage fallback below never picks one of these as a "real"
+  // default — it's a blank one-off scoped to a single campaign, not hand-configured.
   if (context?.system_prompt) {
     const migrated = await pool.query(
-      `INSERT INTO sales_agents (name, industry, channel, system_prompt, active)
-       VALUES ($1, $2, 'whatsapp', $3, TRUE) RETURNING *`,
+      `INSERT INTO sales_agents (name, industry, channel, system_prompt, active, auto_generated)
+       VALUES ($1, $2, 'whatsapp', $3, TRUE, TRUE) RETURNING *`,
       [`${context.campaign_name} agent`, context.business_type || context.business_category || null, context.system_prompt]
     );
     await pool.query('UPDATE campaigns SET agent_id = $1 WHERE id = $2 AND agent_id IS NULL', [migrated.rows[0].id, context.id]);
     return { agent: migrated.rows[0], campaign: { ...context, agent_id: migrated.rows[0].id } };
   }
+  // No usable campaign lineage at all (common for leads whose only outreach history is
+  // follow-up touches, or whose original campaign was later deleted). Rather than permanently
+  // failing to ever reply, fall back to the account's real, hand-configured agent — the
+  // oldest active one not auto-generated, preferring one matching the lead's industry.
+  const fallback = await pool.query(
+    `SELECT sa.* FROM sales_agents sa
+     LEFT JOIN hotel_leads hl ON hl.id = $1
+     WHERE sa.active = TRUE AND sa.auto_generated = FALSE
+     ORDER BY (sa.industry IS NOT DISTINCT FROM hl.business_category) DESC, sa.created_at ASC
+     LIMIT 1`,
+    [leadId]
+  );
+  if (fallback.rows[0]) return { agent: fallback.rows[0], campaign: context };
   return { agent: null, campaign: context };
 }
 

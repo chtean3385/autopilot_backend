@@ -154,6 +154,11 @@ async function initDB() {
     ALTER TABLE sales_agents ADD COLUMN IF NOT EXISTS product_knowledge TEXT;
     ALTER TABLE sales_agents ADD COLUMN IF NOT EXISTS objection_handling TEXT;
     ALTER TABLE sales_agents ADD COLUMN IF NOT EXISTS response_rules TEXT;
+    -- Marks agents auto-created by resolveAgent's migration fallback (salesAgentService.js)
+    -- when a campaign has a system_prompt but no agent_id — a blank one-off, not a real
+    -- Sales Agent the user configured. Lets the no-lineage fallback in resolveAgent skip
+    -- these and prefer a real hand-built agent instead.
+    ALTER TABLE sales_agents ADD COLUMN IF NOT EXISTS auto_generated BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS agent_id INT REFERENCES sales_agents(id);
     CREATE TABLE IF NOT EXISTS agent_knowledge (
       id SERIAL PRIMARY KEY,
