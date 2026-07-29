@@ -36,6 +36,7 @@ router.get('/', async (req, res) => {
     SELECT c.*,
       t.template_name,
       g.name AS group_name,
+      sa.name AS agent_name,
       CASE
         WHEN c.target_type = 'group' AND c.group_id IS NOT NULL THEN (
           SELECT COUNT(*) FROM lead_group_members lgm
@@ -55,6 +56,7 @@ router.get('/', async (req, res) => {
     FROM campaigns c
     LEFT JOIN waba_templates t ON c.template_id = t.id
     LEFT JOIN lead_groups g ON c.group_id = g.id
+    LEFT JOIN sales_agents sa ON c.agent_id = sa.id
     ORDER BY c.created_at DESC
   `;
   try {
@@ -168,14 +170,15 @@ router.post('/:id/launch', async (req, res) => {
   }
 });
 
-// Edit draft campaign
+// Edit campaign — allowed at any status. Editable fields (name, template, target, agent) only
+// affect future behavior (which agent replies going forward, what "Send remaining" uses next),
+// never anything already sent, so there's no reason to lock this down once a campaign launches —
+// re-pointing agent_id here is in fact the main way to fix a campaign that never got a real
+// Sales Agent assigned (see resolveAgent's throwaway-agent fallback in salesAgentService.js).
 router.put('/:id', async (req, res) => {
   try {
     const existing = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
     if (!existing.rows[0]) return res.status(404).json({ error: 'Campaign not found' });
-    if (existing.rows[0].status !== 'draft') {
-      return res.status(400).json({ error: 'Only draft campaigns can be edited' });
-    }
     const { campaign_name, template_id, target_city, group_id, target_type, target_lead_status, agent_id } = req.body;
     const result = await pool.query(
       `UPDATE campaigns
@@ -183,6 +186,35 @@ router.put('/:id', async (req, res) => {
        WHERE id=$8 RETURNING *`,
       [campaign_name, template_id || null, target_city || null, group_id || null, target_type, target_lead_status || 'new', agent_id || null, req.params.id]
     );
+    res.json({ success: true, campaign: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Pause an active campaign — stops it from being offered for further manual "Send remaining"
+// batches. Does not touch leads already sent to or the agent's ability to reply to them;
+// it only gates new outbound sends under this campaign.
+router.post('/:id/pause', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE campaigns SET status='paused' WHERE id=$1 AND status='active' RETURNING *`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(400).json({ error: 'Only active campaigns can be paused' });
+    res.json({ success: true, campaign: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/:id/reactivate', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE campaigns SET status='active' WHERE id=$1 AND status='paused' RETURNING *`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(400).json({ error: 'Only paused campaigns can be reactivated' });
     res.json({ success: true, campaign: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });

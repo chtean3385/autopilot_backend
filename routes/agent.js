@@ -4,7 +4,81 @@ const { runTask, sendTask, refineInstruction, refineEmailInstruction, runEmailTa
 const { runSequenceWorker } = require('../workers/sequenceEmailWorker');
 const SchedulerStatusService = require('../services/schedulerStatusService');
 const WABAService = require('../services/wabaService');
+const agentService = require('../services/agentService');
 const router = express.Router();
+
+// Leads whose most recent inbound WhatsApp message never got an agent reply — the population
+// stuck by the getKnowledge() json=json crash (services/salesAgentService.js) that swallowed
+// every handleReply attempt silently in webhook.js's .catch(). A lead only stays a candidate
+// while no 'reply' outreach_log exists after their last inbound message, so this is naturally
+// safe to re-run: once a lead gets a real reply, they drop out on their own.
+async function findStuckReplyCandidates() {
+  const result = await pool.query(`
+    SELECT DISTINCT ON (ol.lead_id) hl.*, ol.response_text, ol.response_received_at
+    FROM outreach_logs ol
+    JOIN hotel_leads hl ON hl.id = ol.lead_id
+    WHERE ol.response_received = true
+      AND ol.response_text IS NOT NULL
+      AND hl.whatsapp_number IS NOT NULL
+      AND hl.status NOT IN ('opted_out')
+      AND NOT EXISTS (
+        SELECT 1 FROM outreach_logs r
+        WHERE r.lead_id = ol.lead_id
+          AND r.message_type = 'reply'
+          AND r.sent_at > ol.response_received_at
+      )
+    ORDER BY ol.lead_id, ol.response_received_at DESC
+  `);
+  return result.rows;
+}
+
+// Preview only — no messages sent. Call this first to see who would be contacted.
+router.get('/backfill-stuck-replies', async (req, res) => {
+  try {
+    const candidates = await findStuckReplyCandidates();
+    res.json({
+      dry_run: true,
+      count: candidates.length,
+      leads: candidates.map(c => ({
+        lead_id: c.id, hotel_name: c.hotel_name, whatsapp_number: c.whatsapp_number,
+        their_message: c.response_text, received_at: c.response_received_at,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Actually sends. Requires ?confirm=true — this messages real customers on WhatsApp.
+// Paced with a delay between sends to avoid bursting the WABA/OpenAI rate limits.
+router.post('/backfill-stuck-replies', async (req, res) => {
+  if (req.query.confirm !== 'true') {
+    return res.status(400).json({
+      error: 'This sends real WhatsApp messages to real customers. GET this same path first to preview, then re-POST with ?confirm=true.',
+    });
+  }
+  try {
+    const candidates = await findStuckReplyCandidates();
+    const results = [];
+    for (const lead of candidates) {
+      try {
+        await agentService.handleReply(lead, lead.response_text);
+        results.push({ lead_id: lead.id, hotel_name: lead.hotel_name, status: 'sent' });
+      } catch (err) {
+        results.push({ lead_id: lead.id, hotel_name: lead.hotel_name, status: 'failed', error: err.message });
+      }
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    res.json({
+      total: candidates.length,
+      sent: results.filter(r => r.status === 'sent').length,
+      failed: results.filter(r => r.status === 'failed').length,
+      results,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Manually trigger the daily WhatsApp follow-up job (catch-up if the cron tick was
 // missed — e.g. Render was asleep at the scheduled time and never woke for it).

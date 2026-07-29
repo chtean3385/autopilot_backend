@@ -480,6 +480,7 @@ app.use('/api/estimates', require('./routes/estimates'));
 app.use('/api/portfolio-items', require('./routes/portfolio'));
 app.use('/api/email-conversations', require('./routes/emailConversations'));
 app.use('/api/proposals', require('./routes/proposals'));
+app.use('/api/agent-activity', require('./routes/agentActivity'));
 
 // Health check
 app.get('/health', (req, res) => {

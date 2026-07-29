@@ -93,8 +93,8 @@ async function getKnowledge(agentId, stageKey, intent) {
   const result = await pool.query(
     `SELECT title, content, tags FROM agent_knowledge
      WHERE agent_id = $1 AND active = TRUE
-       AND (stage_keys IS NULL OR stage_keys = '[]'::json OR stage_keys ? $2)
-       AND (intent_keys IS NULL OR intent_keys = '[]'::json OR intent_keys ? $3)
+       AND (stage_keys IS NULL OR stage_keys::jsonb = '[]'::jsonb OR stage_keys::jsonb ? $2)
+       AND (intent_keys IS NULL OR intent_keys::jsonb = '[]'::jsonb OR intent_keys::jsonb ? $3)
      ORDER BY priority DESC, id ASC LIMIT 12`, [agentId, stageKey || '', intent]);
   return result.rows;
 }
