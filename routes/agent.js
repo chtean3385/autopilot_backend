@@ -50,15 +50,23 @@ router.get('/backfill-stuck-replies', async (req, res) => {
 });
 
 // Actually sends. Requires ?confirm=true — this messages real customers on WhatsApp.
-// Paced with a delay between sends to avoid bursting the WABA/OpenAI rate limits.
+// Capped at a small batch per call (default 15, max 20) rather than draining the whole
+// backlog at once — the WABA number is already at YELLOW quality, so a single burst of
+// however many hundreds of leads piled up during the outage is exactly the kind of spike
+// that risks tipping it to RED. Call this repeatedly (e.g. once every 15-30 min) to work
+// through the backlog gradually; candidates who've already been answered drop out on
+// their own, so re-running is always safe.
+const MAX_BACKFILL_BATCH = 20;
 router.post('/backfill-stuck-replies', async (req, res) => {
   if (req.query.confirm !== 'true') {
     return res.status(400).json({
       error: 'This sends real WhatsApp messages to real customers. GET this same path first to preview, then re-POST with ?confirm=true.',
     });
   }
+  const batchSize = Math.min(parseInt(req.query.limit, 10) || 15, MAX_BACKFILL_BATCH);
   try {
-    const candidates = await findStuckReplyCandidates();
+    const allCandidates = await findStuckReplyCandidates();
+    const candidates = allCandidates.slice(0, batchSize);
     const results = [];
     for (const lead of candidates) {
       try {
@@ -70,6 +78,7 @@ router.post('/backfill-stuck-replies', async (req, res) => {
       await new Promise(r => setTimeout(r, 1500));
     }
     res.json({
+      remaining_after_this_batch: allCandidates.length - candidates.length,
       total: candidates.length,
       sent: results.filter(r => r.status === 'sent').length,
       failed: results.filter(r => r.status === 'failed').length,
