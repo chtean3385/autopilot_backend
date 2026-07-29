@@ -38,6 +38,7 @@ async function initDB() {
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS header_image_url VARCHAR(500);
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS parameter_mapping JSON;
+    ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS industry VARCHAR(100);
     ALTER TABLE outreach_logs ADD COLUMN IF NOT EXISTS message_text TEXT;
     ALTER TABLE outreach_logs ADD COLUMN IF NOT EXISTS is_auto_reply BOOLEAN DEFAULT FALSE;
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
@@ -441,6 +442,10 @@ async function initDB() {
       last_trigger VARCHAR(20),
       last_summary JSON,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS job_locks (
+      job_name VARCHAR(100) PRIMARY KEY,
+      locked_at TIMESTAMP NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_leads_channel ON hotel_leads(channel);
     CREATE INDEX IF NOT EXISTS idx_senders_status ON email_senders(status);

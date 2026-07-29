@@ -47,7 +47,15 @@ CREATE TABLE IF NOT EXISTS waba_templates (
     footer_text VARCHAR(255),
     status VARCHAR(50) DEFAULT 'pending_approval', -- 'pending_approval', 'approved', 'rejected'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    created_by VARCHAR(100)
+    created_by VARCHAR(100),
+    industry VARCHAR(100) -- NULL/'all' = generic; matched against hotel_leads.business_category for follow-up sends
+);
+
+-- Run-level lock for background jobs, so an overlapping cron tick can't reprocess the
+-- same due leads twice. Stale locks (crash mid-run) self-heal after 10 minutes.
+CREATE TABLE IF NOT EXISTS job_locks (
+    job_name VARCHAR(100) PRIMARY KEY,
+    locked_at TIMESTAMP NOT NULL
 );
 
 -- Campaigns Table

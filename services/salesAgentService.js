@@ -44,13 +44,16 @@ async function resolveAgent(leadId) {
     return { agent: migrated.rows[0], campaign: { ...context, agent_id: migrated.rows[0].id } };
   }
   // No usable campaign lineage at all (common for leads whose only outreach history is
-  // follow-up touches, or whose original campaign was later deleted). Rather than permanently
-  // failing to ever reply, fall back to the account's real, hand-configured agent — the
-  // oldest active one not auto-generated, preferring one matching the lead's industry.
+  // follow-up touches, or whose original campaign was later deleted). Fall back to a real,
+  // hand-configured agent — but ONLY one that actually fits: an exact industry match, or an
+  // agent explicitly marked generic (industry NULL/'All'). Never guess by handing a mismatched
+  // lead to an unrelated industry-specific agent — a logistics company getting a hotel-specific
+  // pitch is worse than the reply simply failing loudly and showing up for manual review.
   const fallback = await pool.query(
     `SELECT sa.* FROM sales_agents sa
      LEFT JOIN hotel_leads hl ON hl.id = $1
      WHERE sa.active = TRUE AND sa.auto_generated = FALSE
+       AND (sa.industry IS NOT DISTINCT FROM hl.business_category OR sa.industry IS NULL OR LOWER(sa.industry) = 'all')
      ORDER BY (sa.industry IS NOT DISTINCT FROM hl.business_category) DESC, sa.created_at ASC
      LIMIT 1`,
     [leadId]
@@ -239,7 +242,17 @@ async function notifyOwner(lead, lastMessage) {
 
 async function handleReply(lead, incomingText) {
   const { agent, campaign } = await resolveAgent(lead.id);
-  if (!agent) throw new Error('No sales agent is assigned to this campaign. Create an agent and assign it before enabling replies.');
+  if (!agent) {
+    // Don't leave the lead sitting at 'new'/'responded' — runFollowUps() treats those as
+    // "still in play" and would keep re-sending the same (likely mismatched) template every
+    // 2 days until the 6-touch cap, even though this reply already went unanswered. Surface
+    // it for a human instead, per the no-guessing rule in resolveAgent() above.
+    await pool.query(
+      `UPDATE hotel_leads SET status='needs_review', updated_at=NOW() WHERE id=$1 AND status IN ('new', 'responded')`,
+      [lead.id]
+    );
+    throw new Error('No sales agent is assigned to this campaign. Create an agent and assign it before enabling replies.');
+  }
   const memory = await getMemory(lead.id, agent.id);
   const { intent } = await detectIntent({ agent, leadId: lead.id, message: incomingText, memory });
   if (intent === 'STOP') {

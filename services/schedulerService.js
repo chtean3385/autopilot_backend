@@ -635,7 +635,7 @@ async function upsertCityGroup(city, businessType, leadIds) {
 }
 
 // Get the best available approved template (task-specific or latest approved)
-async function getApprovedTemplate(templateId) {
+async function getApprovedTemplate(templateId, businessCategory = null) {
   if (templateId) {
     const t = await pool.query(
       `SELECT * FROM waba_templates WHERE id=$1 AND status='approved'`,
@@ -643,8 +643,17 @@ async function getApprovedTemplate(templateId) {
     );
     if (t.rows[0]) return t.rows[0];
   }
+  // Prefer a template built for this lead's industry; fall back to a generic one
+  // (industry NULL/'all'). Same match pattern as resolveAgent() in salesAgentService.js —
+  // grabbing "whatever was approved most recently" regardless of industry is how a
+  // logistics lead ends up getting hotel-worded copy.
   const t = await pool.query(
-    `SELECT * FROM waba_templates WHERE status='approved' ORDER BY created_at DESC LIMIT 1`
+    `SELECT * FROM waba_templates
+     WHERE status='approved'
+       AND (industry IS NOT DISTINCT FROM $1 OR industry IS NULL OR LOWER(industry) = 'all')
+     ORDER BY (industry IS NOT DISTINCT FROM $1) DESC, created_at DESC
+     LIMIT 1`,
+    [businessCategory]
   );
   return t.rows[0] || null;
 }
@@ -867,7 +876,7 @@ async function sendTask(taskId) {
     if (!campaign) throw new Error('Campaign not found');
     if (!campaign.group_id) throw new Error('Campaign has no lead group');
 
-    const template = await getApprovedTemplate(campaign.template_id || task.template_id);
+    const template = await getApprovedTemplate(campaign.template_id || task.template_id, campaign.business_type);
     if (!template) throw new Error('No approved WhatsApp template available');
 
     const leadsResult = await pool.query(
@@ -917,6 +926,21 @@ async function sendTask(taskId) {
 async function runFollowUps(trigger = 'cron') {
   console.log(`[FollowUp] Checking leads for follow-up... (trigger=${trigger})`);
 
+  // Claim a run-level lock first — without it, an overlapping cron tick (e.g. more than one
+  // backend instance alive at once) can pass this point twice and each independently send every
+  // due lead's follow-up template, the same double-send race sendTask's claim (above) guards
+  // against for task sends. Self-heals after 10 min in case a crash left the lock stuck.
+  const lockClaim = await pool.query(
+    `INSERT INTO job_locks (job_name, locked_at) VALUES ('whatsapp_followups', NOW())
+     ON CONFLICT (job_name) DO UPDATE SET locked_at = NOW()
+       WHERE job_locks.locked_at < NOW() - INTERVAL '10 minutes'
+     RETURNING job_name`
+  );
+  if (lockClaim.rowCount === 0) {
+    console.log('[FollowUp] Another run already holds the lock — skipping');
+    return { skipped: true, reason: 'already_running' };
+  }
+
   const stats = { due: 0, sent: 0, expired: 0, failed: 0, noTemplate: 0 };
 
   try {
@@ -943,8 +967,6 @@ async function runFollowUps(trigger = 'cron') {
     stats.due = result.rows.length;
     console.log(`[FollowUp] ${stats.due} lead(s) due for follow-up or expiry`);
 
-    const template = await getApprovedTemplate(null);
-
     for (const lead of result.rows) {
       const outreachCount = lead.template_count;
 
@@ -960,9 +982,13 @@ async function runFollowUps(trigger = 'cron') {
         continue;
       }
 
+      // Per-lead, not hoisted above the loop — different leads in the same batch can be
+      // different industries, and reusing one template for all of them regardless of
+      // business_category is exactly how a logistics lead gets hotel-worded copy.
+      const template = await getApprovedTemplate(null, lead.business_category);
       if (!template) {
         stats.noTemplate++;
-        console.warn('[FollowUp] No approved template — skipping follow-up sends');
+        console.warn(`[FollowUp] No approved template for lead ${lead.id} (industry: ${lead.business_category || 'generic'}) — skipping`);
         continue;
       }
 
@@ -982,6 +1008,8 @@ async function runFollowUps(trigger = 'cron') {
   } catch (err) {
     console.error('[FollowUp] Error:', err.message);
     stats.error = err.message;
+  } finally {
+    await pool.query(`DELETE FROM job_locks WHERE job_name = 'whatsapp_followups'`);
   }
 
   await SchedulerStatusService.recordRun('whatsapp_followups', trigger, stats);
