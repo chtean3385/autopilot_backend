@@ -21,6 +21,7 @@ async function findStuckReplyCandidates() {
       AND ol.response_text IS NOT NULL
       AND hl.whatsapp_number IS NOT NULL
       AND hl.status NOT IN ('opted_out')
+      AND hl.archived_at IS NULL
       AND NOT EXISTS (
         SELECT 1 FROM outreach_logs r
         WHERE r.lead_id = ol.lead_id
