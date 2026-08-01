@@ -27,7 +27,12 @@ router.put('/', async (req, res) => {
     for (const [key, value] of Object.entries(updates)) {
       if (!allowed.has(key)) continue;
       if (value === null || value === undefined) continue;
-      await setSetting(key, String(value).trim());
+      const trimmed = String(value).trim();
+      // GET masks sensitive values as `first8chars + '••••••••'` (below). A bulk "Save All"
+      // resubmits the whole form, including fields the user never touched — without this
+      // check, that masked placeholder overwrites the real secret with garbage.
+      if (trimmed.endsWith('••••••••')) continue;
+      await setSetting(key, trimmed);
     }
     const settings = await getAllSettings();
     res.json({ success: true, settings });
