@@ -19,7 +19,9 @@ async function runWeeklyInsightsJob() {
   }
 }
 
-// Every Monday at 6am — summarizes the past week's agent_actions + reply rate into a playbook insight
-schedule.scheduleJob('0 6 * * 1', runWeeklyInsightsJob);
+// Every Monday at 6am IST — summarizes the past week's agent_actions + reply rate into a playbook insight
+// Explicit tz (see schedulerService.js's daily-follow-up job for the same pattern): host clocks
+// aren't guaranteed to run in IST, so a bare cron rule would fire at the wrong wall-clock hour.
+schedule.scheduleJob({ rule: '0 6 * * 1', tz: 'Asia/Kolkata' }, runWeeklyInsightsJob);
 
 console.log('🧠 Playbook insights worker started - runs weekly on Mondays at 6am');
