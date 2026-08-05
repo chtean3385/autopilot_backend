@@ -349,6 +349,75 @@ function normalizeMobileNumber(rawPhone) {
   return null;
 }
 
+// Cache of Google Place Details responses, keyed by place_id — shared by scrapeLeads() and
+// scrapePlacesForWebsites(). Text Search for a given city+businessType tends to return the
+// same top-ranked places on every re-run, so without this, re-running an agent task for a
+// city+type already scraped re-pays for a Details call (the billed part of the Places API)
+// on every place, even ones we've already resolved and skipped/saved before.
+async function getCachedPlaceDetails(placeIds) {
+  const ids = placeIds.filter(Boolean);
+  if (!ids.length) return new Map();
+  const result = await pool.query(
+    `SELECT place_id, name, formatted_phone_number, international_phone_number, website
+     FROM google_places_details_cache WHERE place_id = ANY($1)`,
+    [ids]
+  );
+  return new Map(result.rows.map(row => [row.place_id, row]));
+}
+
+async function cachePlaceDetails(entries) {
+  for (const e of entries) {
+    if (!e.place_id) continue;
+    await pool.query(
+      `INSERT INTO google_places_details_cache
+         (place_id, name, formatted_phone_number, international_phone_number, website)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (place_id) DO NOTHING`,
+      [e.place_id, e.name || null, e.formatted_phone_number || null, e.international_phone_number || null, e.website || null]
+    );
+  }
+}
+
+// Fetches Place Details for a Text Search results page, reusing google_places_details_cache
+// for any place_id already resolved by a prior search (any city/businessType) instead of
+// paying for another Details call. Returns a Map<place_id, detailsObject>.
+async function fetchDetailsForPage(pageResults, googleKey) {
+  const placeIds = pageResults.map(r => r.place_id);
+  const cached = await getCachedPlaceDetails(placeIds);
+  const toFetch = pageResults.filter(r => r.place_id && !cached.has(r.place_id));
+
+  const fetched = await Promise.allSettled(
+    toFetch.map(r =>
+      axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
+        params: {
+          place_id: r.place_id,
+          fields: 'name,formatted_phone_number,international_phone_number,website',
+          key: googleKey,
+          language: 'en',
+        },
+        timeout: GOOGLE_PLACES_TIMEOUT_MS,
+      })
+    )
+  );
+
+  const detailsByPlaceId = new Map(cached);
+  const toCache = [];
+  toFetch.forEach((r, i) => {
+    const val = fetched[i].status === 'fulfilled' ? fetched[i].value.data.result : null;
+    if (val) {
+      detailsByPlaceId.set(r.place_id, val);
+      toCache.push({ place_id: r.place_id, ...val });
+    }
+  });
+  if (toCache.length) await cachePlaceDetails(toCache);
+
+  if (cached.size) {
+    console.log(`[Scraper] ${cached.size}/${pageResults.length} place(s) already cached — skipped Details API call`);
+  }
+
+  return detailsByPlaceId;
+}
+
 // Scrape any business type from Google Places.
 // Fetches page by page (20 results each, max 3 pages = 60 from Google).
 // Stops as soon as we have enough valid mobile leads OR Google runs out of pages.
@@ -399,26 +468,15 @@ async function scrapeLeads(city, count, businessType = 'businesses', filterHasWe
 
     console.log(`[Scraper] Page ${pageNum}: ${pageResults.length} results from Google (${leads.length}/${count} mobile found so far)`);
 
-    // Fetch Place Details for this page in parallel (10 at a time)
-    const detailed = await Promise.allSettled(
-      pageResults.map(r =>
-        axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
-          params: {
-            place_id: r.place_id,
-            fields: 'name,formatted_phone_number,international_phone_number,website',
-            key: googleKey,
-            language: 'en',
-          },
-          timeout: GOOGLE_PLACES_TIMEOUT_MS,
-        })
-      )
-    );
+    // Fetch Place Details for this page — cached place_ids (from any prior search) skip the
+    // billed Details call entirely.
+    const detailsByPlaceId = await fetchDetailsForPage(pageResults, googleKey);
 
     for (let i = 0; i < pageResults.length; i++) {
       if (leads.length >= count) break; // have enough, stop processing this page
 
       const r = pageResults[i];
-      const detail = detailed[i].status === 'fulfilled' ? detailed[i].value.data.result : {};
+      const detail = detailsByPlaceId.get(r.place_id) || {};
       const rawPhone = detail.international_phone_number || detail.formatted_phone_number || '';
 
       if (!rawPhone) {
@@ -532,20 +590,15 @@ async function scrapePlacesForWebsites(city, count, businessType = 'businesses')
 
     console.log(`[EmailScraper] Page ${pageNum}: ${pageResults.length} results from Google (${candidates.length}/${count} with website so far)`);
 
-    const detailed = await Promise.allSettled(
-      pageResults.map(r =>
-        axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
-          params: { place_id: r.place_id, fields: 'name,website', key: googleKey, language: 'en' },
-          timeout: GOOGLE_PLACES_TIMEOUT_MS,
-        })
-      )
-    );
+    // Shares the same google_places_details_cache as scrapeLeads() — a place_id already
+    // resolved by a WhatsApp-channel search (or a prior email-channel one) skips the Details call.
+    const detailsByPlaceId = await fetchDetailsForPage(pageResults, googleKey);
 
     for (let i = 0; i < pageResults.length; i++) {
       if (candidates.length >= count) break;
 
       const r = pageResults[i];
-      const detail = detailed[i].status === 'fulfilled' ? detailed[i].value.data.result : {};
+      const detail = detailsByPlaceId.get(r.place_id) || {};
 
       if (!detail.website) {
         noWebsiteCount++;

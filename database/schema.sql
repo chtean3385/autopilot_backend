@@ -449,3 +449,14 @@ CREATE INDEX IF NOT EXISTS idx_pending_approvals_status ON pending_approvals(sta
 CREATE INDEX IF NOT EXISTS idx_estimates_lead ON estimates(lead_id);
 CREATE INDEX IF NOT EXISTS idx_estimates_status ON estimates(status);
 CREATE INDEX IF NOT EXISTS idx_playbook_examples_lead ON playbook_examples(source_lead_id);
+
+-- Caches Google Place Details responses by place_id so re-scraping the same city+type
+-- doesn't re-pay for Details lookups on places already resolved in a prior run.
+CREATE TABLE IF NOT EXISTS google_places_details_cache (
+    place_id VARCHAR(255) PRIMARY KEY,
+    name TEXT,
+    formatted_phone_number TEXT,
+    international_phone_number TEXT,
+    website TEXT,
+    cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

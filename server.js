@@ -447,6 +447,14 @@ async function initDB() {
       job_name VARCHAR(100) PRIMARY KEY,
       locked_at TIMESTAMP NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS google_places_details_cache (
+      place_id VARCHAR(255) PRIMARY KEY,
+      name TEXT,
+      formatted_phone_number TEXT,
+      international_phone_number TEXT,
+      website TEXT,
+      cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE INDEX IF NOT EXISTS idx_leads_channel ON hotel_leads(channel);
     CREATE INDEX IF NOT EXISTS idx_senders_status ON email_senders(status);
     CREATE INDEX IF NOT EXISTS idx_lead_sequences_lead ON lead_sequences(lead_id);
