@@ -30,31 +30,23 @@ async function resolveAgent(leadId) {
     const result = await pool.query('SELECT * FROM sales_agents WHERE id = $1 AND active = TRUE', [context.agent_id]);
     if (result.rows[0]) return { agent: result.rows[0], campaign: context };
   }
-  // Compatibility for campaigns created before sales_agents existed. The prompt still
-  // comes from the database; new campaigns should always attach an agent_id. Flagged
-  // auto_generated so the no-lineage fallback below never picks one of these as a "real"
-  // default — it's a blank one-off scoped to a single campaign, not hand-configured.
-  if (context?.system_prompt) {
-    const migrated = await pool.query(
-      `INSERT INTO sales_agents (name, industry, channel, system_prompt, active, auto_generated)
-       VALUES ($1, $2, 'whatsapp', $3, TRUE, TRUE) RETURNING *`,
-      [`${context.campaign_name} agent`, context.business_type || context.business_category || null, context.system_prompt]
-    );
-    await pool.query('UPDATE campaigns SET agent_id = $1 WHERE id = $2 AND agent_id IS NULL', [migrated.rows[0].id, context.id]);
-    return { agent: migrated.rows[0], campaign: { ...context, agent_id: migrated.rows[0].id } };
-  }
-  // No usable campaign lineage at all (common for leads whose only outreach history is
-  // follow-up touches, or whose original campaign was later deleted). Fall back to a real,
-  // hand-configured agent — but ONLY one that actually fits: an exact industry match, or an
-  // agent explicitly marked generic (industry NULL/'All'). Never guess by handing a mismatched
+  // No usable campaign lineage (no agent_id attached — including campaigns from before
+  // sales_agents existed, which used to spin up a throwaway one-off agent here; we only ever
+  // want the hand-configured agents, never an auto-created duplicate per campaign). Fall back to
+  // a real agent — but ONLY one that actually fits: an industry match (business_category is a
+  // free-text search term like "hotels or resorts", so this is a substring match, not exact), or
+  // an agent explicitly marked generic (industry NULL/'All'). Never guess by handing a mismatched
   // lead to an unrelated industry-specific agent — a logistics company getting a hotel-specific
   // pitch is worse than the reply simply failing loudly and showing up for manual review.
   const fallback = await pool.query(
     `SELECT sa.* FROM sales_agents sa
      LEFT JOIN hotel_leads hl ON hl.id = $1
      WHERE sa.active = TRUE AND sa.auto_generated = FALSE
-       AND (sa.industry IS NOT DISTINCT FROM hl.business_category OR sa.industry IS NULL OR LOWER(sa.industry) = 'all')
-     ORDER BY (sa.industry IS NOT DISTINCT FROM hl.business_category) DESC, sa.created_at ASC
+       AND (sa.industry IS NULL OR LOWER(sa.industry) = 'all'
+            OR (sa.industry IS NOT NULL AND hl.business_category ILIKE '%' || sa.industry || '%'))
+     ORDER BY (sa.industry IS NOT NULL AND LOWER(sa.industry) != 'all'
+               AND hl.business_category ILIKE '%' || sa.industry || '%') DESC,
+              sa.created_at ASC
      LIMIT 1`,
     [leadId]
   );
