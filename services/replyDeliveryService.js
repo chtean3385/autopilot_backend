@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const EmailSenderService = require('./emailSenderService');
 const SuppressionService = require('./suppressionService');
 const WABAService = require('./wabaService');
+const settingsService = require('./settingsService');
 const { renderEmailBody, escapeHtml } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
 const { generateTrackingToken, buildPixelUrl, buildClickUrl } = require('../utils/emailTracking');
@@ -16,7 +17,7 @@ async function logAgentAction(leadId, action, { detail, draftText, score, decisi
 }
 
 async function notifyOwner(sender, lead, subjectLine, bodyText) {
-  let ownerNumber = process.env.OWNER_WHATSAPP;
+  let ownerNumber = await settingsService.getSetting('OWNER_WHATSAPP');
   if (ownerNumber) {
     ownerNumber = ownerNumber.replace(/\D/g, '');
     if (ownerNumber.length === 10) ownerNumber = '91' + ownerNumber;
@@ -24,7 +25,7 @@ async function notifyOwner(sender, lead, subjectLine, bodyText) {
     if (!result.success) console.error('[ReplyDelivery] WhatsApp owner notify failed:', result.error);
   }
 
-  const notifyEmail = process.env.OWNER_NOTIFY_EMAIL;
+  const notifyEmail = await settingsService.getSetting('OWNER_NOTIFY_EMAIL');
   if (notifyEmail && sender) {
     const html = `<p>${escapeHtml(bodyText).replace(/\n/g, '<br>')}</p>`;
     const result = await EmailSenderService.send(sender, { to: notifyEmail, subject: subjectLine, html, text: bodyText });
