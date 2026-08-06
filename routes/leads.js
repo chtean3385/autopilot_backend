@@ -177,8 +177,8 @@ router.get('/search', async (req, res) => {
 
 // Get all leads — paginated, enriched with score + group + campaign + message_sent
 router.get('/', async (req, res) => {
-  const { city, status, q, channel, sequenceEnrollment, page = 1, pageSize = 25 } = req.query;
-  const limit = Math.min(Math.max(Number(pageSize) || 25, 1), 100);
+  const { city, status, emailStatus, q, channel, sequenceEnrollment, page = 1, pageSize = 25 } = req.query;
+  const limit = Math.min(Math.max(Number(pageSize) || 25, 1), 500);
   const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
   const conditions = [];
@@ -191,6 +191,7 @@ router.get('/', async (req, res) => {
 
   if (city) conditions.push(`hl.city ILIKE ${addParam(`%${city}%`)}`);
   if (status) conditions.push(`hl.status = ${addParam(status)}`);
+  if (emailStatus) conditions.push(`hl.email_status = ${addParam(emailStatus)}`);
   if (channel) conditions.push(`hl.channel = ${addParam(channel)}`);
   if (q) {
     const p = addParam(`%${q}%`);
