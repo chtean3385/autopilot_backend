@@ -161,6 +161,7 @@ async function initDB() {
     -- these and prefer a real hand-built agent instead.
     ALTER TABLE sales_agents ADD COLUMN IF NOT EXISTS auto_generated BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS agent_id INT REFERENCES sales_agents(id);
+    ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS agent_id INT REFERENCES sales_agents(id);
     CREATE TABLE IF NOT EXISTS agent_knowledge (
       id SERIAL PRIMARY KEY,
       agent_id INT NOT NULL REFERENCES sales_agents(id) ON DELETE CASCADE,

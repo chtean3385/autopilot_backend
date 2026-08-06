@@ -767,9 +767,9 @@ async function runTask(task) {
     // 5. Create campaign (draft — not sent yet; admin reviews leads first)
     const campaignName = `Agent: ${businessType} in ${city} – ${new Date().toLocaleDateString('en-IN')}`;
     const campResult = await pool.query(
-      `INSERT INTO campaigns (campaign_name, template_id, target_city, target_type, status, created_by, system_prompt, business_type, group_id)
-       VALUES ($1, $2, $3, 'city', 'draft', 'agent', $4, $5, $6) RETURNING *`,
-      [campaignName, task.template_id || null, city, task.system_prompt || null, businessType, groupId]
+      `INSERT INTO campaigns (campaign_name, template_id, target_city, target_type, status, created_by, system_prompt, business_type, group_id, agent_id)
+       VALUES ($1, $2, $3, 'city', 'draft', 'agent', $4, $5, $6, $7) RETURNING *`,
+      [campaignName, task.template_id || null, city, task.system_prompt || null, businessType, groupId, task.agent_id || null]
     );
     const campaign = campResult.rows[0];
 

@@ -146,7 +146,7 @@ router.get('/tasks', async (req, res) => {
 // gets its own agent_tasks row (its own approval card, independently editable/deletable/runnable).
 // channel='email' requires sequence_id (auto-enrolled into it once leads are found+verified).
 router.post('/tasks', async (req, res) => {
-  const { instruction, template_id, lead_count, schedule, custom_time, filters, channel, sequence_id } = req.body;
+  const { instruction, template_id, lead_count, schedule, custom_time, filters, channel, sequence_id, agent_id } = req.body;
   if (!instruction?.trim()) return res.status(400).json({ error: 'Instruction is required' });
   if (channel === 'email' && !sequence_id) {
     return res.status(400).json({ error: 'sequence_id is required for email tasks' });
@@ -176,8 +176,8 @@ router.post('/tasks', async (req, res) => {
       const result = await pool.query(
         `INSERT INTO agent_tasks
            (instruction, refined_instruction, refinement_note, city, lead_count,
-            template_id, status, run_at, parsed_params, system_prompt, channel, sequence_id)
-         VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9, $10, $11)
+            template_id, status, run_at, parsed_params, system_prompt, channel, sequence_id, agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9, $10, $11, $12)
          RETURNING *`,
         [
           instruction.trim(),
@@ -191,6 +191,7 @@ router.post('/tasks', async (req, res) => {
           refined.systemPrompt || null,
           channel === 'email' ? 'email' : 'whatsapp',
           channel === 'email' ? sequence_id : null,
+          channel === 'email' ? null : (agent_id || null),
         ]
       );
       tasks.push(result.rows[0]);
@@ -275,8 +276,8 @@ router.post('/tasks/:id/revise', async (req, res) => {
       await pool.query(
         `INSERT INTO agent_tasks
            (instruction, refined_instruction, refinement_note, city, lead_count,
-            template_id, status, run_at, parsed_params, system_prompt, channel, sequence_id)
-         VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9, $10, $11)`,
+            template_id, status, run_at, parsed_params, system_prompt, channel, sequence_id, agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6, 'needs_approval', $7, $8, $9, $10, $11, $12)`,
         [
           instruction.trim(),
           t.refinedInstruction,
@@ -289,6 +290,7 @@ router.post('/tasks/:id/revise', async (req, res) => {
           task.system_prompt,
           task.channel,
           task.sequence_id,
+          task.agent_id,
         ]
       );
     }

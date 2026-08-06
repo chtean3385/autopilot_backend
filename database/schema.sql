@@ -235,6 +235,7 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
   refined_instruction TEXT,
   refinement_note TEXT,
   system_prompt TEXT,
+  agent_id INT REFERENCES sales_agents(id),
   created_at TIMESTAMP DEFAULT NOW()
 );
 
