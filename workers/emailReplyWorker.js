@@ -24,7 +24,7 @@ async function findLeadByEmail(email) {
 
 async function getActiveLeadSequence(leadId) {
   const result = await pool.query(
-    `SELECT ls.*, s.initial_gaps, s.recurring_interval_days
+    `SELECT ls.*, s.initial_gaps, s.recurring_interval_days, s.agent_id
      FROM lead_sequences ls
      JOIN sequences s ON s.id = ls.sequence_id
      WHERE ls.lead_id = $1
@@ -32,6 +32,15 @@ async function getActiveLeadSequence(leadId) {
      LIMIT 1`,
     [leadId]
   );
+  return result.rows[0] || null;
+}
+
+// The sequence's assigned agent (if any) supplies its persona/knowledge to the reply draft in
+// place of the generic hardcoded prompt -- same idea as WhatsApp's resolveAgent(), just scoped
+// to the sequence rather than per-lead conversation state, since email has no stage machinery.
+async function getSequenceAgent(leadSeq) {
+  if (!leadSeq?.agent_id) return null;
+  const result = await pool.query('SELECT * FROM sales_agents WHERE id = $1 AND active = TRUE', [leadSeq.agent_id]);
   return result.rows[0] || null;
 }
 
@@ -130,9 +139,10 @@ async function handleWantsEstimate(lead, leadSeq, sender, incomingText, subject,
 
 async function handleQuestion(lead, leadSeq, sender, incomingText, subject, conversationHistory, messageId) {
   const { fewShotExamples, notes } = await PlaybookService.getPlaybookContext();
+  const agent = await getSequenceAgent(leadSeq);
   const result = await ReplyQualityService.draftAndScore({
     leadId: lead.id, lead, incomingMessage: incomingText, conversationHistory,
-    playbookExamples: fewShotExamples, playbookNotes: notes,
+    playbookExamples: fewShotExamples, playbookNotes: notes, agent,
   });
   await sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentActionLabel: 'draft_sent', inReplyTo: messageId });
 }

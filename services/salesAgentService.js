@@ -27,7 +27,7 @@ async function findCampaignContext(leadId) {
 async function resolveAgent(leadId) {
   const context = await findCampaignContext(leadId);
   if (context?.agent_id) {
-    const result = await pool.query('SELECT * FROM sales_agents WHERE id = $1 AND active = TRUE', [context.agent_id]);
+    const result = await pool.query(`SELECT * FROM sales_agents WHERE id = $1 AND active = TRUE AND channel = 'whatsapp'`, [context.agent_id]);
     if (result.rows[0]) return { agent: result.rows[0], campaign: context };
   }
   // No usable campaign lineage (no agent_id attached — including campaigns from before
@@ -41,7 +41,7 @@ async function resolveAgent(leadId) {
   const fallback = await pool.query(
     `SELECT sa.* FROM sales_agents sa
      LEFT JOIN hotel_leads hl ON hl.id = $1
-     WHERE sa.active = TRUE AND sa.auto_generated = FALSE
+     WHERE sa.active = TRUE AND sa.auto_generated = FALSE AND sa.channel = 'whatsapp'
        AND (sa.industry IS NULL OR LOWER(sa.industry) = 'all'
             OR (sa.industry IS NOT NULL AND hl.business_category ILIKE '%' || sa.industry || '%'))
      ORDER BY (sa.industry IS NOT NULL AND LOWER(sa.industry) != 'all'

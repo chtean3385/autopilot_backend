@@ -14,8 +14,8 @@ class SequenceService {
   static async create(data) {
     const result = await pool.query(
       `INSERT INTO sequences
-         (name, channel, initial_gaps, recurring_interval_days, daily_send_limit, active)
-       VALUES ($1, $2, $3, $4, $5, $6)
+         (name, channel, initial_gaps, recurring_interval_days, daily_send_limit, active, agent_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
       [
         data.name,
@@ -24,6 +24,7 @@ class SequenceService {
         data.recurring_interval_days ?? 7,
         data.daily_send_limit ?? 20,
         data.active ?? true,
+        data.agent_id || null,
       ]
     );
     return result.rows[0];
@@ -45,6 +46,7 @@ class SequenceService {
     if (data.recurring_interval_days !== undefined) set('recurring_interval_days', data.recurring_interval_days);
     if (data.daily_send_limit !== undefined) set('daily_send_limit', data.daily_send_limit);
     if (data.active !== undefined) set('active', data.active);
+    if (data.agent_id !== undefined) set('agent_id', data.agent_id || null);
 
     if (fields.length === 0) return this.getById(id);
 

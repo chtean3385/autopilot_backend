@@ -278,6 +278,7 @@ async function initDB() {
       active BOOLEAN DEFAULT TRUE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE sequences ADD COLUMN IF NOT EXISTS agent_id INT REFERENCES sales_agents(id);
     CREATE TABLE IF NOT EXISTS lead_sequences (
       id SERIAL PRIMARY KEY,
       lead_id INT REFERENCES hotel_leads(id) ON DELETE CASCADE,

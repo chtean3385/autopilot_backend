@@ -204,6 +204,7 @@ CREATE TABLE IF NOT EXISTS sequences (
     sent_today INT DEFAULT 0,
     last_reset_date DATE,
     active BOOLEAN DEFAULT TRUE,
+    agent_id INT REFERENCES sales_agents(id),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -46,25 +46,51 @@ function buildServiceContextText(serviceContext) {
   return `\n\nBackground on what Dreams Technology offers (from our own website — use only if relevant, don't quote verbatim):\n${serviceContext}`;
 }
 
-function buildDraftSystemPrompt(playbookExamples, revisionFeedback, portfolioItems, serviceContext, playbookNotes) {
+// Mirrors salesAgentService.js's agentInstructions() — same idea, same fields, so an agent
+// configured once (Manage -> Sales Agents) reads consistently whether it's driving WhatsApp
+// or email replies.
+function buildAgentPersonaText(agent) {
+  if (!agent) return '';
+  const parts = [
+    agent.system_prompt,
+    agent.sales_strategy,
+    agent.qualification_logic,
+    agent.demo_process,
+    agent.closing_strategy,
+    agent.product_knowledge && `Product knowledge:\n${agent.product_knowledge}`,
+    agent.objection_handling && `Objection handling:\n${agent.objection_handling}`,
+    agent.response_rules && `Response rules:\n${agent.response_rules}`,
+  ].filter(Boolean).join('\n\n');
+  return `\n\n${parts}`;
+}
+
+function buildDraftSystemPrompt(playbookExamples, revisionFeedback, portfolioItems, serviceContext, playbookNotes, agent) {
   const revisionNote = revisionFeedback
     ? `\n\nA previous draft scored too low on quality review. Feedback to address: "${revisionFeedback}". Write an improved reply.`
     : '';
 
-  return `You are a sales assistant for Dreams Technology, a business management software company in India, replying to an inbound message from a lead in an ongoing email conversation.
+  // With an agent assigned, its own persona/strategy fully replaces the generic intro (same
+  // agent-owns-its-persona principle as WhatsApp) -- everything else (portfolio, playbook
+  // examples/notes, revision feedback) still layers on top since those are lead-specific
+  // context, not persona.
+  const intro = agent
+    ? `You are replying to an inbound message from a lead in an ongoing email conversation. Respond in 3-6 sentences unless the agent instructions below say otherwise. Never mention you are an AI.${buildAgentPersonaText(agent)}`
+    : `You are a sales assistant for Dreams Technology, a business management software company in India, replying to an inbound message from a lead in an ongoing email conversation.
 
 Goals:
 - Be warm, professional, and concise (3-6 sentences).
 - Directly address what the lead said or asked — do not ignore it or repeat a generic pitch.
 - Where natural, move the conversation toward a free demo of our business management software, without being pushy.
 - Never fabricate facts about the recipient's business or about Dreams Technology beyond what's given below.
-- Never mention you are an AI.${buildPortfolioText(portfolioItems)}${buildServiceContextText(serviceContext)}${buildPlaybookText(playbookExamples)}${buildPlaybookNotesText(playbookNotes)}${revisionNote}
+- Never mention you are an AI.`;
+
+  return `${intro}${buildPortfolioText(portfolioItems)}${buildServiceContextText(serviceContext)}${buildPlaybookText(playbookExamples)}${buildPlaybookNotesText(playbookNotes)}${revisionNote}
 
 Respond with ONLY a JSON object: {"text": "..."} where text is plain text with "\\n\\n" between paragraphs (no HTML, no signature).`;
 }
 
 async function draftReply(context, revisionFeedback) {
-  const { lead, incomingMessage, conversationHistory, playbookExamples, portfolioItems, serviceContext, playbookNotes } = context;
+  const { lead, incomingMessage, conversationHistory, playbookExamples, portfolioItems, serviceContext, playbookNotes, agent } = context;
   const historyText = buildHistoryText(conversationHistory);
   const userContent = `${buildLeadContext(lead)}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nLead's latest message:\n${incomingMessage}`;
 
@@ -73,7 +99,7 @@ async function draftReply(context, revisionFeedback) {
     max_tokens: 400,
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: buildDraftSystemPrompt(playbookExamples, revisionFeedback, portfolioItems, serviceContext, playbookNotes) },
+      { role: 'system', content: buildDraftSystemPrompt(playbookExamples, revisionFeedback, portfolioItems, serviceContext, playbookNotes, agent) },
       { role: 'user', content: userContent },
     ],
   }, { purpose: 'reply_draft', leadId: context.leadId ?? null });
