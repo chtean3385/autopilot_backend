@@ -238,6 +238,11 @@ async function initDB() {
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_source VARCHAR(50);
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_verify_attempts INT DEFAULT 0;
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS last_verify_attempt_at TIMESTAMP;
+    -- workers/researchWorker.js retry bookkeeping (database/migrate_research_worker_and_open_tracking.sql)
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS research_attempts INT DEFAULT 0;
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS last_research_attempt_at TIMESTAMP;
+    -- WhatsApp Inbox unread tracking (database/migrate_inbox_unread_tracking.sql)
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS inbox_last_read_at TIMESTAMP;
     CREATE UNIQUE INDEX IF NOT EXISTS hotel_leads_email_unique_idx
       ON hotel_leads (LOWER(email))
       WHERE email IS NOT NULL AND email <> '';
@@ -309,6 +314,10 @@ async function initDB() {
     );
     ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP;
     ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS tracking_token VARCHAR(64);
+    -- Open-count tracking (database/migrate_research_worker_and_open_tracking.sql) — opened_at
+    -- above stays first-open-only; these track repeat opens for the "opened Nx" UI badge.
+    ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS open_count INT DEFAULT 0;
+    ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS last_opened_at TIMESTAMP;
     CREATE INDEX IF NOT EXISTS idx_email_logs_provider_message_id ON email_logs(provider_message_id);
     CREATE INDEX IF NOT EXISTS idx_email_logs_tracking_token ON email_logs(tracking_token);
     CREATE TABLE IF NOT EXISTS agent_actions (
@@ -509,6 +518,7 @@ app.get('/health', (req, res) => {
 
 // Start background workers
 require('./workers/campaignWorker');
+require('./workers/researchWorker');
 require('./workers/sequenceEmailWorker');
 require('./workers/emailReplyWorker');
 require('./workers/emailVerificationWorker');

@@ -12,11 +12,15 @@ const router = express.Router();
 // 1x1 transparent GIF
 const PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 
-async function stamp(token, columns) {
+// columns: COALESCE-stamped once (first-fire wins), same as before. countOpen: true also bumps
+// open_count unconditionally and refreshes last_opened_at every single fire, so repeat opens
+// (re-reading the email, forwarding it) are visible in the UI, not just the first one.
+async function stamp(token, columns, { countOpen = false } = {}) {
   try {
+    const setClauses = columns.map((c) => `${c} = COALESCE(${c}, NOW())`);
+    if (countOpen) setClauses.push('open_count = COALESCE(open_count, 0) + 1', 'last_opened_at = NOW()');
     await pool.query(
-      `UPDATE email_logs SET ${columns.map((c) => `${c} = COALESCE(${c}, NOW())`).join(', ')}
-       WHERE tracking_token = $1 AND direction = 'out'`,
+      `UPDATE email_logs SET ${setClauses.join(', ')} WHERE tracking_token = $1 AND direction = 'out'`,
       [token]
     );
   } catch (err) {
@@ -33,7 +37,7 @@ router.get('/o/:token', async (req, res) => {
     Expires: '0',
   });
   res.send(PIXEL);
-  await stamp(req.params.token, ['opened_at']);
+  await stamp(req.params.token, ['opened_at'], { countOpen: true });
 });
 
 // Click redirect — the HMAC sig ties the destination to the token, so this can't be used as
@@ -46,7 +50,7 @@ router.get('/c/:token', async (req, res) => {
     return res.status(404).send('Not found');
   }
   res.redirect(302, url);
-  await stamp(req.params.token, ['clicked_at', 'opened_at']);
+  await stamp(req.params.token, ['clicked_at', 'opened_at'], { countOpen: true });
 });
 
 module.exports = router;

@@ -123,6 +123,8 @@ router.get('/thread/:leadId', async (req, res) => {
       text: log.body,
       timestamp: log.sent_at || log.created_at,
       opened_at: log.opened_at,
+      open_count: log.open_count,
+      last_opened_at: log.last_opened_at,
       clicked_at: log.clicked_at,
       bounced_at: log.bounced_at,
       error: log.error,

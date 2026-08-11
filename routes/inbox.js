@@ -3,55 +3,71 @@ const pool = require('../config/db');
 const WABAService = require('../services/wabaService');
 const router = express.Router();
 
-// GET /api/inbox — conversations (one per lead who replied), newest first
+// GET /api/inbox — conversations (one per lead who replied), sorted like a real messaging app:
+// by whichever happened most recently, their reply OR our own last outbound touch (not just
+// "latest reply" — a lead we followed up with after their last message would otherwise get
+// stuck showing as if nothing happened since). unread_count is genuine unread-message tracking:
+// replies received after hotel_leads.inbox_last_read_at (stamped when the thread is opened
+// below), the same mechanism a real WhatsApp/Gmail read receipt uses.
 router.get('/', async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT DISTINCT ON (ol.lead_id)
-        ol.id,
-        ol.lead_id,
-        ol.campaign_id,
-        ol.waba_message_id,
-        ol.sent_at,
-        ol.delivered_at,
-        ol.read_at,
-        ol.response_text,
-        ol.response_received_at,
-        ol.qualified_for_demo,
-        ol.lead_status_after,
-        hl.hotel_name,
-        hl.owner_name,
-        hl.whatsapp_number,
-        hl.city,
-        hl.status AS lead_status,
-        hl.archived_at,
-        c.campaign_name,
-        t.template_name
-      FROM outreach_logs ol
-      JOIN hotel_leads hl ON hl.id = ol.lead_id
-      LEFT JOIN campaigns c ON c.id = ol.campaign_id
-      LEFT JOIN waba_templates t ON t.id = ol.template_id
-      WHERE ol.response_received = true
-      ORDER BY ol.lead_id, ol.response_received_at DESC
+      WITH latest_reply AS (
+        SELECT DISTINCT ON (lead_id)
+          id, lead_id, campaign_id, template_id, waba_message_id,
+          sent_at, delivered_at, read_at, response_text, response_received_at,
+          qualified_for_demo, lead_status_after
+        FROM outreach_logs
+        WHERE response_received = true
+        ORDER BY lead_id, response_received_at DESC
+      ),
+      last_outbound AS (
+        SELECT lead_id, MAX(sent_at) AS last_sent_at FROM outreach_logs GROUP BY lead_id
+      ),
+      unread AS (
+        SELECT ol.lead_id, COUNT(*) AS unread_count
+        FROM outreach_logs ol
+        JOIN hotel_leads hl ON hl.id = ol.lead_id
+        WHERE ol.response_received = true
+          AND ol.response_received_at > COALESCE(hl.inbox_last_read_at, '-infinity'::timestamp)
+        GROUP BY ol.lead_id
+      )
+      SELECT
+        lr.id, lr.lead_id, lr.campaign_id, lr.waba_message_id,
+        lr.sent_at, lr.delivered_at, lr.read_at, lr.response_text, lr.response_received_at,
+        lr.qualified_for_demo, lr.lead_status_after,
+        hl.hotel_name, hl.owner_name, hl.whatsapp_number, hl.city,
+        hl.status AS lead_status, hl.archived_at,
+        c.campaign_name, t.template_name,
+        GREATEST(lr.response_received_at, lo.last_sent_at) AS last_activity_at,
+        COALESCE(u.unread_count, 0)::int AS unread_count
+      FROM latest_reply lr
+      JOIN hotel_leads hl ON hl.id = lr.lead_id
+      LEFT JOIN campaigns c ON c.id = lr.campaign_id
+      LEFT JOIN waba_templates t ON t.id = lr.template_id
+      LEFT JOIN last_outbound lo ON lo.lead_id = lr.lead_id
+      LEFT JOIN unread u ON u.lead_id = lr.lead_id
+      ORDER BY last_activity_at DESC
     `);
 
-    // Sort by most recent reply
-    const rows = result.rows.sort((a, b) =>
-      new Date(b.response_received_at) - new Date(a.response_received_at)
-    );
-    res.json(rows);
+    res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/inbox/thread/:leadId — full message thread for one lead
+// GET /api/inbox/thread/:leadId — full message thread for one lead. Opening the thread is the
+// "read receipt" moment — stamping inbox_last_read_at here is what clears this lead's unread
+// badge in GET /api/inbox above, mirroring how opening a chat marks it read in a real app.
 router.get('/thread/:leadId', async (req, res) => {
   try {
     const { leadId } = req.params;
 
     const [leadRes, logsRes] = await Promise.all([
-      pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId]),
+      pool.query(
+        `UPDATE hotel_leads SET inbox_last_read_at = NOW() WHERE id = $1 RETURNING *`,
+        [leadId]
+      ),
       pool.query(`
         SELECT ol.id, ol.lead_id, ol.campaign_id, ol.template_id,
                ol.message_type, ol.message_text,

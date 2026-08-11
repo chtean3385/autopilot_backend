@@ -8,7 +8,7 @@ const PlaybookService = require('../services/playbookService');
 const ReplyQualityService = require('../services/replyQualityService');
 const SchedulerStatusService = require('../services/schedulerStatusService');
 const { notifyAdmin } = require('../services/adminNotifyService');
-const { getOrCreateResearch } = require('../services/leadResearchService');
+const { getCachedResearch, RESEARCH_MAX_ATTEMPTS } = require('../services/leadResearchService');
 const { trackedCompletion } = require('../utils/aiUsage');
 const { renderEmailBody } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
@@ -78,7 +78,17 @@ function selectAngleForStep(emailAngles, stepNumber) {
   return { angle, others: emailAngles.filter((a) => a !== angle) };
 }
 
-function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback) {
+// Subjects the model tends to regress to when it isn't leaning on real lead-specific detail —
+// named explicitly as negative examples rather than just telling it to "be specific" in the
+// abstract, since that alone kept producing exactly these.
+const GENERIC_SUBJECT_EXAMPLES = [
+  'Enhance Your Business Management with Our Software Solutions',
+  'Unlock Efficiency for Your Business',
+  'Streamline Your Business Operations',
+  'Transform Your Business Management',
+];
+
+function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead) {
   const portfolioText = portfolioItems.length
     ? `\n\nSome of our recent work you can reference if it fits naturally:\n` +
       portfolioItems.map(p => `- ${p.title}${p.url ? ` (${p.url})` : ''}${p.description ? `: ${p.description}` : ''}`).join('\n')
@@ -92,10 +102,19 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
   const products = Array.isArray(research?.business?.products) ? research.business.products : [];
   const markets = Array.isArray(research?.business?.markets) ? research.business.markets : [];
   const { angle: angleForStep, others: otherAngles } = selectAngleForStep(emailAngles, stepNumber);
+  const hasRealResearch = painPoints.length > 0 || recommendedServices.length > 0 || emailAngles.length > 0;
+  const industry = (lead?.business_category || '').trim();
 
-  const researchText = (painPoints.length || recommendedServices.length || emailAngles.length)
-    ? `\n\nWebsite research on THIS SPECIFIC lead (scraped from their own site — use this to make the ` +
-      `email genuinely specific instead of generic; mention at least one real detail below):\n` +
+  // Three branches: real per-lead website research (best case) → CRM-only industry fallback
+  // (no website, or research permanently failed after RESEARCH_MAX_ATTEMPTS — sequenceEmailWorker's
+  // gate lets these through rather than blocking the lead forever) → bare minimum if neither
+  // exists. The middle branch is what used to be missing: a lead with no research previously fell
+  // straight through to a bare "sell a software demo" prompt with zero lead-specific grounding,
+  // which is exactly what produced the generic emails this whole rewrite is fixing.
+  const researchText = hasRealResearch
+    ? `\n\nWebsite research on THIS SPECIFIC lead (scraped from their own site — this is what makes ` +
+      `the email specific instead of generic; the subject line AND the body must each use at least ` +
+      `one real detail below):\n` +
       (painPoints.length ? `Pain points observed: ${painPoints.join('; ')}\n` : '') +
       (products.length ? `Products/services they offer: ${products.join('; ')}\n` : '') +
       (markets.length ? `Markets they serve: ${markets.join('; ')}\n` : '') +
@@ -103,16 +122,45 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
       (angleForStep ? `The specific angle to lead with in THIS email: ${angleForStep}\n` : '') +
       (otherAngles.length ? `Other angles reserved for other emails in this sequence — do NOT use these here: ${otherAngles.join('; ')}\n` : '') +
       `Every claim you make about their business must trace back to something in this research — never invent details beyond it.`
-    : '';
+    : industry
+      ? `\n\nNo website research is available for this lead (no site to crawl, or the crawl/analysis ` +
+        `permanently failed) — you must still make this email SPECIFIC TO THEIR INDUSTRY using only ` +
+        `this CRM fact: Industry/category: "${industry}"${lead?.city ? `, City: ${lead.city}` : ''}. ` +
+        `Reference something concretely true of how a "${industry}" business actually runs day to day ` +
+        `(what they juggle — bookings/orders, walk-ins, staff schedules, follow-ups, records — pick ` +
+        `whatever is genuinely plausible for THIS industry) so the email reads as written for them, not ` +
+        `as an industry-agnostic template. Do NOT claim to have looked at their website or found anything ` +
+        `on it — none was available, and inventing a website detail would be a fabrication.`
+      : `\n\nNo research or industry data is available for this lead — do not invent business details. ` +
+        `Keep the email short and ask a genuinely open question about how they currently handle ` +
+        `bookings, records, or customer follow-ups, instead of pitching a generic feature list.`;
 
   const priorEmailsText = buildPriorEmailsText(priorEmails);
 
+  const subjectRules = `\n\nSubject line rules: it must reference something concrete and specific to ` +
+    `this lead — their industry, their business name, or the angle/pain point above — never a ` +
+    `generic template. Never write a subject resembling any of these (too generic, could be sent ` +
+    `to any business): ${GENERIC_SUBJECT_EXAMPLES.map(s => `"${s}"`).join(', ')}. It must also differ ` +
+    `from every subject already sent, listed below if any.`;
+
   // Three tiers instead of a flat first/follow-up split — a step-4 nudge should read very
-  // differently from a step-1 nudge, both in length and in how much it still "pitches."
+  // differently from a step-1 nudge, both in length and in how much it still "pitches." Step 0
+  // is now an explicit 3-beat structure (intro → their specific situation → soft question) instead
+  // of a loose "introduce warmly then pitch" instruction, which is what let the model collapse
+  // straight into a feature-dump sales pitch with no actual introduction first.
   const stageNote = stepNumber === 0
-    ? 'This is the FIRST email in the sequence — introduce Dreams Technology briefly and warmly, and make the specific angle above the centerpiece of the email.'
+    ? `This is the FIRST email in the sequence. Write it in exactly this order — do not skip a beat ` +
+      `or jump straight to a pitch:\n` +
+      `1. One short, warm sentence introducing yourself and Dreams Technology by name. No selling yet.\n` +
+      `2. 1-2 sentences naming a SPECIFIC, concrete observation about THEIR business, using the ` +
+      `research/angle or industry detail below — this must read like you actually looked into them, ` +
+      `never like a form letter.\n` +
+      `3. Close with ONE soft, curiosity-driven question inviting a reply (e.g. "is that something ` +
+      `you've already got sorted, or still fairly manual?") — NOT "let me know if you'd like a free ` +
+      `demo." Do not pitch product features or list services in this email; the goal is a reply, not a ` +
+      `booked demo.`
     : stepNumber === 1
-      ? 'This is the FIRST FOLLOW-UP — a brief, low-pressure nudge. Acknowledge you reached out before without repeating what you said last time; lead with the new angle above instead of restating the original pitch.'
+      ? 'This is the FIRST FOLLOW-UP — a brief, low-pressure nudge. Acknowledge you reached out before without repeating what you said last time; lead with the new angle/industry detail above instead of restating the original message. Still no hard pitch — end with an easy, low-effort question.'
       : 'This is a LATER FOLLOW-UP — keep it very short (2-4 sentences), low-key, "just circling back" energy. Assume they are busy; give one simple, easy next step rather than re-pitching.';
 
   const feedbackNote = feedback
@@ -124,26 +172,12 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
 ${stageNote}
 
 Goals:
-- Get the owner interested in a free demo of our business management software (billing, records, customer management).
+- Earn a reply — the goal of this email is to start a conversation, not to close a demo booking in message 1.
 - Keep it SHORT (3-6 sentences for the first email or first follow-up; 2-4 sentences for later follow-ups), professional, warm, no hype or spammy language.
 - Never mention you are an AI.
-- Do not fabricate facts about the recipient's business beyond what's given below.${portfolioText}${playbookText}${notesText}${researchText}${priorEmailsText}${feedbackNote}
+- Do not fabricate facts about the recipient's business beyond what's given below.${portfolioText}${playbookText}${notesText}${researchText}${priorEmailsText}${subjectRules}${feedbackNote}
 
-Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between paragraphs (no HTML, no signature, no unsubscribe line — those are appended separately). The subject line must be different from any subject listed above.`;
-}
-
-// Cached per-lead (lead_research table, shared getOrCreateResearch in leadResearchService.js)
-// so the site is only crawled + GPT-analyzed once per version, not once per email in the
-// sequence. Returns null (silently) if there's no website to crawl or the crawl/GPT step
-// fails — callers fall back to the generic prompt in that case.
-async function fetchResearchForLead(lead) {
-  try {
-    const { research } = await getOrCreateResearch(lead);
-    return research;
-  } catch (err) {
-    console.error(`[SequenceEmail] Research failed for lead ${lead.lead_id}:`, err.message);
-    return null;
-  }
+Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between paragraphs (no HTML, no signature, no unsubscribe line — those are appended separately).`;
 }
 
 async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails = [], feedback = null) {
@@ -154,7 +188,7 @@ async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, r
     max_tokens: 400,
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback) },
+      { role: 'system', content: buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead) },
       { role: 'user', content: leadContext },
     ],
   }, { purpose: 'sequence_email_compose', leadId: lead.lead_id ?? lead.id ?? null });
@@ -209,6 +243,18 @@ async function processRow(row, sequenceCapTracker) {
     return 'stopped';
   }
 
+  // Research gate: a lead with a website must have completed research before ANY email goes out
+  // — workers/researchWorker.js front-loads that crawl on its own 5-min cron, well ahead of send
+  // time, so this just reads whatever's cached rather than triggering a crawl inline. A lead with
+  // no website at all, or whose research permanently failed after RESEARCH_MAX_ATTEMPTS, falls
+  // through and composes from the CRM-only industry fallback in buildSystemPrompt instead of
+  // waiting forever on a crawl that can never succeed.
+  const research = row.website ? await getCachedResearch(leadId) : null;
+  if (row.website && !research && (row.research_attempts || 0) < RESEARCH_MAX_ATTEMPTS) {
+    console.log(`[SequenceEmail] Lead ${leadId} has a website but research isn't ready yet — waiting for researchWorker`);
+    return 'awaiting_research';
+  }
+
   const remainingCap = sequenceCapTracker.get(sequenceId);
   if (remainingCap !== undefined && remainingCap <= 0) {
     console.log(`[SequenceEmail] Sequence ${sequenceId} hit its daily_send_limit — skipping lead ${leadId} for now`);
@@ -221,10 +267,9 @@ async function processRow(row, sequenceCapTracker) {
     return 'no_sender';
   }
 
-  const [portfolioItems, playbookContext, research, priorEmails] = await Promise.all([
+  const [portfolioItems, playbookContext, priorEmails] = await Promise.all([
     fetchPortfolioItems(),
     PlaybookService.getPlaybookContext(),
-    fetchResearchForLead(row),
     fetchPriorSentEmails(leadId),
   ]);
   const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(row.lead_email)}`;
@@ -359,14 +404,14 @@ async function runSequenceWorker(trigger = 'cron') {
 
   isRunning = true;
 
-  const stats = { due: 0, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, deferred: 0, failed: 0 };
+  const stats = { due: 0, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, awaitingResearch: 0, deferred: 0, failed: 0 };
 
   try {
     await SequenceService.resetStaleCounters();
 
     const dueResult = await pool.query(
       `SELECT ls.*, hl.email AS lead_email, hl.hotel_name, hl.owner_name, hl.city,
-              hl.business_category, hl.website, hl.email_status,
+              hl.business_category, hl.website, hl.email_status, hl.research_attempts,
               s.initial_gaps, s.recurring_interval_days, s.daily_send_limit, s.sent_today
        FROM lead_sequences ls
        JOIN hotel_leads hl ON hl.id = ls.lead_id
@@ -395,6 +440,7 @@ async function runSequenceWorker(trigger = 'cron') {
         else if (outcome === 'stopped') stats.stopped++;
         else if (outcome === 'capacity_skip') stats.capacitySkip++;
         else if (outcome === 'no_sender') stats.noSender++;
+        else if (outcome === 'awaiting_research') stats.awaitingResearch++;
         else if (outcome === 'deferred') stats.deferred++;
         else if (outcome === 'failed') stats.failed++;
         await new Promise(resolve => setTimeout(resolve, SEND_DELAY_MS));
@@ -419,6 +465,7 @@ async function runSequenceWorker(trigger = 'cron') {
       (stats.stopped ? `🛑 Sequence stopped (bounced/no email/suppressed): ${stats.stopped}\n` : '') +
       (stats.capacitySkip ? `⏳ Skipped — daily cap reached: ${stats.capacitySkip}\n` : '') +
       (stats.noSender ? `⚠️ Skipped — no sender capacity: ${stats.noSender}\n` : '') +
+      (stats.awaitingResearch ? `🔬 Waiting on website research: ${stats.awaitingResearch}\n` : '') +
       (stats.failed ? `⚠️ Send failures: ${stats.failed}\n` : '') +
       (stats.error ? `❌ Error: ${stats.error}\n` : '')
     );
@@ -438,7 +485,7 @@ async function runSequenceForLead(leadId) {
   try {
     const result = await pool.query(
       `SELECT ls.*, hl.email AS lead_email, hl.hotel_name, hl.owner_name, hl.city,
-              hl.business_category, hl.website, hl.email_status,
+              hl.business_category, hl.website, hl.email_status, hl.research_attempts,
               s.initial_gaps, s.recurring_interval_days, s.daily_send_limit, s.sent_today
        FROM lead_sequences ls
        JOIN hotel_leads hl ON hl.id = ls.lead_id
@@ -453,13 +500,16 @@ async function runSequenceForLead(leadId) {
     }
     const row = result.rows[0];
     const stepBefore = row.current_step;
-    // Empty cap tracker → processRow never sees a sequence-cap entry, so the daily cap is bypassed
+    // Empty cap tracker → processRow never sees a sequence-cap entry, so the daily cap is bypassed.
+    // The research gate still applies here — a manual "Run Now" bypasses timing, not the
+    // requirement that a lead with a website be researched before it gets emailed.
     const outcome = await processRow(row, new Map());
 
-    const stats = { due: 1, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, deferred: 0, failed: 0, leadId };
+    const stats = { due: 1, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, awaitingResearch: 0, deferred: 0, failed: 0, leadId };
     if (outcome === 'sent') stats.sent = 1;
     else if (outcome === 'stopped') stats.stopped = 1;
     else if (outcome === 'no_sender') stats.noSender = 1;
+    else if (outcome === 'awaiting_research') stats.awaitingResearch = 1;
     else if (outcome === 'deferred') stats.deferred = 1;
     else if (outcome === 'failed') stats.failed = 1;
     await SchedulerStatusService.recordRun('email_sequences', 'manual_lead', stats);
@@ -468,6 +518,7 @@ async function runSequenceForLead(leadId) {
       sent: `Step ${stepBefore + 1} sent to ${row.lead_email}.`,
       stopped: 'Sequence was stopped — the lead is bounced, suppressed, or has no email.',
       no_sender: 'No sender capacity right now (daily caps / warmup ramp) — try later or raise the sender cap.',
+      awaiting_research: 'This lead has a website but hasn\'t been researched yet — workers/researchWorker.js checks every 5 minutes, or click "Research Now" on the lead to run it immediately.',
       deferred: 'Email composition failed — it will retry automatically in 1 hour.',
       failed: 'Send failed — check the email logs for the provider error.',
     };

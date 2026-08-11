@@ -29,6 +29,11 @@ const RESEARCH_MODEL_FALLBACK = 'gpt-4o';
 // column NULL/defaulted) predate confidence_breakdown and the richer business fields.
 const RESEARCH_SCHEMA_VERSION = 2;
 
+// How many times workers/researchWorker.js retries a lead whose crawl/GPT step keeps failing
+// before giving up. Once a lead hits this cap, sequenceEmailWorker.js's research gate lets it
+// through on the industry-only fallback prompt instead of blocking that lead's sequence forever.
+const RESEARCH_MAX_ATTEMPTS = 3;
+
 const MAX_PAGE_TEXT = 2000; // lower than the old single-purpose crawler's 3000 — we now fetch ~12 pages, not ~5
 const FETCH_CONCURRENCY = 3;
 
@@ -645,4 +650,12 @@ async function getOrCreateResearch(lead, { force = false } = {}) {
   return { research, wasCached: false };
 }
 
-module.exports = { researchCompany, getOrCreateResearch, saveResearch };
+// Read-only cache lookup — never crawls. Used by sequenceEmailWorker.js's research gate, which
+// must not trigger a crawl inline anymore (that's workers/researchWorker.js's job, run ahead of
+// send time); this just answers "is research ready yet?".
+async function getCachedResearch(leadId) {
+  const result = await pool.query('SELECT * FROM lead_research WHERE lead_id = $1', [leadId]);
+  return result.rows[0] || null;
+}
+
+module.exports = { researchCompany, getOrCreateResearch, saveResearch, getCachedResearch, RESEARCH_MAX_ATTEMPTS };
