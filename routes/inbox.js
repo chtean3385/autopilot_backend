@@ -38,6 +38,7 @@ router.get('/', async (req, res) => {
         lr.qualified_for_demo, lr.lead_status_after,
         hl.hotel_name, hl.owner_name, hl.whatsapp_number, hl.city,
         hl.status AS lead_status, hl.archived_at,
+        hl.needs_attention, hl.needs_attention_reason,
         c.campaign_name, t.template_name,
         GREATEST(lr.response_received_at, lo.last_sent_at) AS last_activity_at,
         COALESCE(u.unread_count, 0)::int AS unread_count
@@ -178,6 +179,23 @@ router.put('/:leadId/archive', async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Lead not found' });
     res.json({ success: true, archived_at: result.rows[0].archived_at });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/inbox/:leadId/attention — manually flag/clear the "Needs Attention" state.
+// Clearing it ("Resume AI") lets the sales agent auto-reply to this lead again.
+router.put('/:leadId/attention', async (req, res) => {
+  const { needs_attention, reason } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE hotel_leads SET needs_attention = $1, needs_attention_reason = $2, updated_at = NOW()
+       WHERE id = $3 RETURNING id, needs_attention, needs_attention_reason`,
+      [!!needs_attention, needs_attention ? (reason || 'Manually flagged') : null, req.params.leadId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Lead not found' });
+    res.json({ success: true, ...result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

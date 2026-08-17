@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS hotel_leads (
     status VARCHAR(50) DEFAULT 'new', -- 'new', 'interested', 'demo_qualified', 'responded', 'no_response'
     archived_at TIMESTAMP, -- inbox conversation archived (hidden from main list); NULL = not archived
     inbox_last_read_at TIMESTAMP, -- WhatsApp Inbox: stamped when the admin opens the thread, drives the unread badge
+    needs_attention BOOLEAN DEFAULT FALSE, -- AI auto-reply paused for this lead; surfaced in the Inbox "Needs Attention" filter
+    needs_attention_reason TEXT, -- why (e.g. "Asked for a callback", "Asked for portfolio", "Qualified for demo")
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -439,6 +441,7 @@ CREATE TABLE IF NOT EXISTS scheduler_status (
 CREATE INDEX IF NOT EXISTS idx_leads_city ON hotel_leads(city);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON hotel_leads(status);
 CREATE INDEX IF NOT EXISTS idx_leads_channel ON hotel_leads(channel);
+CREATE INDEX IF NOT EXISTS idx_leads_needs_attention ON hotel_leads(needs_attention) WHERE needs_attention = TRUE;
 CREATE INDEX IF NOT EXISTS idx_outreach_lead ON outreach_logs(lead_id);
 CREATE INDEX IF NOT EXISTS idx_outreach_campaign ON outreach_logs(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_outreach_sent_at ON outreach_logs(sent_at);

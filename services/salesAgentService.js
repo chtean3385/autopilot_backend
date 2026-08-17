@@ -225,14 +225,63 @@ async function logAgentAction(leadId, action, { detail, draftText, decision } = 
   }
 }
 
-async function notifyOwner(lead, lastMessage) {
+async function notifyOwner(lead, lastMessage, reason = 'New qualified lead') {
   let phone = await settingsService.getSetting('OWNER_WHATSAPP');
   if (!phone) return;
   phone = phone.replace(/\D/g, ''); if (phone.length === 10) phone = `91${phone}`;
-  await WABAService.sendTextMessage(phone, `New qualified lead: ${lead.hotel_name}\n${lead.owner_name || ''} ${lead.city || ''}\n\nLast message: ${lastMessage}`).catch(() => {});
+  await WABAService.sendTextMessage(phone, `${reason}: ${lead.hotel_name}\n${lead.owner_name || ''} ${lead.city || ''} · +${lead.whatsapp_number}\n\nLast message: ${lastMessage}`).catch(() => {});
+}
+
+async function markNeedsAttention(leadId, reason) {
+  await pool.query(
+    `UPDATE hotel_leads SET needs_attention = TRUE, needs_attention_reason = $1, updated_at = NOW() WHERE id = $2`,
+    [reason, leadId]
+  );
+}
+
+// Requests the bot has no business improvising an answer to — a callback or a portfolio are
+// things only a human can actually deliver on WhatsApp (no calendar/booking action, no
+// document-send capability here). Matched deterministically so this doesn't depend on the
+// per-agent GPT intent rules being configured at all. Checked BEFORE the GPT reply draft so
+// these leads never get another generic pitch instead of an answer to what they actually asked.
+const CALLBACK_RE = /\bcall\s*(me|him|her|us|back)\b|\bcallback\b|\bplease\s*call\b|\bgive.*\bcall\b|\bcall\s*on\b/i;
+const PORTFOLIO_RE = /\bportfolio\b|\bpast\s*work\b|\bprevious\s*work\b|\bcase\s*stud(y|ies)\b|\bsample\s*work\b|\bwork\s*samples?\b|\bexamples?\s*of\s*(your\s*)?work\b/i;
+
+function detectHandoffReason(message) {
+  if (CALLBACK_RE.test(message)) return 'Asked for a callback';
+  if (PORTFOLIO_RE.test(message)) return 'Asked for portfolio';
+  return null;
 }
 
 async function handleReply(lead, incomingText) {
+  // Already flagged (callback/portfolio/qualified) — a human took this over, the bot stays
+  // silent until they clear it from the Inbox "Needs Attention" tab. Re-checked fresh from the
+  // DB rather than trusting the passed-in `lead` (webhook.js fetches it once per inbound message,
+  // which can be stale if a flag was set moments earlier in the same burst).
+  const fresh = await pool.query('SELECT needs_attention FROM hotel_leads WHERE id = $1', [lead.id]);
+  if (fresh.rows[0]?.needs_attention) {
+    await logAgentAction(lead.id, 'whatsapp_skipped_needs_attention', { detail: { message: incomingText }, decision: 'skipped' });
+    return { skipped: true, reason: 'needs_attention' };
+  }
+
+  // Deterministic handoff — bypasses the GPT pitch entirely for these, so the lead gets an
+  // honest holding reply instead of another "could you connect me with the owner" loop.
+  const handoffReason = detectHandoffReason(incomingText);
+  if (handoffReason) {
+    await markNeedsAttention(lead.id, handoffReason);
+    const holdingReply = handoffReason === 'Asked for a callback'
+      ? "Thanks! I'll pass this to our team and someone will call you shortly."
+      : "Thanks for asking! I'll have our team send that over to you directly.";
+    const sent = await WABAService.sendTextMessage(lead.whatsapp_number, holdingReply);
+    if (sent.success) {
+      await pool.query(`INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
+        SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, holdingReply]);
+    }
+    await logAgentAction(lead.id, 'whatsapp_needs_attention', { detail: { reason: handoffReason, message: incomingText }, draftText: holdingReply, decision: 'handoff' });
+    await notifyOwner(lead, incomingText, handoffReason);
+    return { skipped: false, handoff: true, reason: handoffReason };
+  }
+
   const { agent, campaign } = await resolveAgent(lead.id);
   if (!agent) {
     // Don't leave the lead sitting at 'new'/'responded' — runFollowUps() treats those as
@@ -263,8 +312,9 @@ async function handleReply(lead, incomingText) {
   await logAgentAction(lead.id, 'whatsapp_reply_sent', { detail: { intent, stage: stage?.stage_key || null }, draftText: result.reply, decision: result.status.toLowerCase() });
   if (result.status === 'QUALIFIED') {
     await pool.query(`UPDATE hotel_leads SET status='demo_qualified', updated_at=NOW() WHERE id=$1`, [lead.id]);
+    await markNeedsAttention(lead.id, 'Qualified for demo');
     await logAgentAction(lead.id, 'whatsapp_demo_qualified', { decision: 'qualified' });
-    await notifyOwner(lead, incomingText);
+    await notifyOwner(lead, incomingText, 'Qualified for demo');
   }
   if (result.status === 'NOT_INTERESTED') {
     await pool.query(`UPDATE hotel_leads SET status='not_interested', updated_at=NOW() WHERE id=$1`, [lead.id]);

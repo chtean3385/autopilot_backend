@@ -42,6 +42,9 @@ async function initDB() {
     ALTER TABLE outreach_logs ADD COLUMN IF NOT EXISTS message_text TEXT;
     ALTER TABLE outreach_logs ADD COLUMN IF NOT EXISTS is_auto_reply BOOLEAN DEFAULT FALSE;
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS needs_attention BOOLEAN DEFAULT FALSE;
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS needs_attention_reason TEXT;
+    CREATE INDEX IF NOT EXISTS idx_leads_needs_attention ON hotel_leads(needs_attention) WHERE needs_attention = TRUE;
     CREATE TABLE IF NOT EXISTS lead_groups (
       id SERIAL PRIMARY KEY,
       name VARCHAR(255) NOT NULL UNIQUE,
@@ -517,7 +520,11 @@ app.get('/health', (req, res) => {
 });
 
 // Start background workers
-require('./workers/campaignWorker');
+// campaignWorker.js is disabled: leftover from the initial commit, superseded by
+// schedulerService.js's sendTask() (proper group-scoping, industry-matched template,
+// race-condition lock, terminal campaign status). The old worker had none of that — an
+// unbounded every-5-min loop querying "any untouched lead in this city" with a hardcoded
+// template and no status exit — root cause of the mass-send incident on 2026-08-17.
 require('./workers/researchWorker');
 require('./workers/sequenceEmailWorker');
 require('./workers/emailReplyWorker');
