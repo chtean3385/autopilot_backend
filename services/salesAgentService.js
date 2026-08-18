@@ -246,10 +246,15 @@ async function markNeedsAttention(leadId, reason) {
 // these leads never get another generic pitch instead of an answer to what they actually asked.
 const CALLBACK_RE = /\bcall\s*(me|him|her|us|back)\b|\bcallback\b|\bplease\s*call\b|\bgive.*\bcall\b|\bcall\s*on\b/i;
 const PORTFOLIO_RE = /\bportfolio\b|\bpast\s*work\b|\bprevious\s*work\b|\bcase\s*stud(y|ies)\b|\bsample\s*work\b|\bwork\s*samples?\b|\bexamples?\s*of\s*(your\s*)?work\b/i;
+// Several live WABA templates end with a keyword CTA ("Reply INFO to receive our portfolio").
+// A lead replying with just that keyword is asking for the portfolio just as much as someone
+// typing the word "portfolio" — matched as a near-exact reply so it doesn't fire on "info"
+// appearing inside an unrelated sentence.
+const INFO_KEYWORD_RE = /^\s*info\s*[.!]?\s*$/i;
 
 function detectHandoffReason(message) {
   if (CALLBACK_RE.test(message)) return 'Asked for a callback';
-  if (PORTFOLIO_RE.test(message)) return 'Asked for portfolio';
+  if (PORTFOLIO_RE.test(message) || INFO_KEYWORD_RE.test(message)) return 'Asked for portfolio';
   return null;
 }
 
