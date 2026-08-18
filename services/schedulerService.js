@@ -1003,18 +1003,23 @@ async function runFollowUps(trigger = 'cron') {
     // - nothing sent to them in the last 2 days
     // Cap counts template sends only — agent conversation replies don't count.
     const result = await pool.query(`
-      SELECT hl.*,
-             COUNT(ol.id) FILTER (WHERE ol.message_type = 'template')::int AS template_count,
-             MAX(ol.sent_at)        AS last_outreach,
-             (SELECT campaign_id FROM outreach_logs ol2
-              WHERE ol2.lead_id = hl.id AND ol2.campaign_id IS NOT NULL
-              ORDER BY ol2.sent_at DESC LIMIT 1)                            AS last_campaign_id
-      FROM hotel_leads hl
-      INNER JOIN outreach_logs ol ON ol.lead_id = hl.id
-      WHERE hl.status IN ('new', 'responded')
-        AND hl.whatsapp_number IS NOT NULL
-      GROUP BY hl.id
-      HAVING MAX(ol.sent_at) <= NOW() - INTERVAL '2 days'
+      WITH due AS (
+        SELECT hl.*,
+               COUNT(ol.id) FILTER (WHERE ol.message_type = 'template')::int AS template_count,
+               MAX(ol.sent_at)        AS last_outreach,
+               (SELECT campaign_id FROM outreach_logs ol2
+                WHERE ol2.lead_id = hl.id AND ol2.campaign_id IS NOT NULL
+                ORDER BY ol2.sent_at DESC LIMIT 1)                            AS last_campaign_id
+        FROM hotel_leads hl
+        INNER JOIN outreach_logs ol ON ol.lead_id = hl.id
+        WHERE hl.status IN ('new', 'responded')
+          AND hl.whatsapp_number IS NOT NULL
+        GROUP BY hl.id
+        HAVING MAX(ol.sent_at) <= NOW() - INTERVAL '2 days'
+      )
+      SELECT due.*, c.template_id AS last_campaign_template_id
+      FROM due
+      LEFT JOIN campaigns c ON c.id = due.last_campaign_id
     `);
 
     stats.due = result.rows.length;
@@ -1038,7 +1043,12 @@ async function runFollowUps(trigger = 'cron') {
       // Per-lead, not hoisted above the loop — different leads in the same batch can be
       // different industries, and reusing one template for all of them regardless of
       // business_category is exactly how a logistics lead gets hotel-worded copy.
-      const template = await getApprovedTemplate(null, lead.business_category);
+      // Prefer whichever campaign's template actually contacted this lead last — passing null
+      // here (the old behavior) ignored that entirely and re-resolved by industry from scratch,
+      // which silently fell through to whatever untagged template was most recently approved
+      // whenever no template's industry exactly matched business_category. That's how editing a
+      // campaign's template in the UI had zero effect on that campaign's own follow-up sends.
+      const template = await getApprovedTemplate(lead.last_campaign_template_id, lead.business_category);
       if (!template) {
         stats.noTemplate++;
         console.warn(`[FollowUp] No approved template for lead ${lead.id} (industry: ${lead.business_category || 'generic'}) — skipping`);
