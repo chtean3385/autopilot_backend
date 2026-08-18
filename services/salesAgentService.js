@@ -28,7 +28,22 @@ async function resolveAgent(leadId) {
   const context = await findCampaignContext(leadId);
   if (context?.agent_id) {
     const result = await pool.query(`SELECT * FROM sales_agents WHERE id = $1 AND active = TRUE AND channel = 'whatsapp'`, [context.agent_id]);
-    if (result.rows[0]) return { agent: result.rows[0], campaign: context };
+    const candidate = result.rows[0];
+    if (candidate) {
+      // Trust the campaign's assigned agent only if its industry (when it has one set) actually
+      // fits this lead. Previously this returned unconditionally — a campaign wired to the wrong
+      // agent (e.g. a hotel campaign attached to a generic "Website Growth Consultant" agent)
+      // would keep pitching the wrong business on every reply forever, since nothing ever
+      // re-checked it. A generic agent (industry NULL/'all') always fits; a specific one only
+      // fits if it substring-matches the lead's own business_category. Mismatches fall through
+      // to the industry-matched fallback below instead of being trusted blindly.
+      const leadRow = await pool.query(`SELECT business_category FROM hotel_leads WHERE id = $1`, [leadId]);
+      const businessCategory = leadRow.rows[0]?.business_category || '';
+      const fits = !candidate.industry || candidate.industry.toLowerCase() === 'all'
+        || businessCategory.toLowerCase().includes(candidate.industry.toLowerCase());
+      if (fits) return { agent: candidate, campaign: context };
+      console.warn(`[SalesAgent] Lead ${leadId} campaign agent "${candidate.name}" (industry: ${candidate.industry}) doesn't fit business_category "${businessCategory}" — falling back to industry match`);
+    }
   }
   // No usable campaign lineage (no agent_id attached — including campaigns from before
   // sales_agents existed, which used to spin up a throwaway one-off agent here; we only ever
@@ -297,6 +312,7 @@ async function handleReply(lead, incomingText) {
       `UPDATE hotel_leads SET status='needs_review', updated_at=NOW() WHERE id=$1 AND status IN ('new', 'responded')`,
       [lead.id]
     );
+    await markNeedsAttention(lead.id, 'No matching sales agent — needs manual review');
     throw new Error('No sales agent is assigned to this campaign. Create an agent and assign it before enabling replies.');
   }
   const memory = await getMemory(lead.id, agent.id);
