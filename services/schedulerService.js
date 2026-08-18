@@ -697,14 +697,21 @@ async function getApprovedTemplate(templateId, businessCategory = null) {
     if (t.rows[0]) return t.rows[0];
   }
   // Prefer a template built for this lead's industry; fall back to a generic one
-  // (industry NULL/'all'). Same match pattern as resolveAgent() in salesAgentService.js —
-  // grabbing "whatever was approved most recently" regardless of industry is how a
-  // logistics lead ends up getting hotel-worded copy.
+  // (industry NULL/'all'). `industry` is stored as a regex-alternation pattern (e.g.
+  // 'hotel|resort|farmhouse'), matched against business_category with ~* — an exact-string
+  // match (the old IS NOT DISTINCT FROM) never fires against messy free text like "hotels or
+  // resorts" or "tour and travel business", so in practice every template with a real
+  // industry-specific pitch was landing in the "generic" bucket and losing every fallback to
+  // whichever template happened to be approved most recently — confirmed live: 3,470+ sends
+  // (visa_constuatnt + first_message) went to leads outside their intended industry this way.
   const t = await pool.query(
     `SELECT * FROM waba_templates
      WHERE status='approved'
-       AND (industry IS NOT DISTINCT FROM $1 OR industry IS NULL OR LOWER(industry) = 'all')
-     ORDER BY (industry IS NOT DISTINCT FROM $1) DESC, created_at DESC
+       AND (industry IS NULL OR LOWER(industry) = 'all'
+            OR ($1 IS NOT NULL AND $1 <> '' AND $1 ~* industry))
+     ORDER BY (industry IS NOT NULL AND LOWER(industry) <> 'all'
+               AND $1 IS NOT NULL AND $1 ~* industry) DESC,
+              created_at DESC
      LIMIT 1`,
     [businessCategory]
   );
