@@ -2,6 +2,7 @@ const express = require('express');
 const pool = require('../config/db');
 const EmailSenderService = require('../services/emailSenderService');
 const SuppressionService = require('../services/suppressionService');
+const WABAService = require('../services/wabaService');
 const { logAgentAction } = require('../services/replyDeliveryService');
 const PlaybookService = require('../services/playbookService');
 const { escapeHtml, unsubscribeFooterHtml, renderEmailBody } = require('../utils/emailRender');
@@ -13,7 +14,7 @@ const router = express.Router();
 
 async function getApproval(approvalId) {
   const result = await pool.query(
-    `SELECT pa.*, hl.hotel_name, hl.email AS lead_email, hl.city
+    `SELECT pa.*, hl.hotel_name, hl.email AS lead_email, hl.city, hl.whatsapp_number
      FROM pending_approvals pa
      JOIN hotel_leads hl ON hl.id = pa.lead_id
      WHERE pa.id = $1`,
@@ -97,7 +98,7 @@ function buildEstimateText(lead, lineItems, total, notes) {
 router.get('/pending', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT pa.*, hl.hotel_name, hl.email AS lead_email, hl.city,
+      `SELECT pa.*, hl.hotel_name, hl.email AS lead_email, hl.city, hl.whatsapp_number,
               e.id AS estimate_id, e.line_items, e.total, e.status AS estimate_status
        FROM pending_approvals pa
        JOIN hotel_leads hl ON hl.id = pa.lead_id
@@ -156,6 +157,27 @@ router.post('/:approvalId/approve', async (req, res) => {
     const approval = await getApproval(req.params.approvalId);
     if (!approval) return res.status(404).json({ success: false, error: 'Approval not found' });
     if (approval.status !== 'pending') return res.status(400).json({ success: false, error: `Already ${approval.status}` });
+
+    // WhatsApp drafts have no email sender/thread/tracking to resolve — handled and returned
+    // early, before the email-only lookups below (which would otherwise 400 on a WhatsApp lead
+    // that has no active email sender at all).
+    if (approval.type === 'whatsapp_low_score_reply') {
+      const payload = typeof approval.payload === 'string' ? JSON.parse(approval.payload || '{}') : (approval.payload || {});
+      const draftText = req.body.draft_text || payload.draftText;
+      if (!draftText) return res.status(400).json({ success: false, error: 'No draft text to send' });
+      if (!approval.whatsapp_number) return res.status(400).json({ success: false, error: 'Lead has no WhatsApp number' });
+      if (req.body.draft_text && req.body.draft_text !== payload.draftText) {
+        await PlaybookService.captureCorrection({ leadId: approval.lead_id, before: payload.draftText, after: draftText });
+      }
+      const sendResult = await WABAService.sendTextMessage(approval.whatsapp_number, draftText);
+      if (!sendResult.success) return res.status(502).json({ success: false, error: sendResult.error });
+
+      await pool.query(`INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
+        SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [approval.lead_id, sendResult.messageId, draftText]);
+      await pool.query(`UPDATE pending_approvals SET status = 'approved', decided_at = NOW() WHERE id = $1`, [approval.id]);
+      await logAgentAction(approval.lead_id, 'whatsapp_draft_sent', { draftText, decision: 'send' });
+      return res.json({ success: true });
+    }
 
     const sender = await EmailSenderService.getSenderForLead(approval.lead_id);
     if (!sender) return res.status(400).json({ success: false, error: 'No active email sender available to send from' });
@@ -247,7 +269,7 @@ router.post('/:approvalId/reject', async (req, res) => {
     if (approval.type === 'estimate') {
       const leadSeq = await getLeadSequence(approval.lead_id);
       await resumeLeadSequence(leadSeq, { forceRecurring: true });
-    } else if (approval.type === 'low_score_reply') {
+    } else if (approval.type === 'low_score_reply' || approval.type === 'whatsapp_low_score_reply') {
       const payload = typeof approval.payload === 'string' ? JSON.parse(approval.payload || '{}') : (approval.payload || {});
       await PlaybookService.captureCorrection({ leadId: approval.lead_id, before: payload.draftText, after: null });
     }

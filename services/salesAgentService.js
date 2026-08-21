@@ -3,6 +3,7 @@ const pool = require('../config/db');
 const WABAService = require('./wabaService');
 const settingsService = require('./settingsService');
 const { trackedCompletion } = require('../utils/aiUsage');
+const ReplyQualityService = require('./replyQualityService');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const DEFAULT_INTENT = 'UNKNOWN';
@@ -124,22 +125,45 @@ async function getKnowledge(agentId, stageKey, intent) {
   return result.rows;
 }
 
-function buildContext({ lead, campaign, memory, intent, stage, knowledge }) {
+// Feeds draftAndScore's `extraContext` slot (buildLeadContext() from replyQualityService.js
+// already covers Business/Owner/City/Category/Website, so this only adds what's WhatsApp/CRM
+// specific: campaign, funnel stage, structured memory, and configured knowledge).
+function buildContext({ lead, campaign, memory, intent, stage, knowledge, handoffReason }) {
   const knowledgeText = knowledge.map(k => `- ${k.title}: ${k.content}`).join('\n') || 'No product knowledge is configured for this situation.';
-  return `Campaign: ${campaign?.campaign_name || 'Unassigned'}\nIndustry: ${campaign?.business_type || lead.business_category || 'Unknown'}\nLead: ${lead.hotel_name || 'Unknown'}\nContact: ${lead.owner_name || 'Unknown'}\nSource: ${lead.source || 'Unknown'}\nDetected intent: ${intent}\nCurrent stage: ${stage?.stage_name || memory.current_stage || 'Unqualified'}\nCurrent objective: ${stage?.objective || memory.next_objective || 'Understand the lead and progress the sale'}\nPrevious structured summary: ${memory.summary || 'None'}\nKnown decision maker: ${memory.decision_maker || 'Unknown'}\nPain points: ${(memory.pain_points || []).join('; ') || 'Unknown'}\nObjections: ${(memory.objections || []).join('; ') || 'None'}\nBudget: ${memory.budget || 'Unknown'}\nTimeline: ${memory.timeline || 'Unknown'}\nRelevant knowledge:\n${knowledgeText}`;
+  // Replaces the old hardcoded canned-sentence handoff: the lead still gets a real, specific
+  // acknowledgment of what they asked for, drafted (and quality-scored) like any other reply,
+  // instead of one of two fixed strings — a human still has to actually place the callback or
+  // send the portfolio, which markNeedsAttention() below still flags for.
+  const handoffNote = handoffReason
+    ? `\n\nIMPORTANT: this message was detected as: ${handoffReason}. Acknowledge specifically what they asked for, and let them know a team member will personally follow up with it directly — you cannot place a call or send a document yourself, so do not attempt to fulfill it, only acknowledge and reassure.`
+    : '';
+  return `Campaign: ${campaign?.campaign_name || 'Unassigned'}\nIndustry: ${campaign?.business_type || lead.business_category || 'Unknown'}\nDetected intent: ${intent}\nCurrent stage: ${stage?.stage_name || memory.current_stage || 'Unqualified'}\nCurrent objective: ${stage?.objective || memory.next_objective || 'Understand the lead and progress the sale'}\nPrevious structured summary: ${memory.summary || 'None'}\nKnown decision maker: ${memory.decision_maker || 'Unknown'}\nPain points: ${(memory.pain_points || []).join('; ') || 'Unknown'}\nObjections: ${(memory.objections || []).join('; ') || 'None'}\nBudget: ${memory.budget || 'Unknown'}\nTimeline: ${memory.timeline || 'Unknown'}\nRelevant knowledge:\n${knowledgeText}${handoffNote}`;
 }
 
-function agentInstructions(agent) {
-  return [
-    agent.system_prompt,
-    agent.sales_strategy,
-    agent.qualification_logic,
-    agent.demo_process,
-    agent.closing_strategy,
-    agent.product_knowledge && `Product knowledge:\n${agent.product_knowledge}`,
-    agent.objection_handling && `Objection handling:\n${agent.objection_handling}`,
-    agent.response_rules && `Response rules:\n${agent.response_rules}`,
-  ].filter(Boolean).join('\n\n');
+// Real conversation history instead of the compressed one-line memory summary — mirrors
+// emailReplyWorker.js's getConversationHistory() but reads outreach_logs. Each row pairs one
+// outbound send with the inbound reply that landed on it (webhook.js always attaches an inbound
+// message to the most recently sent row), so out-then-in per row, ordered by sent_at, reconstructs
+// the real back-and-forth. Template-type rows never get message_text populated (logOutreach() is
+// called without text at every call site), so those fall back to the template's own body_text —
+// not personalized, but enough for the model to see what was actually sent.
+const HISTORY_LIMIT = 20;
+async function getConversationHistory(leadId) {
+  const result = await pool.query(
+    `SELECT COALESCE(ol.message_text, wt.body_text) AS out_text, ol.response_text
+     FROM outreach_logs ol
+     LEFT JOIN waba_templates wt ON wt.id = ol.template_id
+     WHERE ol.lead_id = $1
+     ORDER BY ol.sent_at ASC
+     LIMIT $2`,
+    [leadId, HISTORY_LIMIT]
+  );
+  const turns = [];
+  for (const row of result.rows) {
+    if (row.out_text) turns.push({ direction: 'out', body: row.out_text });
+    if (row.response_text) turns.push({ direction: 'in', body: row.response_text });
+  }
+  return turns;
 }
 
 function normalizeIndianMobile(raw) {
@@ -148,26 +172,6 @@ function normalizeIndianMobile(raw) {
   if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
   else if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
   return /^[6-9]\d{9}$/.test(digits) ? '91' + digits : null;
-}
-
-async function draftReply({ agent, lead, campaign, memory, intent, stage, knowledge, message }) {
-  const response = await trackedCompletion(client, {
-    model: 'gpt-4o-mini', max_tokens: 380, response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: `${agentInstructions(agent)}\n\nYou are an experienced human B2B sales executive. Use only the supplied context and knowledge. Never mention AI. Keep the reply to 2-3 short sentences, ask at most one question, and move toward the current objective. Never answer a business's customer booking request; ask for the owner or operations manager instead.\n\nRedirect handling: if the contact tells you to reach someone else — a different phone number, another branch, or a head/main office — read carefully whether they gave you a phone number for that contact.\n- If they DID give a number for that other contact, set redirect_phone to it (digits, any format they used) and redirect_label to a short 2-4 word description of who it is (e.g. "Head Office", "Rajkot Branch", "Manager Direct"), and mention in your reply that you'll also reach out there.\n- If they mention another branch/head office/person but do NOT give a number, do not end the conversation — ask them for that contact's phone number in your reply, and leave redirect_phone/redirect_label null.\nOnly set redirect_phone when a real phone number is actually present in their message.\n\nReturn only JSON: {"reply":"...","status":"CONTINUE|WARM|COLD|QUALIFIED|NOT_INTERESTED","redirect_phone":"digits or null","redirect_label":"short label or null","memory":{"summary":"...","current_stage":"configured stage key or current key","lead_score":0-100,"pain_points":[],"interested_features":[],"decision_maker":"...","objections":[],"budget":"...","timeline":"...","next_objective":"..."}}` },
-      { role: 'user', content: `${buildContext({ lead, campaign, memory, intent, stage, knowledge })}\n\nLatest inbound message: ${message}` },
-    ],
-  }, { purpose: 'sales_agent_reply', leadId: lead.id });
-  const parsed = json(response.choices[0].message.content, {});
-  const reply = String(parsed.reply || '').trim().replace(/\s+/g, ' ');
-  if (!reply) throw new Error('Sales agent returned no reply');
-  return {
-    reply: reply.slice(0, 1000),
-    status: ['CONTINUE', 'WARM', 'COLD', 'QUALIFIED', 'NOT_INTERESTED'].includes(parsed.status) ? parsed.status : 'CONTINUE',
-    memory: parsed.memory || {},
-    redirectPhone: normalizeIndianMobile(parsed.redirect_phone),
-    redirectLabel: (parsed.redirect_label && String(parsed.redirect_label).trim().slice(0, 40)) || null,
-  };
 }
 
 // A redirect ("call our head office on 9876543210") means a second decision-maker exists at a
@@ -284,26 +288,30 @@ async function handleReply(lead, incomingText) {
     return { skipped: true, reason: 'needs_attention' };
   }
 
-  // Deterministic handoff — bypasses the GPT pitch entirely for these, so the lead gets an
-  // honest holding reply instead of another "could you connect me with the owner" loop.
+  // Deterministic signal, kept — cheap and instant — but no longer short-circuits to one of two
+  // fixed sentences (see buildContext()'s handoffNote). It's fed into the same
+  // draft->score->revise->escalate pipeline as every other reply so the acknowledgment is
+  // actually worded around what the lead asked for, not a canned line.
   const handoffReason = detectHandoffReason(incomingText);
-  if (handoffReason) {
-    await markNeedsAttention(lead.id, handoffReason);
-    const holdingReply = handoffReason === 'Asked for a callback'
-      ? "Thanks! I'll pass this to our team and someone will call you shortly."
-      : "Thanks for asking! I'll have our team send that over to you directly.";
-    const sent = await WABAService.sendTextMessage(lead.whatsapp_number, holdingReply);
-    if (sent.success) {
-      await pool.query(`INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
-        SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, holdingReply]);
-    }
-    await logAgentAction(lead.id, 'whatsapp_needs_attention', { detail: { reason: handoffReason, message: incomingText }, draftText: holdingReply, decision: 'handoff' });
-    await notifyOwner(lead, incomingText, handoffReason);
-    return { skipped: false, handoff: true, reason: handoffReason };
-  }
-
   const { agent, campaign } = await resolveAgent(lead.id);
+
   if (!agent) {
+    if (handoffReason) {
+      // No agent configured to draft an AI acknowledgment with — fall back to the old plain
+      // holding reply rather than going fully silent on a lead who explicitly asked for something.
+      await markNeedsAttention(lead.id, handoffReason);
+      const holdingReply = handoffReason === 'Asked for a callback'
+        ? "Thanks! I'll pass this to our team and someone will call you shortly."
+        : "Thanks for asking! I'll have our team send that over to you directly.";
+      const sent = await WABAService.sendTextMessage(lead.whatsapp_number, holdingReply);
+      if (sent.success) {
+        await pool.query(`INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
+          SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, holdingReply]);
+      }
+      await logAgentAction(lead.id, 'whatsapp_needs_attention', { detail: { reason: handoffReason, message: incomingText }, draftText: holdingReply, decision: 'handoff' });
+      await notifyOwner(lead, incomingText, handoffReason);
+      return { skipped: false, handoff: true, reason: handoffReason };
+    }
     // Don't leave the lead sitting at 'new'/'responded' — runFollowUps() treats those as
     // "still in play" and would keep re-sending the same (likely mismatched) template every
     // 2 days until the 6-touch cap, even though this reply already went unanswered. Surface
@@ -315,36 +323,70 @@ async function handleReply(lead, incomingText) {
     await markNeedsAttention(lead.id, 'No matching sales agent — needs manual review');
     throw new Error('No sales agent is assigned to this campaign. Create an agent and assign it before enabling replies.');
   }
+
   const memory = await getMemory(lead.id, agent.id);
-  const { intent } = await detectIntent({ agent, leadId: lead.id, message: incomingText, memory });
-  if (intent === 'STOP') {
+  const conversationHistory = await getConversationHistory(lead.id);
+
+  // Intent/stage/knowledge lookup is skipped for a handoff message — the reply is a scoped
+  // acknowledgment (buildContext()'s handoffNote), not a funnel-progressing pitch.
+  const { intent } = handoffReason
+    ? { intent: 'UNKNOWN' }
+    : await detectIntent({ agent, leadId: lead.id, message: incomingText, memory });
+  if (!handoffReason && intent === 'STOP') {
     await logAgentAction(lead.id, 'whatsapp_sequence_stopped', { detail: { reason: 'stop_intent' }, decision: 'stop' });
     return { skipped: true, reason: 'stop' };
   }
-  const stage = await getStage(agent.id, memory, intent);
-  const knowledge = await getKnowledge(agent.id, stage?.stage_key, intent);
-  const result = await draftReply({ agent, lead, campaign, memory, intent, stage, knowledge, message: incomingText });
-  const sent = await WABAService.sendTextMessage(lead.whatsapp_number, result.reply);
+  const stage = handoffReason ? null : await getStage(agent.id, memory, intent);
+  const knowledge = handoffReason ? [] : await getKnowledge(agent.id, stage?.stage_key, intent);
+  const extraContext = buildContext({ lead, campaign, memory, intent, stage, knowledge, handoffReason });
+
+  const result = await ReplyQualityService.draftAndScore({
+    channel: 'whatsapp', leadId: lead.id, lead, agent,
+    incomingMessage: incomingText, conversationHistory, extraContext,
+  });
+
+  if (result.decision === 'queue_human') {
+    // The AI couldn't produce a confident reply — flag it and stay silent instead of guessing,
+    // same principle as the deterministic handoffs above, just driven by the quality gate.
+    await pool.query(
+      `INSERT INTO pending_approvals (type, lead_id, payload) VALUES ('whatsapp_low_score_reply', $1, $2)`,
+      [lead.id, JSON.stringify({ draftText: result.text, score: result.score })]
+    );
+    await markNeedsAttention(lead.id, `AI reply needs review (scored ${result.score}/5)`);
+    await logAgentAction(lead.id, 'whatsapp_queued_for_review', { detail: { score: result.score, intent, handoffReason }, draftText: result.text, decision: 'queue_human' });
+    await notifyOwner(lead, incomingText, 'AI reply needs your review before sending');
+    return { skipped: false, queued: true, score: result.score };
+  }
+
+  const meta = result.meta || {};
+  const sent = await WABAService.sendTextMessage(lead.whatsapp_number, result.text);
   if (!sent.success) throw new Error(sent.error || 'Could not send sales reply');
   await pool.query(`INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
-    SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, result.reply]);
-  await saveMemory(lead.id, agent.id, { ...memory, ...result.memory, current_stage: result.memory.current_stage || stage?.stage_key || memory.current_stage });
-  await pool.query(`UPDATE outreach_logs SET lead_status_after=$1, qualified_for_demo=$2 WHERE id=(SELECT id FROM outreach_logs WHERE lead_id=$3 AND response_received=TRUE ORDER BY response_received_at DESC NULLS LAST LIMIT 1)`, [result.status.toLowerCase(), result.status === 'QUALIFIED', lead.id]);
-  await logAgentAction(lead.id, 'whatsapp_reply_sent', { detail: { intent, stage: stage?.stage_key || null }, draftText: result.reply, decision: result.status.toLowerCase() });
-  if (result.status === 'QUALIFIED') {
+    SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, result.text]);
+  await saveMemory(lead.id, agent.id, { ...memory, ...meta.memory, current_stage: meta.memory?.current_stage || stage?.stage_key || memory.current_stage });
+  await pool.query(`UPDATE outreach_logs SET lead_status_after=$1, qualified_for_demo=$2 WHERE id=(SELECT id FROM outreach_logs WHERE lead_id=$3 AND response_received=TRUE ORDER BY response_received_at DESC NULLS LAST LIMIT 1)`, [(meta.status || 'continue').toLowerCase(), meta.status === 'QUALIFIED', lead.id]);
+  await logAgentAction(lead.id, 'whatsapp_reply_sent', { detail: { intent, stage: stage?.stage_key || null, handoffReason }, draftText: result.text, decision: (meta.status || 'continue').toLowerCase() });
+  if (handoffReason) {
+    // The AI-drafted acknowledgment went out — a human still has to actually place the callback
+    // or send the real portfolio, so this still needs their attention.
+    await markNeedsAttention(lead.id, handoffReason);
+    await notifyOwner(lead, incomingText, handoffReason);
+  }
+  if (meta.status === 'QUALIFIED') {
     await pool.query(`UPDATE hotel_leads SET status='demo_qualified', updated_at=NOW() WHERE id=$1`, [lead.id]);
     await markNeedsAttention(lead.id, 'Qualified for demo');
     await logAgentAction(lead.id, 'whatsapp_demo_qualified', { decision: 'qualified' });
     await notifyOwner(lead, incomingText, 'Qualified for demo');
   }
-  if (result.status === 'NOT_INTERESTED') {
+  if (meta.status === 'NOT_INTERESTED') {
     await pool.query(`UPDATE hotel_leads SET status='not_interested', updated_at=NOW() WHERE id=$1`, [lead.id]);
     await logAgentAction(lead.id, 'whatsapp_not_interested', { decision: 'not_interested' });
   }
-  if (result.redirectPhone) {
-    await handleRedirectContact(lead, result.redirectPhone, result.redirectLabel, campaign);
+  if (meta.redirectPhone) {
+    const normalizedRedirect = normalizeIndianMobile(meta.redirectPhone);
+    if (normalizedRedirect) await handleRedirectContact(lead, normalizedRedirect, meta.redirectLabel, campaign);
   }
-  return { ...result, intent, stage: stage?.stage_key || null };
+  return { ...result, meta, intent, stage: stage?.stage_key || null, handoffReason };
 }
 
 module.exports = { handleReply, logAgentAction };

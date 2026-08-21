@@ -1,6 +1,10 @@
 const express = require('express');
+const OpenAI = require('openai');
 const pool = require('../config/db');
+const { trackedCompletion } = require('../utils/aiUsage');
 const router = express.Router();
+
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const jsonFields = ['tags', 'stage_keys', 'intent_keys', 'examples'];
 const optionalText = ['industry', 'sales_strategy', 'qualification_logic', 'demo_process', 'closing_strategy', 'product_knowledge', 'objection_handling', 'response_rules'];
@@ -59,6 +63,85 @@ router.post('/:id/intents', async (req, res) => {
 router.post('/:id/stages', async (req, res) => {
   const b=req.body||{}; if (!b.stage_key?.trim() || !b.stage_name?.trim() || !b.objective?.trim()) return res.status(400).json({ error: 'stage_key, stage_name and objective are required' });
   try { const r=await pool.query(`INSERT INTO agent_stage_rules (agent_id,stage_key,stage_name,objective,stage_order,active) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,[req.params.id,b.stage_key.trim(),b.stage_name.trim(),b.objective.trim(),Number(b.stage_order)||1,b.active!==false]); res.status(201).json(r.rows[0]); } catch(err){res.status(500).json({error:err.message});}
+});
+
+// GPT-assisted setup for an agent stuck at 0 intents / 0 stages (or just to top it up): reads
+// the agent's own persona/strategy + existing knowledge, proposes a tailored set of intents and
+// funnel stages, and inserts them via the exact same SQL as the manual POST /:id/intents and
+// POST /:id/stages routes above — reused, not duplicated. Skips any stage_key/intent that already
+// exists for this agent so re-running (or running after some manual entries) doesn't collide with
+// agent_stage_rules' UNIQUE(agent_id, stage_key) constraint or spam duplicate intents.
+router.post('/:id/auto-configure', async (req, res) => {
+  try {
+    const agentResult = await pool.query('SELECT * FROM sales_agents WHERE id=$1', [req.params.id]);
+    const agent = agentResult.rows[0];
+    if (!agent) return res.status(404).json({ error: 'Sales agent not found' });
+
+    const [knowledgeResult, existingIntents, existingStages] = await Promise.all([
+      pool.query('SELECT title, content FROM agent_knowledge WHERE agent_id=$1 AND active=TRUE', [req.params.id]),
+      pool.query('SELECT intent FROM agent_intent_rules WHERE agent_id=$1', [req.params.id]),
+      pool.query('SELECT stage_key FROM agent_stage_rules WHERE agent_id=$1', [req.params.id]),
+    ]);
+    const existingIntentSet = new Set(existingIntents.rows.map(r => r.intent.toUpperCase()));
+    const existingStageKeySet = new Set(existingStages.rows.map(r => r.stage_key));
+    const nextStageOrder = existingStages.rows.length;
+
+    const persona = [agent.system_prompt, agent.sales_strategy, agent.qualification_logic, agent.demo_process, agent.closing_strategy, agent.product_knowledge, agent.objection_handling, agent.response_rules].filter(Boolean).join('\n\n');
+    const knowledgeText = knowledgeResult.rows.map(k => `- ${k.title}: ${k.content}`).join('\n') || 'None configured';
+
+    const response = await trackedCompletion(client, {
+      model: 'gpt-4o-mini',
+      max_tokens: 1500,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: `You design the intent classification rules and sales funnel stages for a B2B sales agent (channel: ${agent.channel}, industry: ${agent.industry || 'general'}) at Dreams Technology, an Indian business software/website company.
+
+Given the agent's persona/strategy and existing knowledge base, propose:
+- 6-9 INTENTS: what an inbound reply from a lead could be classified as (e.g. PRICING_QUESTION, WANTS_DEMO, OBJECTION_PRICE, NOT_INTERESTED, CALLBACK_REQUEST, GENERAL_QUESTION). Always include a STOP intent for opt-out/unsubscribe requests.
+- 4-6 STAGES: the ordered sales funnel this agent walks a lead through (e.g. opening -> qualifying -> objection handling -> demo offer -> closing), each with a clear one-sentence objective, stage_order starting at 1.
+
+Tailor both specifically to this agent's business/persona below — do not use generic placeholders.
+
+Respond with ONLY JSON: {"intents":[{"intent":"UPPER_SNAKE_CASE","description":"...","examples":["...","..."]}],"stages":[{"stage_key":"lower_snake_case","stage_name":"...","objective":"...","stage_order":1}]}`,
+        },
+        { role: 'user', content: `Agent name: ${agent.name}\nPersona/strategy:\n${persona || 'None set'}\n\nExisting knowledge base:\n${knowledgeText}` },
+      ],
+    }, { purpose: 'sales_agent_auto_configure' });
+
+    const parsed = JSON.parse(response.choices[0].message.content);
+    const proposedIntents = Array.isArray(parsed.intents) ? parsed.intents : [];
+    const proposedStages = Array.isArray(parsed.stages) ? parsed.stages : [];
+
+    const createdIntents = [];
+    for (const i of proposedIntents) {
+      const intentName = String(i.intent || '').trim().toUpperCase();
+      if (!intentName || existingIntentSet.has(intentName)) continue;
+      existingIntentSet.add(intentName);
+      const r = await pool.query(
+        `INSERT INTO agent_intent_rules (agent_id,intent,description,examples,priority,active) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+        [req.params.id, intentName, i.description || null, JSON.stringify(Array.isArray(i.examples) ? i.examples : []), 0, true]
+      );
+      createdIntents.push(r.rows[0]);
+    }
+
+    const createdStages = [];
+    let order = nextStageOrder;
+    for (const s of proposedStages) {
+      const stageKey = String(s.stage_key || '').trim();
+      if (!stageKey || !s.stage_name?.trim() || !s.objective?.trim() || existingStageKeySet.has(stageKey)) continue;
+      existingStageKeySet.add(stageKey);
+      order += 1;
+      const r = await pool.query(
+        `INSERT INTO agent_stage_rules (agent_id,stage_key,stage_name,objective,stage_order,active) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+        [req.params.id, stageKey, s.stage_name.trim(), s.objective.trim(), order, true]
+      );
+      createdStages.push(r.rows[0]);
+    }
+
+    res.status(201).json({ intents: createdIntents, stages: createdStages });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 router.delete('/:id', async (req,res) => { try { await pool.query('UPDATE campaigns SET agent_id = NULL WHERE agent_id = $1', [req.params.id]); const r=await pool.query('DELETE FROM sales_agents WHERE id=$1 RETURNING id',[req.params.id]); if(!r.rows[0]) return res.status(404).json({error:'Sales agent not found'}); res.json({success:true}); } catch(err){res.status(500).json({error:err.message});} });

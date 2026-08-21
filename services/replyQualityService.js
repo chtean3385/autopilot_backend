@@ -64,54 +64,81 @@ function buildAgentPersonaText(agent) {
   return `\n\n${parts}`;
 }
 
-function buildDraftSystemPrompt(playbookExamples, revisionFeedback, portfolioItems, serviceContext, playbookNotes, agent) {
+// channel: 'email' (default) | 'whatsapp'. WhatsApp needs shorter replies, no HTML paragraphing,
+// and its own status/redirect-contact tracking fields — everything else (portfolio, playbook
+// examples/notes, revision feedback, agent persona) is channel-agnostic and layers on top either way.
+function buildDraftSystemPrompt(playbookExamples, revisionFeedback, portfolioItems, serviceContext, playbookNotes, agent, channel) {
+  const isWhatsapp = channel === 'whatsapp';
   const revisionNote = revisionFeedback
     ? `\n\nA previous draft scored too low on quality review. Feedback to address: "${revisionFeedback}". Write an improved reply.`
     : '';
+  const conversationLabel = isWhatsapp ? 'WhatsApp conversation' : 'email conversation';
+  const lengthRule = isWhatsapp ? 'Keep the reply to 2-3 short sentences and ask at most one question.' : 'Respond in 3-6 sentences unless the agent instructions below say otherwise.';
 
   // With an agent assigned, its own persona/strategy fully replaces the generic intro (same
-  // agent-owns-its-persona principle as WhatsApp) -- everything else (portfolio, playbook
+  // agent-owns-its-persona principle across channels) -- everything else (portfolio, playbook
   // examples/notes, revision feedback) still layers on top since those are lead-specific
   // context, not persona.
   const intro = agent
-    ? `You are replying to an inbound message from a lead in an ongoing email conversation. Respond in 3-6 sentences unless the agent instructions below say otherwise. Never mention you are an AI.${buildAgentPersonaText(agent)}`
-    : `You are a sales assistant for Dreams Technology, a business management software company in India, replying to an inbound message from a lead in an ongoing email conversation.
+    ? `You are replying to an inbound message from a lead in an ongoing ${conversationLabel}. ${lengthRule} Never mention you are an AI.${buildAgentPersonaText(agent)}`
+    : `You are a sales assistant for Dreams Technology, a business management software company in India, replying to an inbound message from a lead in an ongoing ${conversationLabel}.
 
 Goals:
-- Be warm, professional, and concise (3-6 sentences).
+- Be warm, professional, and concise${isWhatsapp ? ' (2-3 short sentences, at most one question)' : ' (3-6 sentences)'}.
 - Directly address what the lead said or asked — do not ignore it or repeat a generic pitch.
 - Where natural, move the conversation toward a free demo of our business management software, without being pushy.
 - Never fabricate facts about the recipient's business or about Dreams Technology beyond what's given below.
 - Never mention you are an AI.`;
 
-  return `${intro}${buildPortfolioText(portfolioItems)}${buildServiceContextText(serviceContext)}${buildPlaybookText(playbookExamples)}${buildPlaybookNotesText(playbookNotes)}${revisionNote}
+  const whatsappNote = isWhatsapp
+    ? `\n\nAlso track the conversation status. Redirect handling: if the contact tells you to reach someone else — a different phone number, another branch, or a head/main office — read carefully whether they gave you a phone number for that contact.\n- If they DID give a number, set redirect_phone to it (digits, any format they used) and redirect_label to a short 2-4 word description (e.g. "Head Office", "Rajkot Branch"), and mention in your reply that you'll also reach out there.\n- If they mention another branch/head office/person but do NOT give a number, ask them for that contact's phone number in your reply instead, and leave redirect_phone/redirect_label null.\nOnly set redirect_phone when a real phone number is actually present in their message. Never answer a business's customer booking request; ask for the owner or operations manager instead.`
+    : '';
+  const whatsappFields = isWhatsapp
+    ? `,"status":"CONTINUE|WARM|COLD|QUALIFIED|NOT_INTERESTED","redirect_phone":"digits or null","redirect_label":"short label or null","memory":{"summary":"...","current_stage":"configured stage key or current key","lead_score":0-100,"pain_points":[],"interested_features":[],"decision_maker":"...","objections":[],"budget":"...","timeline":"...","next_objective":"..."}`
+    : '';
+  const textFormatNote = isWhatsapp ? '' : ' with "\\n\\n" between paragraphs (no HTML, no signature)';
 
-Respond with ONLY a JSON object: {"text": "..."} where text is plain text with "\\n\\n" between paragraphs (no HTML, no signature).`;
+  return `${intro}${buildPortfolioText(portfolioItems)}${buildServiceContextText(serviceContext)}${buildPlaybookText(playbookExamples)}${buildPlaybookNotesText(playbookNotes)}${revisionNote}${whatsappNote}
+
+Respond with ONLY a JSON object: {"text": "..."${whatsappFields}} where text is plain text${textFormatNote}.`;
 }
 
+// Returns { text, meta }. `meta` is undefined for email; for whatsapp it carries the extra
+// status/redirect fields salesAgentService.js's handleReply() needs (conversation status,
+// alternate-contact redirect) that email replies have no equivalent of.
 async function draftReply(context, revisionFeedback) {
-  const { lead, incomingMessage, conversationHistory, playbookExamples, portfolioItems, serviceContext, playbookNotes, agent } = context;
+  const { lead, incomingMessage, conversationHistory, playbookExamples, portfolioItems, serviceContext, playbookNotes, agent, channel, extraContext } = context;
   const historyText = buildHistoryText(conversationHistory);
-  const userContent = `${buildLeadContext(lead)}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nLead's latest message:\n${incomingMessage}`;
+  const userContent = `${buildLeadContext(lead)}${extraContext ? `\n\n${extraContext}` : ''}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nLead's latest message:\n${incomingMessage}`;
 
   const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
-    max_tokens: 400,
+    max_tokens: channel === 'whatsapp' ? 380 : 400,
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: buildDraftSystemPrompt(playbookExamples, revisionFeedback, portfolioItems, serviceContext, playbookNotes, agent) },
+      { role: 'system', content: buildDraftSystemPrompt(playbookExamples, revisionFeedback, portfolioItems, serviceContext, playbookNotes, agent, channel) },
       { role: 'user', content: userContent },
     ],
   }, { purpose: 'reply_draft', leadId: context.leadId ?? null });
 
   const parsed = JSON.parse(response.choices[0].message.content);
-  return (parsed.text || '').trim();
+  const text = (parsed.text || '').trim();
+  const meta = channel === 'whatsapp'
+    ? {
+        status: ['CONTINUE', 'WARM', 'COLD', 'QUALIFIED', 'NOT_INTERESTED'].includes(parsed.status) ? parsed.status : 'CONTINUE',
+        redirectPhone: parsed.redirect_phone || null,
+        redirectLabel: (parsed.redirect_label && String(parsed.redirect_label).trim().slice(0, 40)) || null,
+        memory: parsed.memory || {},
+      }
+    : undefined;
+  return { text, meta };
 }
 
 async function scoreReply(context, draftText) {
-  const { lead, incomingMessage, conversationHistory } = context;
+  const { lead, incomingMessage, conversationHistory, channel, extraContext } = context;
   const historyText = buildHistoryText(conversationHistory);
-  const userContent = `${buildLeadContext(lead)}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nLead's latest message:\n${incomingMessage}\n\nDraft reply to score:\n${draftText}`;
+  const userContent = `${buildLeadContext(lead)}${extraContext ? `\n\n${extraContext}` : ''}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nLead's latest message:\n${incomingMessage}\n\nDraft reply to score:\n${draftText}`;
+  const medium = channel === 'whatsapp' ? 'WhatsApp sales messages' : 'outbound sales email replies';
 
   const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
@@ -121,7 +148,7 @@ async function scoreReply(context, draftText) {
       {
         role: 'system',
         content:
-          'You are a strict quality reviewer for outbound sales email replies sent by Dreams Technology. ' +
+          `You are a strict quality reviewer for ${medium} sent by Dreams Technology. ` +
           'Score the draft reply from 1 (bad) to 5 (excellent) based on: relevance to what the lead said, ' +
           'professionalism, accuracy (no fabricated facts), warm but non-pushy tone, and whether it avoids revealing it is AI-generated. ' +
           'Respond with ONLY a JSON object: {"score": <1-5 integer>, "feedback": "short reason, especially if below 4"}.',
@@ -189,7 +216,7 @@ async function draftAndScore(context) {
   let result = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const text = await draftReply(context, revisionFeedback);
+    const { text, meta } = await draftReply(context, revisionFeedback);
     await logAction(leadId, 'draft_created', { detail: { attempt }, draftText: text });
 
     const { score, feedback } = await scoreReply(context, text);
@@ -199,7 +226,7 @@ async function draftAndScore(context) {
 
     await logAction(leadId, 'draft_scored', { detail: { attempt, feedback }, draftText: text, score, decision });
 
-    result = { text, score, decision: passed ? 'send' : 'queue_human' };
+    result = { text, meta, score, decision: passed ? 'send' : 'queue_human' };
     if (passed) return result;
     revisionFeedback = feedback;
   }
