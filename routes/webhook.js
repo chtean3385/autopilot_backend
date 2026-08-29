@@ -75,10 +75,29 @@ router.post('/whatsapp', async (req, res) => {
               );
               console.log(`[Webhook] Read confirmed: ${msgId}`);
             } else if (wabStatus === 'failed') {
-              await pool.query(
-                `UPDATE outreach_logs SET error_message = $1 WHERE waba_message_id = $2`,
-                [status.errors?.[0]?.message || 'Failed', msgId]
+              const errMsg = status.errors?.[0]?.message || status.errors?.[0]?.title || 'Delivery failed';
+              const upd = await pool.query(
+                `UPDATE outreach_logs SET error_message = $1 WHERE waba_message_id = $2 RETURNING lead_id`,
+                [errMsg, msgId]
               );
+              console.log(`[Webhook] Send failed ${msgId}: ${errMsg}`);
+              // Surface delivery failures in the Live Feed — but at most one row per ~10 min so
+              // a bulk-campaign failure (e.g. a billing block failing hundreds of sends) shows
+              // up without burying every other event.
+              const leadId = upd.rows[0]?.lead_id;
+              if (leadId) {
+                const recent = await pool.query(
+                  `SELECT 1 FROM agent_actions WHERE action='whatsapp_send_failed'
+                     AND created_at > NOW() - INTERVAL '10 minutes' LIMIT 1`
+                );
+                if (recent.rowCount === 0) {
+                  await pool.query(
+                    `INSERT INTO agent_actions (lead_id, action, detail, decision)
+                     VALUES ($1, 'whatsapp_send_failed', $2, 'error')`,
+                    [leadId, JSON.stringify({ error: errMsg })]
+                  );
+                }
+              }
             }
           }
 
