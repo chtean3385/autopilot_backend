@@ -12,8 +12,8 @@ const settingsService = require('./settingsService');
 // The fix: send an approved template (category UTILITY), which delivers any time. Free text
 // is kept only as the in-window path (e.g. the owner replied to an earlier alert).
 //
-// Template `owner_alert` (submit via scripts/submit_owner_alert_template.js):
-//   body: "🔔 {{1}}\n\n{{2}}"   →   {{1}} = short title, {{2}} = detail line
+// Template `owner_alert` (submit via scripts/submit_owner_alert_template.js) is one variable
+// wrapped in fixed copy — {{1}} carries the whole alert: "<title>: <detail>".
 // Override the name in settings key OWNER_ALERT_TEMPLATE if you approve it under another name.
 async function alertOwner(title, body) {
   let phone = await settingsService.getSetting('OWNER_WHATSAPP');
@@ -25,13 +25,14 @@ async function alertOwner(title, body) {
   if (phone.length === 10) phone = '91' + phone;
 
   const tpl = (await settingsService.getSetting('OWNER_ALERT_TEMPLATE')) || 'owner_alert';
-  const p1 = String(title || 'Dreams CRM alert').replace(/\s+/g, ' ').trim().slice(0, 60) || 'Dreams CRM alert';
-  const p2 = String(body || '').replace(/\s*\n\s*/g, ' — ').replace(/\s+/g, ' ').trim().slice(0, 600) || '—';
+  const t = String(title || 'Dreams CRM alert').replace(/\s+/g, ' ').trim().slice(0, 60) || 'Dreams CRM alert';
+  const b = String(body || '').replace(/\s*\n\s*/g, ' — ').replace(/\s+/g, ' ').trim().slice(0, 600);
+  const line = b ? `${t}: ${b}` : t;
 
-  const viaTemplate = await WABAService.sendTemplateMessage(phone, tpl, [p1, p2]);
+  const viaTemplate = await WABAService.sendTemplateMessage(phone, tpl, [line]);
   if (viaTemplate.success) return { ok: true, via: 'template' };
 
-  const viaText = await WABAService.sendTextMessage(phone, `🔔 ${p1}\n\n${p2}`);
+  const viaText = await WABAService.sendTextMessage(phone, `🔔 ${line}`);
   if (!viaText.success) {
     console.error(`[OwnerAlert] template "${tpl}" failed (${viaTemplate.error}) AND text failed (${viaText.error}). ` +
       `Approve the "${tpl}" template in Meta — see backend/scripts/submit_owner_alert_template.js`);

@@ -12,12 +12,15 @@ require('dotenv').config();
 const WABAService = require('../services/wabaService');
 const pool = require('../config/db');
 
+// Meta rejects templates with too high a variable-to-text ratio ("Parameters words ratio
+// exceeds limit"), so this is one variable wrapped in plenty of fixed copy. The single {{1}}
+// carries the whole alert (what happened + which lead + their last message).
 const template = {
   template_name: 'owner_alert',
   template_category: process.env.WABA_ALERT_CATEGORY || 'UTILITY',
-  body_text: '🔔 {{1}}\n\n{{2}}',
-  examples: ['New lead reply', 'Sunrise Hotel (Jaipur) - +919812345678 - "what is the price?"'],
-  footer_text: 'Dreams Technology CRM',
+  body_text: 'Dreams Technology CRM alert.\n\n{{1}}\n\nOpen the CRM dashboard to view the full conversation and reply to this lead.',
+  examples: ['Pricing question from Sunrise Hotel (Jaipur), +919812345678: "what is the price for the booking software?"'],
+  footer_text: 'Dreams Technology',
 };
 
 (async () => {
