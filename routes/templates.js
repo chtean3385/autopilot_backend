@@ -1,8 +1,46 @@
 const express = require('express');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const TemplateService = require('../services/templateService');
 const WABAService = require('../services/wabaService');
 const pool = require('../config/db');
 const router = express.Router();
+
+// Template header images. Stored outside git under backend/uploads/ — the deploy does
+// `git reset --hard`, which only removes *tracked* files, so this dir survives every deploy.
+// Served back through this same /api/templates/image/ path so no nginx change is needed; the
+// URL must be publicly reachable because Meta fetches it at template-submit and send time.
+const TEMPLATE_IMG_DIR = path.join(__dirname, '..', 'uploads', 'template-images');
+fs.mkdirSync(TEMPLATE_IMG_DIR, { recursive: true });
+
+const EXT_BY_MIME = { 'image/jpeg': '.jpg', 'image/png': '.png' };
+const imgUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // Meta's cap for template header images
+  fileFilter: (req, file, cb) =>
+    EXT_BY_MIME[file.mimetype] ? cb(null, true) : cb(new Error('Only JPG or PNG images are allowed.')),
+});
+
+router.use('/image', express.static(TEMPLATE_IMG_DIR, { maxAge: '30d', immutable: true }));
+
+// POST /api/templates/upload-image  (multipart, field "image")
+// → { url } — a permanent public link to drop into a template's Header Image URL.
+router.post('/upload-image', (req, res) => {
+  imgUpload.single('image')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.message });
+    if (!req.file) return res.status(400).json({ error: 'No image uploaded.' });
+    try {
+      const name = `tpl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${EXT_BY_MIME[req.file.mimetype]}`;
+      fs.writeFileSync(path.join(TEMPLATE_IMG_DIR, name), req.file.buffer);
+      const base = (process.env.BACKEND_URL || '').replace(/\/+$/, '');
+      const url = base ? `${base}/api/templates/image/${name}` : `/api/templates/image/${name}`;
+      res.json({ url, filename: name });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+});
 
 // Diagnostic: show which Meta WABA account is connected
 router.get('/waba-info', async (req, res) => {
