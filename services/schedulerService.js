@@ -704,13 +704,18 @@ async function getApprovedTemplate(templateId, businessCategory = null) {
   // industry-specific pitch was landing in the "generic" bucket and losing every fallback to
   // whichever template happened to be approved most recently — confirmed live: 3,470+ sends
   // (visa_constuatnt + first_message) went to leads outside their intended industry this way.
+  // $1 must be cast to ::text explicitly. node-postgres sends the param untyped, and every use
+  // of it here (IS NOT NULL, <> '', ~*) leaves the type ambiguous enough that Postgres bails
+  // out at parse time with "could not determine data type of parameter $1" — which since this
+  // query was introduced meant getApprovedTemplate() threw on every industry-fallback lookup,
+  // aborting the whole runFollowUps() batch (0 follow-ups sent).
   const t = await pool.query(
     `SELECT * FROM waba_templates
      WHERE status='approved'
        AND (industry IS NULL OR LOWER(industry) = 'all'
-            OR ($1 IS NOT NULL AND $1 <> '' AND $1 ~* industry))
+            OR ($1::text IS NOT NULL AND $1::text <> '' AND $1::text ~* industry))
      ORDER BY (industry IS NOT NULL AND LOWER(industry) <> 'all'
-               AND $1 IS NOT NULL AND $1 ~* industry) DESC,
+               AND $1::text IS NOT NULL AND $1::text ~* industry) DESC,
               created_at DESC
      LIMIT 1`,
     [businessCategory]
@@ -1033,6 +1038,7 @@ async function runFollowUps(trigger = 'cron') {
     console.log(`[FollowUp] ${stats.due} lead(s) due for follow-up or expiry`);
 
     for (const lead of result.rows) {
+     try {
       const outreachCount = lead.template_count;
 
       // 1 initial + 5 follow-ups = 6 template touches max
@@ -1074,6 +1080,13 @@ async function runFollowUps(trigger = 'cron') {
         stats.failed++;
         console.warn(`[FollowUp] Lead ${lead.id} send failed: ${wabaResult.error}`);
       }
+     } catch (leadErr) {
+      // One lead blowing up (bad template lookup, WABA hiccup, etc.) must not abort the whole
+      // batch — the rest of the due leads still deserve their follow-up this tick.
+      stats.failed++;
+      stats.lastLeadError = `lead ${lead.id}: ${leadErr.message}`;
+      console.error(`[FollowUp] Lead ${lead.id} errored — skipping:`, leadErr.message);
+     }
     }
   } catch (err) {
     console.error('[FollowUp] Error:', err.message);
