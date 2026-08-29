@@ -15,6 +15,7 @@ const TEMPLATE_IMG_DIR = path.join(__dirname, '..', 'uploads', 'template-images'
 fs.mkdirSync(TEMPLATE_IMG_DIR, { recursive: true });
 
 const EXT_BY_MIME = { 'image/jpeg': '.jpg', 'image/png': '.png' };
+const TYPE_BY_EXT = { '.jpg': 'image/jpeg', '.png': 'image/png' };
 const imgUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // Meta's cap for template header images
@@ -22,20 +23,36 @@ const imgUpload = multer({
     EXT_BY_MIME[file.mimetype] ? cb(null, true) : cb(new Error('Only JPG or PNG images are allowed.')),
 });
 
-router.use('/image', express.static(TEMPLATE_IMG_DIR, { maxAge: '30d', immutable: true }));
+// Served at /api/templates/media/<id> — deliberately NO file extension in the URL, because
+// nginx's `location ~* \.(png|jpg|...)$` regex block would otherwise intercept the request
+// before it ever reaches this backend (regex locations beat the /api/ prefix). Content-Type
+// is set explicitly here from the stored file's extension, which is all Meta needs.
+router.get('/media/:id', (req, res) => {
+  const id = String(req.params.id || '');
+  if (!/^[a-z0-9_]+$/i.test(id)) return res.status(400).end();
+  for (const ext of ['.png', '.jpg']) {
+    const p = path.join(TEMPLATE_IMG_DIR, id + ext);
+    if (fs.existsSync(p)) {
+      res.type(TYPE_BY_EXT[ext]);
+      res.set('Cache-Control', 'public, max-age=2592000, immutable');
+      return res.sendFile(p);
+    }
+  }
+  res.status(404).end();
+});
 
 // POST /api/templates/upload-image  (multipart, field "image")
-// → { url } — a permanent public link to drop into a template's Header Image URL.
+// → { url } — a permanent public link to drop into a template's Header Image.
 router.post('/upload-image', (req, res) => {
   imgUpload.single('image')(req, res, (err) => {
     if (err) return res.status(400).json({ error: err.message });
     if (!req.file) return res.status(400).json({ error: 'No image uploaded.' });
     try {
-      const name = `tpl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${EXT_BY_MIME[req.file.mimetype]}`;
-      fs.writeFileSync(path.join(TEMPLATE_IMG_DIR, name), req.file.buffer);
+      const id = `tpl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      fs.writeFileSync(path.join(TEMPLATE_IMG_DIR, id + EXT_BY_MIME[req.file.mimetype]), req.file.buffer);
       const base = (process.env.BACKEND_URL || '').replace(/\/+$/, '');
-      const url = base ? `${base}/api/templates/image/${name}` : `/api/templates/image/${name}`;
-      res.json({ url, filename: name });
+      const url = base ? `${base}/api/templates/media/${id}` : `/api/templates/media/${id}`;
+      res.json({ url });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
