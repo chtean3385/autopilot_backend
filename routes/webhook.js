@@ -81,21 +81,36 @@ router.post('/whatsapp', async (req, res) => {
                 [errMsg, msgId]
               );
               console.log(`[Webhook] Send failed ${msgId}: ${errMsg}`);
-              // Surface delivery failures in the Live Feed — but at most one row per ~10 min so
-              // a bulk-campaign failure (e.g. a billing block failing hundreds of sends) shows
-              // up without burying every other event.
               const leadId = upd.rows[0]?.lead_id;
               if (leadId) {
-                const recent = await pool.query(
+                // In-system flag: a Live Feed row, at most one per ~10 min so a bulk failure
+                // (billing block failing hundreds of sends) surfaces without burying the feed.
+                const feedThrottle = await pool.query(
                   `SELECT 1 FROM agent_actions WHERE action='whatsapp_send_failed'
                      AND created_at > NOW() - INTERVAL '10 minutes' LIMIT 1`
                 );
-                if (recent.rowCount === 0) {
+                if (feedThrottle.rowCount === 0) {
                   await pool.query(
                     `INSERT INTO agent_actions (lead_id, action, detail, decision)
                      VALUES ($1, 'whatsapp_send_failed', $2, 'error')`,
                     [leadId, JSON.stringify({ error: errMsg })]
                   );
+                }
+                // WhatsApp alert to the owner — once per hour max, so a burst pings once.
+                const alertThrottle = await pool.query(
+                  `SELECT 1 FROM agent_actions WHERE action='whatsapp_fail_alert_sent'
+                     AND created_at > NOW() - INTERVAL '60 minutes' LIMIT 1`
+                );
+                if (alertThrottle.rowCount === 0) {
+                  await pool.query(
+                    `INSERT INTO agent_actions (lead_id, action, detail, decision)
+                     VALUES ($1, 'whatsapp_fail_alert_sent', $2, 'error')`,
+                    [leadId, JSON.stringify({ error: errMsg })]
+                  );
+                  require('../services/ownerAlertService').alertOwner(
+                    'WhatsApp sending is failing',
+                    `Meta is rejecting messages: "${errMsg}". Check the WhatsApp Business Account billing / the template. (Muted for 1 hour.)`
+                  ).catch(e => console.error('[Webhook] fail-alert send error:', e.message));
                 }
               }
             }
