@@ -21,8 +21,9 @@ CREATE TABLE IF NOT EXISTS hotel_leads (
     status VARCHAR(50) DEFAULT 'new', -- 'new', 'interested', 'demo_qualified', 'responded', 'no_response'
     archived_at TIMESTAMP, -- inbox conversation archived (hidden from main list); NULL = not archived
     inbox_last_read_at TIMESTAMP, -- WhatsApp Inbox: stamped when the admin opens the thread, drives the unread badge
-    needs_attention BOOLEAN DEFAULT FALSE, -- AI auto-reply paused for this lead; surfaced in the Inbox "Needs Attention" filter
-    needs_attention_reason TEXT, -- why (e.g. "Asked for a callback", "Asked for portfolio", "Qualified for demo")
+    needs_attention BOOLEAN DEFAULT FALSE, -- flagged for a human's eyes; surfaced in the Inbox "Needs Attention" filter (does NOT by itself silence the AI)
+    needs_attention_reason TEXT, -- why (e.g. "Asked for a callback", "Pricing question", "Qualified for demo")
+    ai_paused BOOLEAN DEFAULT FALSE, -- a human explicitly took over (Inbox "Take over"); the AI stays silent until "Return to AI"
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -151,6 +152,13 @@ CREATE TABLE IF NOT EXISTS outreach_logs (
     lead_status_after VARCHAR(50), -- 'interested', 'demo_qualified', etc
     is_auto_reply BOOLEAN DEFAULT FALSE, -- response_text was the business's own WhatsApp auto-responder, not a human
     error_message TEXT
+);
+
+-- Webhook idempotency — one row per inbound WhatsApp message id already processed,
+-- so a Meta webhook redelivery can't trigger a second agent reply.
+CREATE TABLE IF NOT EXISTS processed_wa_messages (
+    wa_message_id VARCHAR(255) PRIMARY KEY,
+    processed_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Demo Bookings Table

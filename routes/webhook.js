@@ -86,6 +86,19 @@ router.post('/whatsapp', async (req, res) => {
           for (const msg of (value.messages || [])) {
             if (msg.type !== 'text') continue;
 
+            // Idempotency — Meta redelivers a webhook on any non-200 / timeout. Without this,
+            // a redelivery re-runs the agent and sends the lead a second reply. First writer
+            // wins; a duplicate delivery inserts nothing and is skipped.
+            const dedup = await pool.query(
+              `INSERT INTO processed_wa_messages (wa_message_id) VALUES ($1)
+               ON CONFLICT DO NOTHING RETURNING wa_message_id`,
+              [msg.id]
+            );
+            if (dedup.rowCount === 0) {
+              console.log(`[Webhook] Duplicate delivery of message ${msg.id} — skipped`);
+              continue;
+            }
+
             const fromPhone = msg.from; // E.164 without +
             const msgText = msg.text?.body || '';
             console.log(`[Webhook] Incoming reply from ${fromPhone}: "${msgText}"`);
@@ -144,6 +157,14 @@ router.post('/whatsapp', async (req, res) => {
                  ORDER BY sent_at DESC LIMIT 1
                )`,
               [msgText, leadId]
+            );
+
+            // A reply of any kind takes the lead out of the cold-template follow-up pool
+            // (runFollowUps keys off status = 'new'). The agent decides everything else.
+            await pool.query(
+              `UPDATE hotel_leads SET status = 'responded', updated_at = NOW()
+               WHERE id = $1 AND status IN ('new', 'no_response')`,
+              [leadId]
             );
 
             // AI agent auto-replies to qualify the lead

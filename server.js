@@ -44,7 +44,17 @@ async function initDB() {
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS needs_attention BOOLEAN DEFAULT FALSE;
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS needs_attention_reason TEXT;
+    -- ai_paused: a human explicitly took the lead over (Inbox "Take over"). Distinct from
+    -- needs_attention — a lead can be flagged for a human's eyes while the AI keeps replying
+    -- so the customer is never left waiting; only ai_paused actually silences the bot.
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS ai_paused BOOLEAN DEFAULT FALSE;
     CREATE INDEX IF NOT EXISTS idx_leads_needs_attention ON hotel_leads(needs_attention) WHERE needs_attention = TRUE;
+    -- Webhook idempotency: Meta redelivers a webhook on any non-200/timeout. Without this a
+    -- redelivery re-runs the agent and double-replies to the lead.
+    CREATE TABLE IF NOT EXISTS processed_wa_messages (
+      wa_message_id VARCHAR(255) PRIMARY KEY,
+      processed_at TIMESTAMP DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS lead_groups (
       id SERIAL PRIMARY KEY,
       name VARCHAR(255) NOT NULL UNIQUE,

@@ -38,7 +38,7 @@ router.get('/', async (req, res) => {
         lr.qualified_for_demo, lr.lead_status_after,
         hl.hotel_name, hl.owner_name, hl.whatsapp_number, hl.city,
         hl.status AS lead_status, hl.archived_at,
-        hl.needs_attention, hl.needs_attention_reason,
+        hl.needs_attention, hl.needs_attention_reason, hl.ai_paused,
         c.campaign_name, t.template_name,
         GREATEST(lr.response_received_at, lo.last_sent_at) AS last_activity_at,
         COALESCE(u.unread_count, 0)::int AS unread_count
@@ -162,6 +162,19 @@ router.post('/reply', async (req, res) => {
       [lead_id, result.messageId, message.trim()]
     );
 
+    // A staff member replying by hand = taking the lead over. Pause the AI and flag the
+    // thread; the "Return to AI" button clears both. Without this the bot would keep
+    // replying alongside the human and the follow-up job would still chase the lead.
+    await pool.query(
+      `UPDATE hotel_leads
+       SET needs_attention = TRUE,
+           ai_paused = TRUE,
+           needs_attention_reason = COALESCE(NULLIF(needs_attention_reason, ''), 'Staff replied — you are handling this'),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [lead_id]
+    );
+
     res.json({ success: true, messageId: result.messageId });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -184,15 +197,36 @@ router.put('/:leadId/archive', async (req, res) => {
   }
 });
 
-// PUT /api/inbox/:leadId/attention — manually flag/clear the "Needs Attention" state.
-// Clearing it ("Resume AI") lets the sales agent auto-reply to this lead again.
+// PUT /api/inbox/:leadId/attention — manual "Take over" / "Return to AI".
+//   needs_attention=true  → flag the thread AND pause the AI (a human is taking it).
+//   needs_attention=false → clear the flag, un-pause the AI, and put the lead back in a
+//                           status the follow-up job / agent will pick up again.
 router.put('/:leadId/attention', async (req, res) => {
   const { needs_attention, reason } = req.body;
+  const flag = !!needs_attention;
   try {
+    if (flag) {
+      const result = await pool.query(
+        `UPDATE hotel_leads
+         SET needs_attention = TRUE, ai_paused = TRUE,
+             needs_attention_reason = $1, updated_at = NOW()
+         WHERE id = $2 RETURNING id, needs_attention, ai_paused, needs_attention_reason`,
+        [reason || 'You are handling this lead', req.params.leadId]
+      );
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Lead not found' });
+      return res.json({ success: true, ...result.rows[0] });
+    }
+
     const result = await pool.query(
-      `UPDATE hotel_leads SET needs_attention = $1, needs_attention_reason = $2, updated_at = NOW()
-       WHERE id = $3 RETURNING id, needs_attention, needs_attention_reason`,
-      [!!needs_attention, needs_attention ? (reason || 'Manually flagged') : null, req.params.leadId]
+      `UPDATE hotel_leads
+       SET needs_attention = FALSE, ai_paused = FALSE, needs_attention_reason = NULL,
+           status = CASE
+             WHEN status IN ('demo_qualified','not_interested','opted_out','converted','needs_review') THEN status
+             WHEN EXISTS (SELECT 1 FROM outreach_logs o WHERE o.lead_id = hotel_leads.id AND o.response_received = TRUE) THEN 'responded'
+             ELSE 'new' END,
+           updated_at = NOW()
+       WHERE id = $1 RETURNING id, needs_attention, ai_paused, needs_attention_reason, status`,
+      [req.params.leadId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Lead not found' });
     res.json({ success: true, ...result.rows[0] });

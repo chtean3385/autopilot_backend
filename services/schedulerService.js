@@ -984,10 +984,60 @@ async function sendTask(taskId) {
   }
 }
 
-// Follow up with leads that haven't responded, and re-engage stalled conversations.
-// Runs daily: sends follow-up every 2 days, up to 6 template touches total.
-// 'new' leads (never replied) → 'dead' after the cap.
-// 'responded' leads (replied, then went quiet) → 'stalled' after the cap.
+// Pick the best-fit approved template for a follow-up to a lead who hasn't replied, skipping
+// any this lead has already been sent. GPT chooses among the industry-fitting candidates so a
+// second touch reads differently from the first; falls back to best-fit-first if GPT is down.
+// Returns null when there's no unused fitting template (caller stops chasing rather than repeat).
+async function pickFollowUpTemplate(lead, usedIds) {
+  const res = await pool.query(
+    `SELECT id, template_name, body_text, industry, header_image_url, parameter_mapping
+     FROM waba_templates
+     WHERE status='approved'
+       AND (industry IS NULL OR LOWER(industry)='all'
+            OR ($1::text IS NOT NULL AND $1::text <> '' AND $1::text ~* industry))
+     ORDER BY (industry IS NOT NULL AND LOWER(industry) <> 'all'
+               AND $1::text IS NOT NULL AND $1::text ~* industry) DESC, created_at ASC`,
+    [lead.business_category || null]
+  );
+  const candidates = res.rows.filter(t => !usedIds.has(t.id));
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  try {
+    const sentRes = await pool.query(
+      `SELECT COALESCE(wt.body_text, ol.message_text) AS body
+       FROM outreach_logs ol LEFT JOIN waba_templates wt ON wt.id = ol.template_id
+       WHERE ol.lead_id=$1 ORDER BY ol.sent_at ASC`,
+      [lead.id]
+    );
+    const alreadySent = sentRes.rows.map(r => r.body).filter(Boolean).join('\n---\n') || '(nothing yet)';
+    const pick = await trackedCompletion(openai, {
+      model: 'gpt-4o-mini', max_tokens: 20, response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: `Pick the single best next follow-up template for a B2B lead who has not replied. Return only JSON {"id": <one allowed id>}. Prefer a different angle from what was already sent.` },
+        { role: 'user', content:
+`Lead: ${lead.hotel_name} — ${lead.business_category || 'general business'} in ${lead.city || 'India'}
+
+Already sent to this lead:
+${alreadySent}
+
+Allowed templates:
+${candidates.map(t => `id ${t.id}: ${t.body_text}`).join('\n\n')}` },
+      ],
+    }, { purpose: 'followup_template_pick', leadId: lead.id });
+    const pickedId = JSON.parse(pick.choices[0].message.content)?.id;
+    const picked = candidates.find(t => t.id === pickedId);
+    if (picked) return picked;
+  } catch (err) {
+    console.error('[FollowUp] template pick failed — using best-fit:', err.message);
+  }
+  return candidates[0];
+}
+
+// Cold-template follow-ups to leads who have NEVER replied. Runs daily; sends every 2 days,
+// 1 initial + 2 follow-ups max, then status → 'no_response'. Never re-sends a template the
+// lead already got. Leads who replied, or a human has flagged, are excluded — those belong
+// to the AI agent / the Inbox, not this job.
 async function runFollowUps(trigger = 'cron') {
   console.log(`[FollowUp] Checking leads for follow-up... (trigger=${trigger})`);
 
@@ -1009,11 +1059,12 @@ async function runFollowUps(trigger = 'cron') {
   const stats = { due: 0, sent: 0, expired: 0, failed: 0, noTemplate: 0 };
 
   try {
-    // Leads that:
-    // - status 'new' (never replied) or 'responded' (conversation went quiet)
-    // - have at least 1 prior outreach
-    // - nothing sent to them in the last 2 days
-    // Cap counts template sends only — agent conversation replies don't count.
+    // Cold-template follow-ups go ONLY to leads who have never replied. The moment a lead
+    // replies, webhook.js moves them to status 'responded' and the AI agent owns the
+    // conversation from then on (Meta forbids free-form follow-ups outside a 24h window, so
+    // these stay templates — kept short: 1 initial + 2 follow-ups). A lead a human has flagged
+    // (needs_attention) is off-limits too. NOT EXISTS(...response_received) is the real gate;
+    // the status filter is belt-and-suspenders.
     const result = await pool.query(`
       WITH due AS (
         SELECT hl.*,
@@ -1024,8 +1075,12 @@ async function runFollowUps(trigger = 'cron') {
                 ORDER BY ol2.sent_at DESC LIMIT 1)                            AS last_campaign_id
         FROM hotel_leads hl
         INNER JOIN outreach_logs ol ON ol.lead_id = hl.id
-        WHERE hl.status IN ('new', 'responded')
+        WHERE hl.status = 'new'
+          AND hl.needs_attention = FALSE
           AND hl.whatsapp_number IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE
+          )
         GROUP BY hl.id
         HAVING MAX(ol.sent_at) <= NOW() - INTERVAL '2 days'
       )
@@ -1041,30 +1096,31 @@ async function runFollowUps(trigger = 'cron') {
      try {
       const outreachCount = lead.template_count;
 
-      // 1 initial + 5 follow-ups = 6 template touches max
-      if (outreachCount >= 6) {
-        const finalStatus = lead.status === 'responded' ? 'stalled' : 'dead';
+      // 1 initial + 2 follow-ups = 3 template touches max, then stop chasing.
+      if (outreachCount >= 3) {
         await pool.query(
-          `UPDATE hotel_leads SET status=$1, updated_at=NOW() WHERE id=$2`,
-          [finalStatus, lead.id]
+          `UPDATE hotel_leads SET status='no_response', updated_at=NOW() WHERE id=$1`,
+          [lead.id]
         );
         stats.expired++;
-        console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" → ${finalStatus} (${outreachCount} template sends, no response)`);
+        console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" → no_response (${outreachCount} template sends, never replied)`);
         continue;
       }
 
-      // Per-lead, not hoisted above the loop — different leads in the same batch can be
-      // different industries, and reusing one template for all of them regardless of
-      // business_category is exactly how a logistics lead gets hotel-worded copy.
-      // Prefer whichever campaign's template actually contacted this lead last — passing null
-      // here (the old behavior) ignored that entirely and re-resolved by industry from scratch,
-      // which silently fell through to whatever untagged template was most recently approved
-      // whenever no template's industry exactly matched business_category. That's how editing a
-      // campaign's template in the UI had zero effect on that campaign's own follow-up sends.
-      const template = await getApprovedTemplate(lead.last_campaign_template_id, lead.business_category);
+      // Never re-send a lead a template they've already had. GPT picks the best-fit unused
+      // one for their industry so touch #2 reads differently from touch #1.
+      const usedRes = await pool.query(
+        `SELECT DISTINCT template_id FROM outreach_logs
+         WHERE lead_id=$1 AND message_type='template' AND template_id IS NOT NULL`,
+        [lead.id]
+      );
+      const usedIds = new Set(usedRes.rows.map(r => r.template_id));
+      const template = await pickFollowUpTemplate(lead, usedIds);
       if (!template) {
-        stats.noTemplate++;
-        console.warn(`[FollowUp] No approved template for lead ${lead.id} (industry: ${lead.business_category || 'generic'}) — skipping`);
+        // No fresh template left for this industry — stop rather than repeat one.
+        await pool.query(`UPDATE hotel_leads SET status='no_response', updated_at=NOW() WHERE id=$1`, [lead.id]);
+        stats.expired++;
+        console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" → no_response (no unused template left)`);
         continue;
       }
 
@@ -1097,13 +1153,11 @@ async function runFollowUps(trigger = 'cron') {
 
   await SchedulerStatusService.recordRun('whatsapp_followups', trigger, stats);
   await notifyAdmin(
-    `🕙 *WhatsApp Follow-ups ran* (${trigger === 'manual' ? 'manual trigger' : 'daily 10AM check'})\n\n` +
-    `Checked: ${stats.due} lead(s) due\n` +
-    `✅ Sent: ${stats.sent}\n` +
-    `⚰️ Expired (6-touch cap reached): ${stats.expired}\n` +
-    (stats.noTemplate ? `⚠️ Skipped — no approved template: ${stats.noTemplate}\n` : '') +
-    (stats.failed ? `⚠️ Send failures: ${stats.failed}\n` : '') +
-    (stats.error ? `❌ Error: ${stats.error}\n` : '')
+    `WhatsApp follow-ups ran (${trigger === 'manual' ? 'manual trigger' : 'daily noon IST'}). ` +
+    `Checked ${stats.due} due. Sent ${stats.sent}. Stopped chasing ${stats.expired}.` +
+    (stats.noTemplate ? ` No template: ${stats.noTemplate}.` : '') +
+    (stats.failed ? ` Send failures: ${stats.failed}.` : '') +
+    (stats.error ? ` Error: ${stats.error}.` : '')
   );
 
   return stats;
@@ -1142,7 +1196,7 @@ schedule.scheduleJob({ rule: '0 12 * * *', tz: 'Asia/Kolkata' }, async () => {
   await runFollowUps('cron');
 });
 
-console.log('🤖 Agent scheduler started — checks every minute for tasks, daily follow-ups at 10AM');
+console.log('🤖 Agent scheduler started — checks every minute for tasks, daily follow-ups at noon IST');
 
 module.exports = {
   runTask, sendTask, parseInstruction, refineInstruction, runFollowUps,

@@ -4,6 +4,7 @@ const WABAService = require('./wabaService');
 const settingsService = require('./settingsService');
 const { trackedCompletion } = require('../utils/aiUsage');
 const ReplyQualityService = require('./replyQualityService');
+const { alertOwner } = require('./ownerAlertService');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const DEFAULT_INTENT = 'UNKNOWN';
@@ -245,16 +246,22 @@ async function logAgentAction(leadId, action, { detail, draftText, decision } = 
 }
 
 async function notifyOwner(lead, lastMessage, reason = 'New qualified lead') {
-  let phone = await settingsService.getSetting('OWNER_WHATSAPP');
-  if (!phone) return;
-  phone = phone.replace(/\D/g, ''); if (phone.length === 10) phone = `91${phone}`;
-  await WABAService.sendTextMessage(phone, `${reason}: ${lead.hotel_name}\n${lead.owner_name || ''} ${lead.city || ''} · +${lead.whatsapp_number}\n\nLast message: ${lastMessage}`).catch(() => {});
+  // Goes through ownerAlertService, which sends an approved template (works any time)
+  // and only falls back to free text when the owner is inside a 24h window.
+  await alertOwner(
+    reason,
+    `${lead.hotel_name}${lead.city ? ' (' + lead.city + ')' : ''} · +${lead.whatsapp_number}\n"${String(lastMessage || '').slice(0, 160)}"`
+  ).catch(() => {});
 }
 
-async function markNeedsAttention(leadId, reason) {
+// pauseAi=true only when a human explicitly takes the lead over. A plain flag (pauseAi=false)
+// surfaces the lead in the Needs Attention tab and pings the owner, but the AI keeps replying
+// so the customer is never left waiting for a human who may be hours away.
+async function markNeedsAttention(leadId, reason, pauseAi = false) {
   await pool.query(
-    `UPDATE hotel_leads SET needs_attention = TRUE, needs_attention_reason = $1, updated_at = NOW() WHERE id = $2`,
-    [reason, leadId]
+    `UPDATE hotel_leads SET needs_attention = TRUE, needs_attention_reason = $1,
+       ai_paused = ai_paused OR $2, updated_at = NOW() WHERE id = $3`,
+    [reason, pauseAi, leadId]
   );
 }
 
@@ -277,106 +284,168 @@ function detectHandoffReason(message) {
   return null;
 }
 
+// Fixed, always-on safety gate — one cheap GPT call that decides what to DO with an inbound
+// reply BEFORE any draft is attempted. Separate from detectIntent() (which classifies against
+// the agent's own configured funnel intents for stage/knowledge selection); this rubric never
+// depends on per-agent configuration. The AI still replies on HANDOFF — the customer is never
+// left waiting — but the lead also surfaces for a human and the owner is pinged.
+const REPLY_GATES = ['HANDOFF', 'NOT_INTERESTED', 'UNSURE', 'ROUTINE'];
+async function classifyReplyIntent({ lead, message, conversationHistory }) {
+  const history = (conversationHistory || []).slice(-10)
+    .map(t => `${t.direction === 'in' ? 'Lead' : 'Us'}: ${t.body}`).join('\n');
+  try {
+    const res = await trackedCompletion(client, {
+      model: 'gpt-4o-mini', max_tokens: 60, response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content:
+`Classify a B2B lead's latest WhatsApp reply. Return only JSON: {"gate":"ONE VALUE","reason":"3-6 words"}.
+- HANDOFF: shows buying interest, asks about price/quote/cost, asks to be called, wants a demo/meeting, asks for help or support, raises a problem or complaint, or asks something only a salesperson should answer. When unsure between HANDOFF and ROUTINE, pick HANDOFF.
+- NOT_INTERESTED: a clear no — "not interested", "stop", "don't message me".
+- UNSURE: unclear, gibberish, a wrong number, or a language you cannot read.
+- ROUTINE: a simple question answerable from product knowledge, a mild objection, "who is this", "not right now", small talk.` },
+        { role: 'user', content: `Conversation so far:\n${history || '(none)'}\n\nLead's latest reply:\n${message}` },
+      ],
+    }, { purpose: 'sales_agent_reply_gate', leadId: lead.id });
+    const parsed = json(res.choices[0].message.content, {});
+    return {
+      gate: REPLY_GATES.includes(parsed.gate) ? parsed.gate : 'UNSURE',
+      reason: String(parsed.reason || '').slice(0, 60),
+    };
+  } catch (err) {
+    console.error('[SalesAgent] classifyReplyIntent failed:', err.message);
+    return { gate: 'UNSURE', reason: 'classifier error' };
+  }
+}
+
+// Normalized comparison so the bot never re-sends a message it (or a template) already sent —
+// catches exact repeats and light rewordings (~80%+ shared tokens).
+function normalizeMsg(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+function tooSimilarToPrior(candidate, priorOutbound) {
+  const c = normalizeMsg(candidate);
+  if (!c) return true;
+  const cWords = new Set(c.split(' '));
+  for (const prev of priorOutbound) {
+    const p = normalizeMsg(prev);
+    if (!p) continue;
+    if (p === c) return true;
+    const pWords = new Set(p.split(' '));
+    const inter = [...cWords].filter(w => pWords.has(w)).length;
+    const union = new Set([...cWords, ...pWords]).size;
+    if (union > 0 && inter / union >= 0.8) return true;
+  }
+  return false;
+}
+
 async function handleReply(lead, incomingText) {
-  // Already flagged (callback/portfolio/qualified) — a human took this over, the bot stays
-  // silent until they clear it from the Inbox "Needs Attention" tab. Re-checked fresh from the
-  // DB rather than trusting the passed-in `lead` (webhook.js fetches it once per inbound message,
-  // which can be stale if a flag was set moments earlier in the same burst).
-  const fresh = await pool.query('SELECT needs_attention FROM hotel_leads WHERE id = $1', [lead.id]);
-  if (fresh.rows[0]?.needs_attention) {
-    await logAgentAction(lead.id, 'whatsapp_skipped_needs_attention', { detail: { message: incomingText }, decision: 'skipped' });
-    return { skipped: true, reason: 'needs_attention' };
+  // ai_paused = a human explicitly took this lead over from the Inbox. Only that silences the
+  // bot — a plain needs_attention flag does NOT, so the customer keeps getting answers.
+  // Re-read fresh (webhook.js's copy can be stale if a flag was set moments ago).
+  const fresh = await pool.query('SELECT ai_paused FROM hotel_leads WHERE id = $1', [lead.id]);
+  if (fresh.rows[0]?.ai_paused) {
+    await logAgentAction(lead.id, 'whatsapp_skipped_ai_paused', { detail: { message: incomingText }, decision: 'skipped' });
+    return { skipped: true, reason: 'ai_paused' };
   }
 
-  // Deterministic signal, kept — cheap and instant — but no longer short-circuits to one of two
-  // fixed sentences (see buildContext()'s handoffNote). It's fed into the same
-  // draft->score->revise->escalate pipeline as every other reply so the acknowledgment is
-  // actually worded around what the lead asked for, not a canned line.
-  const handoffReason = detectHandoffReason(incomingText);
   const { agent, campaign } = await resolveAgent(lead.id);
+  const conversationHistory = await getConversationHistory(lead.id);
+  const priorOutbound = conversationHistory.filter(t => t.direction === 'out').map(t => t.body);
 
   if (!agent) {
-    if (handoffReason) {
-      // No agent configured to draft an AI acknowledgment with — fall back to the old plain
-      // holding reply rather than going fully silent on a lead who explicitly asked for something.
-      await markNeedsAttention(lead.id, handoffReason);
-      const holdingReply = handoffReason === 'Asked for a callback'
-        ? "Thanks! I'll pass this to our team and someone will call you shortly."
-        : "Thanks for asking! I'll have our team send that over to you directly.";
-      const sent = await WABAService.sendTextMessage(lead.whatsapp_number, holdingReply);
-      if (sent.success) {
-        await pool.query(`INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
-          SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, holdingReply]);
-      }
-      await logAgentAction(lead.id, 'whatsapp_needs_attention', { detail: { reason: handoffReason, message: incomingText }, draftText: holdingReply, decision: 'handoff' });
-      await notifyOwner(lead, incomingText, handoffReason);
-      return { skipped: false, handoff: true, reason: handoffReason };
-    }
-    // Don't leave the lead sitting at 'new'/'responded' — runFollowUps() treats those as
-    // "still in play" and would keep re-sending the same (likely mismatched) template every
-    // 2 days until the 6-touch cap, even though this reply already went unanswered. Surface
-    // it for a human instead, per the no-guessing rule in resolveAgent() above.
     await pool.query(
-      `UPDATE hotel_leads SET status='needs_review', updated_at=NOW() WHERE id=$1 AND status IN ('new', 'responded')`,
+      `UPDATE hotel_leads SET status='needs_review', updated_at=NOW() WHERE id=$1 AND status IN ('new','responded','no_response')`,
       [lead.id]
     );
-    await markNeedsAttention(lead.id, 'No matching sales agent — needs manual review');
-    throw new Error('No sales agent is assigned to this campaign. Create an agent and assign it before enabling replies.');
+    await markNeedsAttention(lead.id, 'No matching sales agent — needs manual review', true);
+    await logAgentAction(lead.id, 'whatsapp_needs_attention', { detail: { reason: 'no_agent', message: incomingText }, decision: 'handoff' });
+    await notifyOwner(lead, incomingText, 'No sales agent — needs manual review');
+    return { skipped: false, handoff: true, reason: 'no_agent' };
+  }
+
+  // Safety gate first — buying signal / pricing / callback / help, or a message we can't
+  // read, pulls in a human. The deterministic regex is a cheap pre-check for the obvious ones.
+  const deterministicHandoff = detectHandoffReason(incomingText);
+  const { gate, reason: gateReason } = deterministicHandoff
+    ? { gate: 'HANDOFF', reason: deterministicHandoff }
+    : await classifyReplyIntent({ lead, message: incomingText, conversationHistory });
+
+  if (gate === 'NOT_INTERESTED') {
+    await pool.query(`UPDATE hotel_leads SET status='not_interested', updated_at=NOW() WHERE id=$1`, [lead.id]);
+    await logAgentAction(lead.id, 'whatsapp_not_interested', { detail: { message: incomingText }, decision: 'not_interested' });
+    return { skipped: true, reason: 'not_interested' };
+  }
+  if (gate === 'UNSURE') {
+    // Don't guess. Say nothing this turn, flag for a human, ping the owner.
+    await markNeedsAttention(lead.id, 'AI could not understand — please reply');
+    await logAgentAction(lead.id, 'whatsapp_unsure', { detail: { message: incomingText }, decision: 'queue_human' });
+    await notifyOwner(lead, incomingText, 'Lead reply the AI could not understand');
+    return { skipped: false, queued: true, reason: 'unsure' };
   }
 
   const memory = await getMemory(lead.id, agent.id);
-  const conversationHistory = await getConversationHistory(lead.id);
-
-  // Intent/stage/knowledge lookup is skipped for a handoff message — the reply is a scoped
-  // acknowledgment (buildContext()'s handoffNote), not a funnel-progressing pitch.
-  const { intent } = handoffReason
-    ? { intent: 'UNKNOWN' }
-    : await detectIntent({ agent, leadId: lead.id, message: incomingText, memory });
-  if (!handoffReason && intent === 'STOP') {
+  const { intent } = await detectIntent({ agent, leadId: lead.id, message: incomingText, memory });
+  if (intent === 'STOP') {
+    await pool.query(`UPDATE hotel_leads SET status='not_interested', updated_at=NOW() WHERE id=$1`, [lead.id]);
     await logAgentAction(lead.id, 'whatsapp_sequence_stopped', { detail: { reason: 'stop_intent' }, decision: 'stop' });
     return { skipped: true, reason: 'stop' };
   }
-  const stage = handoffReason ? null : await getStage(agent.id, memory, intent);
-  const knowledge = handoffReason ? [] : await getKnowledge(agent.id, stage?.stage_key, intent);
-  const extraContext = buildContext({ lead, campaign, memory, intent, stage, knowledge, handoffReason });
+  const stage = await getStage(agent.id, memory, intent);
+  const knowledge = await getKnowledge(agent.id, stage?.stage_key, intent);
+  // On HANDOFF the AI still replies (so the lead isn't left waiting) but must stay in its
+  // lane: acknowledge, promise a personal follow-up, don't quote prices or commit to anything.
+  const handoffGuard = gate === 'HANDOFF'
+    ? `\n\nThis lead asked for something a human teammate will handle personally (pricing, a call, a demo, or support). Reply warmly in 1-2 sentences: acknowledge exactly what they asked, and tell them a team member will personally follow up with them very shortly. Answer only what is factually in the knowledge above. Do NOT quote prices, discounts, or timelines, and do NOT promise anything specific.`
+    : '';
+  const extraContext = buildContext({ lead, campaign, memory, intent, stage, knowledge, handoffReason: null })
+    + handoffGuard
+    + `\n\nEVERY message already sent to this lead is below. NEVER repeat one or lightly reword it. `
+    + `If everything worth saying has already been said, return an empty string for "text" and we will bring in a human:\n`
+    + (priorOutbound.length ? priorOutbound.map(m => `- ${m}`).join('\n') : '(none yet)');
 
   const result = await ReplyQualityService.draftAndScore({
     channel: 'whatsapp', leadId: lead.id, lead, agent,
     incomingMessage: incomingText, conversationHistory, extraContext,
   });
+  const meta = result.meta || {};
 
   if (result.decision === 'queue_human') {
-    // The AI couldn't produce a confident reply — flag it and stay silent instead of guessing,
-    // same principle as the deterministic handoffs above, just driven by the quality gate.
     await pool.query(
       `INSERT INTO pending_approvals (type, lead_id, payload) VALUES ('whatsapp_low_score_reply', $1, $2)`,
       [lead.id, JSON.stringify({ draftText: result.text, score: result.score })]
     );
     await markNeedsAttention(lead.id, `AI reply needs review (scored ${result.score}/5)`);
-    await logAgentAction(lead.id, 'whatsapp_queued_for_review', { detail: { score: result.score, intent, handoffReason }, draftText: result.text, decision: 'queue_human' });
+    await logAgentAction(lead.id, 'whatsapp_queued_for_review', { detail: { score: result.score, intent, gate }, draftText: result.text, decision: 'queue_human' });
     await notifyOwner(lead, incomingText, 'AI reply needs your review before sending');
     return { skipped: false, queued: true, score: result.score };
   }
 
-  const meta = result.meta || {};
+  // Never send a repeat, a reword, or an empty reply — flag for a human instead of annoying the lead.
+  if (!result.text?.trim() || tooSimilarToPrior(result.text, priorOutbound)) {
+    await markNeedsAttention(lead.id, 'AI would only repeat itself — needs a human');
+    await logAgentAction(lead.id, 'whatsapp_no_new_reply', { detail: { draft: result.text, intent, gate }, decision: 'queue_human' });
+    await notifyOwner(lead, incomingText, 'Conversation needs a human — AI has nothing new to add');
+    return { skipped: false, queued: true, reason: 'would_repeat' };
+  }
+
   const sent = await WABAService.sendTextMessage(lead.whatsapp_number, result.text);
   if (!sent.success) throw new Error(sent.error || 'Could not send sales reply');
   await pool.query(`INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
     SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, result.text]);
   await saveMemory(lead.id, agent.id, { ...memory, ...meta.memory, current_stage: meta.memory?.current_stage || stage?.stage_key || memory.current_stage });
   await pool.query(`UPDATE outreach_logs SET lead_status_after=$1, qualified_for_demo=$2 WHERE id=(SELECT id FROM outreach_logs WHERE lead_id=$3 AND response_received=TRUE ORDER BY response_received_at DESC NULLS LAST LIMIT 1)`, [(meta.status || 'continue').toLowerCase(), meta.status === 'QUALIFIED', lead.id]);
-  await logAgentAction(lead.id, 'whatsapp_reply_sent', { detail: { intent, stage: stage?.stage_key || null, handoffReason }, draftText: result.text, decision: (meta.status || 'continue').toLowerCase() });
-  if (handoffReason) {
-    // The AI-drafted acknowledgment went out — a human still has to actually place the callback
-    // or send the real portfolio, so this still needs their attention.
-    await markNeedsAttention(lead.id, handoffReason);
-    await notifyOwner(lead, incomingText, handoffReason);
-  }
-  if (meta.status === 'QUALIFIED') {
-    await pool.query(`UPDATE hotel_leads SET status='demo_qualified', updated_at=NOW() WHERE id=$1`, [lead.id]);
-    await markNeedsAttention(lead.id, 'Qualified for demo');
-    await logAgentAction(lead.id, 'whatsapp_demo_qualified', { decision: 'qualified' });
-    await notifyOwner(lead, incomingText, 'Qualified for demo');
+  await logAgentAction(lead.id, 'whatsapp_reply_sent', { detail: { intent, gate, stage: stage?.stage_key || null }, draftText: result.text, decision: (meta.status || 'continue').toLowerCase() });
+
+  // The AI replied (customer isn't waiting). Now surface the lead for a human where warranted —
+  // the gate's HANDOFF, or the drafter's own WARM/QUALIFIED read. AI stays live in all these
+  // cases; only a human clicking "Take over" pauses it.
+  if (gate === 'HANDOFF' || meta.status === 'QUALIFIED' || meta.status === 'WARM') {
+    const why = gate === 'HANDOFF' ? (gateReason || 'Needs a human')
+      : meta.status === 'QUALIFIED' ? 'Qualified for demo' : 'Lead showing interest';
+    await markNeedsAttention(lead.id, why);
+    if (meta.status === 'QUALIFIED') await pool.query(`UPDATE hotel_leads SET status='demo_qualified', updated_at=NOW() WHERE id=$1`, [lead.id]);
+    await logAgentAction(lead.id, 'whatsapp_handoff', { detail: { why, gate, status: meta.status }, decision: 'handoff' });
+    await notifyOwner(lead, incomingText, why);
   }
   if (meta.status === 'NOT_INTERESTED') {
     await pool.query(`UPDATE hotel_leads SET status='not_interested', updated_at=NOW() WHERE id=$1`, [lead.id]);
@@ -386,7 +455,7 @@ async function handleReply(lead, incomingText) {
     const normalizedRedirect = normalizeIndianMobile(meta.redirectPhone);
     if (normalizedRedirect) await handleRedirectContact(lead, normalizedRedirect, meta.redirectLabel, campaign);
   }
-  return { ...result, meta, intent, stage: stage?.stage_key || null, handoffReason };
+  return { ...result, meta, intent, gate, stage: stage?.stage_key || null };
 }
 
 module.exports = { handleReply, logAgentAction };

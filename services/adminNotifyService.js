@@ -1,19 +1,11 @@
-const WABAService = require('./wabaService');
-const settingsService = require('./settingsService');
+const { alertOwner } = require('./ownerAlertService');
 
-// WhatsApp-only admin ping — reuses the same OWNER_WHATSAPP setting (Settings → App)
-// as the "qualified lead" alert in agentService.js, so no new config is needed.
+// WhatsApp-only admin ping. Routes through ownerAlertService so it goes out as an approved
+// template (delivers any time) instead of a free-text message that Meta drops unless the
+// owner happens to be inside a 24h window — the reason these never arrived for months.
 async function notifyAdmin(text) {
-  let ownerNumber = await settingsService.getSetting('OWNER_WHATSAPP');
-  if (!ownerNumber) {
-    console.log('[AdminNotify] OWNER_WHATSAPP not configured (Settings → App) — skipping notification');
-    return;
-  }
-  ownerNumber = ownerNumber.replace(/\D/g, '');
-  if (ownerNumber.length === 10) ownerNumber = '91' + ownerNumber;
-
-  const result = await WABAService.sendTextMessage(ownerNumber, text);
-  if (!result.success) console.error('[AdminNotify] Failed to send:', result.error);
+  const firstLine = String(text || '').split('\n').find(l => l.trim()) || 'Dreams CRM update';
+  await alertOwner(firstLine.replace(/[*_`>#]/g, '').slice(0, 60), text);
 }
 
 module.exports = { notifyAdmin };
