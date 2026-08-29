@@ -3,26 +3,36 @@ const pool = require('../config/db');
 const WABAService = require('../services/wabaService');
 const router = express.Router();
 
-// GET /api/inbox — conversations (one per lead who replied), sorted like a real messaging app:
-// by whichever happened most recently, their reply OR our own last outbound touch (not just
-// "latest reply" — a lead we followed up with after their last message would otherwise get
-// stuck showing as if nothing happened since). unread_count is genuine unread-message tracking:
-// replies received after hotel_leads.inbox_last_read_at (stamped when the thread is opened
-// below), the same mechanism a real WhatsApp/Gmail read receipt uses.
+// GET /api/inbox — one row per lead we've contacted on WhatsApp (NOT only leads who replied —
+// a messaging inbox shows every thread you've started). Newest activity first (their reply OR
+// our last send). Each row carries the last outbound message + its Meta delivery state
+// (error_message → failed, read_at → read, delivered_at → delivered, else sent) and, if any,
+// the latest inbound reply. Capped at 400 threads. unread_count counts replies that landed
+// after hotel_leads.inbox_last_read_at (stamped when the thread is opened).
 router.get('/', async (req, res) => {
   try {
     const result = await pool.query(`
-      WITH latest_reply AS (
+      WITH threads AS (
+        SELECT lead_id,
+               MAX(sent_at)               AS last_sent_at,
+               MAX(response_received_at)  AS last_reply_at,
+               bool_or(response_received) AS has_replied
+        FROM outreach_logs
+        GROUP BY lead_id
+      ),
+      last_out AS (
         SELECT DISTINCT ON (lead_id)
-          id, lead_id, campaign_id, template_id, waba_message_id,
-          sent_at, delivered_at, read_at, response_text, response_received_at,
-          qualified_for_demo, lead_status_after
+          lead_id, id, campaign_id, template_id, waba_message_id,
+          message_type, message_text, sent_at, delivered_at, read_at, error_message
+        FROM outreach_logs
+        ORDER BY lead_id, sent_at DESC
+      ),
+      last_reply AS (
+        SELECT DISTINCT ON (lead_id)
+          lead_id, response_text, response_received_at, qualified_for_demo, lead_status_after
         FROM outreach_logs
         WHERE response_received = true
         ORDER BY lead_id, response_received_at DESC
-      ),
-      last_outbound AS (
-        SELECT lead_id, MAX(sent_at) AS last_sent_at FROM outreach_logs GROUP BY lead_id
       ),
       unread AS (
         SELECT ol.lead_id, COUNT(*) AS unread_count
@@ -33,22 +43,30 @@ router.get('/', async (req, res) => {
         GROUP BY ol.lead_id
       )
       SELECT
-        lr.id, lr.lead_id, lr.campaign_id, lr.waba_message_id,
-        lr.sent_at, lr.delivered_at, lr.read_at, lr.response_text, lr.response_received_at,
-        lr.qualified_for_demo, lr.lead_status_after,
+        lo.id, t.lead_id, lo.campaign_id, lo.waba_message_id,
+        lo.sent_at, lo.delivered_at, lo.read_at, lo.error_message,
+        lo.message_type AS last_out_type,
+        left(CASE WHEN lo.message_type = 'template'
+             THEN COALESCE(NULLIF(lo.message_text, ''), wt.body_text)
+             ELSE lo.message_text END, 200) AS last_out_text,
+        lr.response_text, lr.response_received_at, lr.qualified_for_demo, lr.lead_status_after,
+        COALESCE(t.has_replied, false) AS has_replied,
         hl.hotel_name, hl.owner_name, hl.whatsapp_number, hl.city,
         hl.status AS lead_status, hl.archived_at,
         hl.needs_attention, hl.needs_attention_reason, hl.ai_paused,
-        c.campaign_name, t.template_name,
-        GREATEST(lr.response_received_at, lo.last_sent_at) AS last_activity_at,
+        c.campaign_name,
+        GREATEST(t.last_reply_at, t.last_sent_at) AS last_activity_at,
         COALESCE(u.unread_count, 0)::int AS unread_count
-      FROM latest_reply lr
-      JOIN hotel_leads hl ON hl.id = lr.lead_id
-      LEFT JOIN campaigns c ON c.id = lr.campaign_id
-      LEFT JOIN waba_templates t ON t.id = lr.template_id
-      LEFT JOIN last_outbound lo ON lo.lead_id = lr.lead_id
-      LEFT JOIN unread u ON u.lead_id = lr.lead_id
-      ORDER BY last_activity_at DESC
+      FROM threads t
+      JOIN hotel_leads hl   ON hl.id = t.lead_id
+      JOIN last_out lo      ON lo.lead_id = t.lead_id
+      LEFT JOIN last_reply lr    ON lr.lead_id = t.lead_id
+      LEFT JOIN waba_templates wt ON wt.id = lo.template_id
+      LEFT JOIN campaigns c      ON c.id = lo.campaign_id
+      LEFT JOIN unread u         ON u.lead_id = t.lead_id
+      WHERE (hl.channel = 'whatsapp' OR hl.channel IS NULL)
+      ORDER BY last_activity_at DESC NULLS LAST
+      LIMIT 400
     `);
 
     res.json(result.rows);
