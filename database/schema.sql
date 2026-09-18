@@ -264,6 +264,7 @@ CREATE TABLE IF NOT EXISTS lead_sequences (
     next_run_at TIMESTAMP,
     status VARCHAR(30) DEFAULT 'active', -- 'active', 'paused', 'waiting_estimate', 'dead'
     paused_reason TEXT,
+    send_fail_count INT DEFAULT 0, -- consecutive send failures; capped retry before giving up (sequenceEmailWorker.js)
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

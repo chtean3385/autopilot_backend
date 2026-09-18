@@ -329,6 +329,9 @@ async function initDB() {
     );
     ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP;
     ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS tracking_token VARCHAR(64);
+    -- Consecutive send-failure tracking (database/migrate_sequence_send_fail_tracking.sql) — caps
+    -- retries on a transient send error instead of retrying forever.
+    ALTER TABLE lead_sequences ADD COLUMN IF NOT EXISTS send_fail_count INT DEFAULT 0;
     -- Open-count tracking (database/migrate_research_worker_and_open_tracking.sql) — opened_at
     -- above stays first-open-only; these track repeat opens for the "opened Nx" UI badge.
     ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS open_count INT DEFAULT 0;

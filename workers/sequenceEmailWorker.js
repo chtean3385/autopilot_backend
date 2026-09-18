@@ -22,6 +22,12 @@ const BATCH_SIZE = 50;
 const SEND_DELAY_MS = 1500;
 const COMPOSE_MAX_ATTEMPTS = 2; // 1 draft + 1 feedback-driven revision, bounded for a 50-lead batch
 const PRIOR_EMAILS_LIMIT = 5;
+const MAX_SEND_FAIL_ATTEMPTS = 3; // same cap convention as RESEARCH_MAX_ATTEMPTS / mails.so's 3 verify retries
+// How long to wait for Brevo's `delivered` webhook before sending a follow-up anyway. Not every
+// receiving mail server generates a delivery confirmation, so silence past this point is treated
+// as "probably fine" rather than blocking the lead forever — an explicit bounce still kills the
+// sequence immediately via routes/brevoWebhook.js, long before this timeout matters.
+const DELIVERY_CONFIRM_TIMEOUT_HOURS = 24;
 
 let isRunning = false;
 
@@ -243,6 +249,39 @@ async function processRow(row, sequenceCapTracker) {
     return 'stopped';
   }
 
+  // Delivery gate: don't send a follow-up (step > 0) blind — confirm the previous email in this
+  // sequence was actually delivered first. A "sent" row just means Brevo's API accepted it
+  // synchronously; delivered_at is only stamped once Brevo's webhook confirms real delivery. An
+  // async bounce already kills the sequence via routes/brevoWebhook.js before this ever runs
+  // again, so reaching here with neither delivered_at nor bounced_at just means "no webhook event
+  // yet" — wait a few hours and recheck, but give up waiting past DELIVERY_CONFIRM_TIMEOUT_HOURS
+  // since not every recipient server fires a delivery confirmation at all.
+  if (row.current_step > 0) {
+    const lastSent = await pool.query(
+      `SELECT delivered_at, bounced_at, sent_at FROM email_logs
+       WHERE lead_id = $1 AND sequence_id = $2 AND direction = 'out' AND error IS NULL
+       ORDER BY COALESCE(sent_at, created_at) DESC LIMIT 1`,
+      [leadId, sequenceId]
+    );
+    const last = lastSent.rows[0];
+    if (last?.bounced_at) {
+      console.log(`[SequenceEmail] Lead ${leadId} — previous email bounced, stopping sequence`);
+      await killSequence(leadSequenceId, leadId, 'bounced');
+      return 'stopped';
+    }
+    if (last && !last.delivered_at) {
+      const hoursSinceSent = (Date.now() - new Date(last.sent_at).getTime()) / 3600000;
+      if (hoursSinceSent < DELIVERY_CONFIRM_TIMEOUT_HOURS) {
+        console.log(`[SequenceEmail] Lead ${leadId} — previous email not yet confirmed delivered (${hoursSinceSent.toFixed(1)}h ago) — waiting`);
+        await pool.query(
+          `UPDATE lead_sequences SET next_run_at = NOW() + INTERVAL '3 hours', updated_at = NOW() WHERE id = $1`,
+          [leadSequenceId]
+        );
+        return 'awaiting_delivery';
+      }
+    }
+  }
+
   // Research gate: a lead with a website must have completed research before ANY email goes out
   // — workers/researchWorker.js front-loads that crawl on its own 5-min cron, well ahead of send
   // time, so this just reads whatever's cached rather than triggering a crawl inline. A lead with
@@ -344,12 +383,35 @@ async function processRow(row, sequenceCapTracker) {
       [leadId, sender.id, sequenceId, composed.subject, html, sendResult.error]
     );
     await pool.query(
-      `UPDATE lead_sequences SET next_run_at = NOW() + INTERVAL '1 hour', updated_at = NOW() WHERE id = $1`,
-      [leadSequenceId]
-    );
-    await pool.query(
       `INSERT INTO agent_actions (lead_id, action, detail, draft_text, decision) VALUES ($1, 'draft_sent', $2, $3, 'error')`,
       [leadId, JSON.stringify({ error: sendResult.error, sequenceId }), composed.body]
+    );
+
+    // A 400 rejecting the "to" address itself (malformed/nonexistent recipient — e.g. Brevo's
+    // "email is not valid in to") is permanent: retrying sends the identical address again and
+    // will fail identically forever, just burning API calls and worker time. Stop chasing
+    // immediately instead of the hourly retry below, same as a confirmed bounce.
+    const isInvalidRecipient = sendResult.status === 400 &&
+      /not valid|invalid.*(email|recipient|to\b)|does not exist|no such (user|recipient|mailbox)|mailbox.*(unavailable|not found)/i.test(sendResult.error || '');
+    if (isInvalidRecipient) {
+      console.log(`[SequenceEmail] Lead ${leadId} — permanent recipient rejection, stopping sequence: ${sendResult.error}`);
+      await pool.query(`UPDATE hotel_leads SET email_status = 'bounced', updated_at = NOW() WHERE id = $1`, [leadId]);
+      await SuppressionService.addToSuppression(row.lead_email, 'invalid_email');
+      await killSequence(leadSequenceId, leadId, 'invalid_email');
+      return 'stopped';
+    }
+
+    // Anything else (network blip, provider outage, rate limit) is treated as transient — retry
+    // hourly, but only up to MAX_SEND_FAIL_ATTEMPTS total before giving up on this lead too.
+    const failCount = (row.send_fail_count || 0) + 1;
+    if (failCount >= MAX_SEND_FAIL_ATTEMPTS) {
+      console.log(`[SequenceEmail] Lead ${leadId} — ${failCount} consecutive send failures, giving up`);
+      await killSequence(leadSequenceId, leadId, 'send_failed');
+      return 'stopped';
+    }
+    await pool.query(
+      `UPDATE lead_sequences SET send_fail_count = $1, next_run_at = NOW() + INTERVAL '1 hour', updated_at = NOW() WHERE id = $2`,
+      [failCount, leadSequenceId]
     );
     return 'failed';
   }
@@ -364,7 +426,7 @@ async function processRow(row, sequenceCapTracker) {
 
   await pool.query(
     `UPDATE lead_sequences
-     SET current_step = current_step + 1, next_run_at = $1, sender_id = $2, updated_at = NOW()
+     SET current_step = current_step + 1, next_run_at = $1, sender_id = $2, send_fail_count = 0, updated_at = NOW()
      WHERE id = $3`,
     [nextRunAt, sender.id, leadSequenceId]
   );
@@ -404,7 +466,7 @@ async function runSequenceWorker(trigger = 'cron') {
 
   isRunning = true;
 
-  const stats = { due: 0, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, awaitingResearch: 0, deferred: 0, failed: 0 };
+  const stats = { due: 0, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, awaitingResearch: 0, awaitingDelivery: 0, deferred: 0, failed: 0 };
 
   try {
     await SequenceService.resetStaleCounters();
@@ -441,6 +503,7 @@ async function runSequenceWorker(trigger = 'cron') {
         else if (outcome === 'capacity_skip') stats.capacitySkip++;
         else if (outcome === 'no_sender') stats.noSender++;
         else if (outcome === 'awaiting_research') stats.awaitingResearch++;
+        else if (outcome === 'awaiting_delivery') stats.awaitingDelivery++;
         else if (outcome === 'deferred') stats.deferred++;
         else if (outcome === 'failed') stats.failed++;
         await new Promise(resolve => setTimeout(resolve, SEND_DELAY_MS));
@@ -466,6 +529,7 @@ async function runSequenceWorker(trigger = 'cron') {
       (stats.capacitySkip ? `⏳ Skipped — daily cap reached: ${stats.capacitySkip}\n` : '') +
       (stats.noSender ? `⚠️ Skipped — no sender capacity: ${stats.noSender}\n` : '') +
       (stats.awaitingResearch ? `🔬 Waiting on website research: ${stats.awaitingResearch}\n` : '') +
+      (stats.awaitingDelivery ? `📬 Waiting on delivery confirmation: ${stats.awaitingDelivery}\n` : '') +
       (stats.failed ? `⚠️ Send failures: ${stats.failed}\n` : '') +
       (stats.error ? `❌ Error: ${stats.error}\n` : '')
     );
@@ -505,22 +569,24 @@ async function runSequenceForLead(leadId) {
     // requirement that a lead with a website be researched before it gets emailed.
     const outcome = await processRow(row, new Map());
 
-    const stats = { due: 1, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, awaitingResearch: 0, deferred: 0, failed: 0, leadId };
+    const stats = { due: 1, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, awaitingResearch: 0, awaitingDelivery: 0, deferred: 0, failed: 0, leadId };
     if (outcome === 'sent') stats.sent = 1;
     else if (outcome === 'stopped') stats.stopped = 1;
     else if (outcome === 'no_sender') stats.noSender = 1;
     else if (outcome === 'awaiting_research') stats.awaitingResearch = 1;
+    else if (outcome === 'awaiting_delivery') stats.awaitingDelivery = 1;
     else if (outcome === 'deferred') stats.deferred = 1;
     else if (outcome === 'failed') stats.failed = 1;
     await SchedulerStatusService.recordRun('email_sequences', 'manual_lead', stats);
 
     const messages = {
       sent: `Step ${stepBefore + 1} sent to ${row.lead_email}.`,
-      stopped: 'Sequence was stopped — the lead is bounced, suppressed, or has no email.',
+      stopped: 'Sequence was stopped — the lead is bounced, suppressed, invalid, or has no email.',
       no_sender: 'No sender capacity right now (daily caps / warmup ramp) — try later or raise the sender cap.',
       awaiting_research: 'This lead has a website but hasn\'t been researched yet — workers/researchWorker.js checks every 5 minutes, or click "Research Now" on the lead to run it immediately.',
+      awaiting_delivery: `The previous email hasn't been confirmed delivered yet — waiting up to ${DELIVERY_CONFIRM_TIMEOUT_HOURS}h for Brevo's delivery webhook before sending the next step anyway.`,
       deferred: 'Email composition failed — it will retry automatically in 1 hour.',
-      failed: 'Send failed — check the email logs for the provider error.',
+      failed: 'Send failed — will retry, up to 3 attempts before the sequence stops.',
     };
     if (outcome === 'no_sender') {
       // Spell out exactly which sender is blocked and why — "no capacity" alone is useless

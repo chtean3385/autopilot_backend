@@ -231,7 +231,7 @@ class EmailSenderService {
       return { success: true, messageId };
     } catch (error) {
       console.error('[EmailSender] send error:', error.response?.data || error.message);
-      return { success: false, error: error.response?.data?.message || error.message };
+      return { success: false, error: error.response?.data?.message || error.message, status: error.response?.status || null };
     }
   }
 }
