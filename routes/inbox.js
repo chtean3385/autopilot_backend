@@ -253,15 +253,18 @@ router.put('/:leadId/attention', async (req, res) => {
   }
 });
 
-// GET /api/inbox/count — unread badge count (archived conversations don't count)
+// GET /api/inbox/count — unread badge count (archived conversations don't count). A lead only
+// counts if it has a reply that arrived after the thread was last opened (inbox_last_read_at) —
+// mirrors the per-row `unread` calculation in GET / above, so the top-nav badge and each
+// conversation's own unread indicator agree, and actually clears once you've read a thread.
 router.get('/count', async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT COUNT(*) AS count
+      SELECT COUNT(DISTINCT ol.lead_id) AS count
       FROM outreach_logs ol
       JOIN hotel_leads hl ON hl.id = ol.lead_id
       WHERE ol.response_received = true
-        AND (ol.lead_status_after IS NULL OR ol.lead_status_after = 'responded')
+        AND ol.response_received_at > COALESCE(hl.inbox_last_read_at, '-infinity'::timestamp)
         AND hl.archived_at IS NULL
     `);
     res.json({ count: parseInt(result.rows[0].count, 10) });

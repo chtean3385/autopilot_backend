@@ -30,17 +30,21 @@ function attachScores(messages, scoredActions) {
   return messages;
 }
 
-// GET /api/email-conversations/count — badge count: conversations where the lead replied
-// last and nothing has gone out since (mirrors /api/inbox/count's "waiting on us" idea).
+// GET /api/email-conversations/count — unread badge count: the lead's latest message is an
+// inbound reply that arrived after the thread was last opened (email_last_read_at). Mirrors
+// /api/inbox/count's logic so the badge actually clears once you've read a thread.
 router.get('/count', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT COUNT(*) AS count FROM (
-        SELECT DISTINCT ON (lead_id) lead_id, direction
-        FROM email_logs
-        ORDER BY lead_id, COALESCE(sent_at, created_at) DESC
+        SELECT DISTINCT ON (el.lead_id) el.lead_id, el.direction,
+               COALESCE(el.sent_at, el.created_at) AS last_at, hl.email_last_read_at
+        FROM email_logs el
+        JOIN hotel_leads hl ON hl.id = el.lead_id
+        ORDER BY el.lead_id, COALESCE(el.sent_at, el.created_at) DESC
       ) latest
       WHERE direction = 'in'
+        AND last_at > COALESCE(email_last_read_at, '-infinity'::timestamp)
     `);
     res.json({ count: parseInt(result.rows[0].count, 10) });
   } catch (err) {
@@ -83,12 +87,14 @@ router.get('/', async (req, res) => {
 });
 
 // GET /api/email-conversations/thread/:leadId — full thread + agent scores + sequence status
+// Opening the thread is the "read receipt" moment — stamping email_last_read_at here is what
+// clears this lead's unread badge in GET /count below, mirroring routes/inbox.js's pattern.
 router.get('/thread/:leadId', async (req, res) => {
   try {
     const { leadId } = req.params;
 
     const [leadRes, logsRes, seqRes, scoredActionsRes, researchRes, actionsRes] = await Promise.all([
-      pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId]),
+      pool.query('UPDATE hotel_leads SET email_last_read_at = NOW() WHERE id = $1 RETURNING *', [leadId]),
       pool.query(
         `SELECT * FROM email_logs WHERE lead_id = $1 ORDER BY COALESCE(sent_at, created_at) ASC`,
         [leadId]

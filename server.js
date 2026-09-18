@@ -256,6 +256,8 @@ async function initDB() {
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS last_research_attempt_at TIMESTAMP;
     -- WhatsApp Inbox unread tracking (database/migrate_inbox_unread_tracking.sql)
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS inbox_last_read_at TIMESTAMP;
+    -- Email Conversations unread tracking (database/migrate_email_unread_tracking.sql)
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_last_read_at TIMESTAMP;
     CREATE UNIQUE INDEX IF NOT EXISTS hotel_leads_email_unique_idx
       ON hotel_leads (LOWER(email))
       WHERE email IS NOT NULL AND email <> '';

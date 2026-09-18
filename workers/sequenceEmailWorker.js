@@ -417,7 +417,7 @@ async function runSequenceWorker(trigger = 'cron') {
        JOIN hotel_leads hl ON hl.id = ls.lead_id
        JOIN sequences s ON s.id = ls.sequence_id
        WHERE ls.next_run_at <= NOW() AND ls.status = 'active' AND s.active = TRUE
-       ORDER BY ls.next_run_at ASC
+       ORDER BY (ls.current_step = 0) DESC, ls.next_run_at ASC
        LIMIT $1`,
       [BATCH_SIZE]
     );

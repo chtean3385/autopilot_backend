@@ -50,16 +50,40 @@ class EmailSenderService {
       values.push(value);
     };
 
+    // A blank password in an edit means "leave it as-is", not "erase it" — the frontend never
+    // round-trips the real secret back into the form, so an untouched password field always
+    // submits blank. Without this merge, saving ANY change to a sender (even just the label)
+    // would silently wipe its stored IMAP/SMTP password.
+    let existing = null;
+    const needsExisting = (data.imap_config && !data.imap_config.pass) || (data.smtp_config && !data.smtp_config.pass) || data.api_key === '';
+    if (needsExisting) existing = await this.getById(id);
+
     if (data.label !== undefined) set('label', data.label);
     if (data.provider !== undefined) set('provider', data.provider);
-    if (data.api_key !== undefined) set('api_key', data.api_key);
-    if (data.smtp_config !== undefined) set('smtp_config', data.smtp_config ? JSON.stringify(data.smtp_config) : null);
+    if (data.api_key !== undefined) {
+      set('api_key', data.api_key === '' ? (existing?.api_key ?? null) : data.api_key);
+    }
+    if (data.smtp_config !== undefined) {
+      let smtpConfig = data.smtp_config;
+      if (smtpConfig && !smtpConfig.pass) {
+        const existingSmtp = typeof existing?.smtp_config === 'string' ? JSON.parse(existing.smtp_config || '{}') : (existing?.smtp_config || {});
+        smtpConfig = { ...smtpConfig, pass: existingSmtp.pass };
+      }
+      set('smtp_config', smtpConfig ? JSON.stringify(smtpConfig) : null);
+    }
     if (data.from_name !== undefined) set('from_name', data.from_name);
     if (data.from_email !== undefined) set('from_email', data.from_email);
     if (data.sending_domain !== undefined) set('sending_domain', data.sending_domain);
     if (data.daily_cap !== undefined) set('daily_cap', data.daily_cap);
     if (data.warmup_started_at !== undefined) set('warmup_started_at', data.warmup_started_at);
-    if (data.imap_config !== undefined) set('imap_config', data.imap_config ? JSON.stringify(data.imap_config) : null);
+    if (data.imap_config !== undefined) {
+      let imapConfig = data.imap_config;
+      if (imapConfig && !imapConfig.pass) {
+        const existingImap = typeof existing?.imap_config === 'string' ? JSON.parse(existing.imap_config || '{}') : (existing?.imap_config || {});
+        imapConfig = { ...imapConfig, pass: existingImap.pass };
+      }
+      set('imap_config', imapConfig ? JSON.stringify(imapConfig) : null);
+    }
     if (data.status !== undefined) set('status', data.status);
 
     if (fields.length === 0) return this.getById(id);
