@@ -64,7 +64,9 @@ router.get('/', async (req, res) => {
       LEFT JOIN waba_templates wt ON wt.id = lo.template_id
       LEFT JOIN campaigns c      ON c.id = lo.campaign_id
       LEFT JOIN unread u         ON u.lead_id = t.lead_id
-      WHERE (hl.channel = 'whatsapp' OR hl.channel IS NULL)
+      -- No channel filter: threads come only from outreach_logs (WhatsApp sends/replies), so any
+      -- lead here has a WhatsApp conversation — including email-channel leads that were also
+      -- targeted by a WhatsApp campaign (hidden entirely before 2026-10-07).
       ORDER BY last_activity_at DESC NULLS LAST
       LIMIT 400
     `);
