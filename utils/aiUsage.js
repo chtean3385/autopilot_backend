@@ -86,6 +86,12 @@ async function trackedCompletion(client, params, { purpose, leadId = null } = {}
   const t0 = Date.now();
   try {
     await assertWithinBudget();
+    // Every OpenAI client in the codebase is built once at module load from .env's
+    // OPENAI_API_KEY, so a key changed in Manage → Settings was never used. Read the live
+    // value (settings table first, .env fallback) on each call and swap it onto the client.
+    const { getSetting } = require('../services/settingsService');
+    const liveKey = await getSetting('OPENAI_API_KEY');
+    if (liveKey && client.apiKey !== liveKey) client.apiKey = liveKey;
     response = await client.chat.completions.create(params);
   } catch (err) {
     if (isBillingError(err)) aiUnavailableUntil = Date.now() + AI_UNAVAILABLE_COOLDOWN_MS;
