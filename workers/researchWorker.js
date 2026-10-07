@@ -1,6 +1,7 @@
 const schedule = require('node-schedule');
 const pool = require('../config/db');
 const { getOrCreateResearch, RESEARCH_MAX_ATTEMPTS } = require('../services/leadResearchService');
+const { isAiAvailable } = require('../utils/aiUsage');
 
 // Front-loads website research for sequence-enrolled leads, decoupled from send time.
 // Previously sequenceEmailWorker.js crawled a lead's site inline the moment its first email
@@ -47,6 +48,10 @@ async function runResearchPass() {
 
     stats.candidates = result.rows.length;
     if (stats.candidates === 0) return stats;
+    if (!isAiAvailable()) {
+      console.log('[ResearchWorker] OpenAI out of credit/budget — skipping pass (no attempts used)');
+      return stats;
+    }
 
     console.log(`[ResearchWorker] Researching ${stats.candidates} lead(s)...`);
 
@@ -63,6 +68,16 @@ async function runResearchPass() {
       } catch (err) {
         console.error(`[ResearchWorker] Research failed for lead ${lead.id}:`, err.message);
         stats.failed++;
+      }
+      // The failure was OpenAI billing (no credit / budget cap), not this lead — give the
+      // attempt back and stop the pass instead of burning every remaining lead's attempts too.
+      if (!isAiAvailable()) {
+        await pool.query(
+          `UPDATE hotel_leads SET research_attempts = GREATEST(COALESCE(research_attempts, 1) - 1, 0) WHERE id = $1`,
+          [lead.id]
+        );
+        console.log('[ResearchWorker] OpenAI out of credit/budget — attempt refunded, stopping pass');
+        break;
       }
       await sleep(DELAY_BETWEEN_LEADS_MS);
     }

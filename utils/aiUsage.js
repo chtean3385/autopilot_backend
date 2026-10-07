@@ -66,10 +66,32 @@ async function assertWithinBudget() {
 // Drop-in replacement for client.chat.completions.create(params): identical return value and
 // error behavior, plus one ai_usage_logs row per successful response. The INSERT is wrapped in
 // its own try/catch — a logging failure must never break the AI call that paid for the tokens.
+// Set when OpenAI says the account is out of credit (429 "no credits"/insufficient_quota) or our
+// own budget cap trips — a billing outage, not a verdict on any lead. Workers that count failed
+// attempts per lead (researchWorker.js) check isAiAvailable() so an outage doesn't burn them.
+const AI_UNAVAILABLE_COOLDOWN_MS = 15 * 60 * 1000;
+let aiUnavailableUntil = 0;
+
+function isBillingError(err) {
+  return err?.code === 'budget_exceeded' || err?.code === 'insufficient_quota' ||
+    (err?.status === 429 && /credits|quota|billing/i.test(err?.message || ''));
+}
+
+function isAiAvailable() {
+  return Date.now() >= aiUnavailableUntil;
+}
+
 async function trackedCompletion(client, params, { purpose, leadId = null } = {}) {
-  await assertWithinBudget();
+  let response;
   const t0 = Date.now();
-  const response = await client.chat.completions.create(params);
+  try {
+    await assertWithinBudget();
+    response = await client.chat.completions.create(params);
+  } catch (err) {
+    if (isBillingError(err)) aiUnavailableUntil = Date.now() + AI_UNAVAILABLE_COOLDOWN_MS;
+    throw err;
+  }
+  aiUnavailableUntil = 0;
   const durationMs = Date.now() - t0;
 
   try {
@@ -97,4 +119,4 @@ async function trackedCompletion(client, params, { purpose, leadId = null } = {}
   return response;
 }
 
-module.exports = { trackedCompletion, computeCost, PRICING };
+module.exports = { trackedCompletion, computeCost, PRICING, isAiAvailable };
