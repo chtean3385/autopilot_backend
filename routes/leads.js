@@ -6,6 +6,7 @@ const { parseLeadsFile } = require('../services/importService');
 const { findEmail } = require('../services/enrichmentService');
 const { getOrCreateResearch } = require('../services/leadResearchService');
 const pool = require('../config/db');
+const { verifyEmail } = require('../services/emailVerifierService');
 const router = express.Router();
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -446,6 +447,57 @@ router.post('/bulk-email-status', async (req, res) => {
       [email_status, ids]
     );
     res.json({ success: true, updated: result.rowCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// On-demand mails.so check for selected leads (Leads → bulk bar → "Verify via mails.so") —
+// same verifyEmail() + status mapping as workers/emailVerificationWorker.js, but ignores its
+// 3-attempt cap so an admin can re-check after topping up credit. A lead that comes back bad
+// also has its active sequences stopped, since the send worker only skips bounced/unsubscribed.
+// Capped per request so a run stays well inside nginx's 300s /api/ timeout.
+const VERIFY_MAX_PER_REQUEST = 100;
+router.post('/verify-emails', async (req, res) => {
+  const { ids } = req.body;
+  if (!ids?.length) return res.status(400).json({ error: 'No ids provided' });
+  if (ids.length > VERIFY_MAX_PER_REQUEST) {
+    return res.status(400).json({ error: `Select at most ${VERIFY_MAX_PER_REQUEST} leads per run` });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, email FROM hotel_leads WHERE id = ANY($1::int[]) AND email IS NOT NULL AND email <> ''`,
+      [ids]
+    );
+    const counts = { verified: 0, unverifiable: 0, error: 0, skipped: ids.length - rows.length, sequencesStopped: 0 };
+    const results = [];
+    for (const lead of rows) {
+      const verification = await verifyEmail(lead.email);
+      if (verification.status === 'error') {
+        counts.error++;
+        results.push({ id: lead.id, email: lead.email, result: 'error' });
+        continue;
+      }
+      const newStatus = verification.valid ? 'verified' : 'unverifiable';
+      counts[newStatus]++;
+      await pool.query(
+        `UPDATE hotel_leads
+         SET email_status = $1, email_verify_attempts = COALESCE(email_verify_attempts, 0) + 1,
+             last_verify_attempt_at = NOW(), updated_at = NOW()
+         WHERE id = $2`,
+        [newStatus, lead.id]
+      );
+      if (newStatus === 'unverifiable') {
+        const stopped = await pool.query(
+          `UPDATE lead_sequences SET status = 'dead', paused_reason = 'unverifiable', updated_at = NOW()
+           WHERE lead_id = $1 AND status = 'active'`,
+          [lead.id]
+        );
+        counts.sequencesStopped += stopped.rowCount;
+      }
+      results.push({ id: lead.id, email: lead.email, result: verification.status, email_status: newStatus });
+    }
+    res.json({ success: true, counts, results });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

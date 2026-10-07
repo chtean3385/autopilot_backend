@@ -1,6 +1,7 @@
 const express = require('express');
 const pool = require('../config/db');
 const WABAService = require('../services/wabaService');
+const { getSetting } = require('../services/settingsService');
 const router = express.Router();
 
 // Overview stats + per-campaign breakdown
@@ -147,7 +148,7 @@ router.get('/email', async (req, res) => {
 // are "cost of priced calls"; token counts are always complete.
 router.get('/ai-usage', async (req, res) => {
   try {
-    const [totalsRes, byPurposeRes, byModelRes, byDayRes, recentRes] = await Promise.all([
+    const [totalsRes, byPurposeRes, byModelRes, byDayRes, recentRes, byMonthRes, budgetSetting] = await Promise.all([
       pool.query(`
         SELECT
           COUNT(*)::int                                                        AS calls,
@@ -198,7 +199,25 @@ router.get('/ai-usage', async (req, res) => {
         ORDER BY u.created_at DESC
         LIMIT 50
       `),
+      // Monthly billing history (calendar months, DB time) — same window the budget cap in
+      // utils/aiUsage.js enforces against.
+      pool.query(`
+        SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
+          COUNT(*)::int                               AS calls,
+          COALESCE(SUM(prompt_tokens), 0)::bigint     AS prompt_tokens,
+          COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens,
+          SUM(cost_usd)                               AS cost_usd
+        FROM ai_usage_logs
+        GROUP BY 1
+        ORDER BY 1 DESC
+        LIMIT 24
+      `),
+      getSetting('OPENAI_MONTHLY_BUDGET_USD'),
     ]);
+    const budgetUsd = Number(budgetSetting) || 10;
+    const spentThisMonth = Number((await pool.query(
+      `SELECT COALESCE(SUM(cost_usd), 0) AS spent FROM ai_usage_logs WHERE created_at >= date_trunc('month', NOW())`
+    )).rows[0].spent);
 
     res.json({
       totals: totalsRes.rows[0],
@@ -206,6 +225,8 @@ router.get('/ai-usage', async (req, res) => {
       byModel: byModelRes.rows,
       byDay: byDayRes.rows,
       recent: recentRes.rows,
+      byMonth: byMonthRes.rows,
+      budget: { budget_usd: budgetUsd, spent_this_month_usd: spentThisMonth },
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
