@@ -39,10 +39,35 @@ function computeCost(model, usage) {
   return (promptTokens * price.input + completionTokens * price.output) / 1_000_000;
 }
 
+// Hard monthly spend cap (added 2026-10-07): every GPT call is refused once this calendar
+// month's logged cost_usd reaches OPENAI_MONTHLY_BUDGET_USD (settings table, default $10).
+// Callers already treat a thrown OpenAI error as "try again later", so hitting the cap just
+// pauses AI work until the 1st. Cached 60s so we don't SUM the table on every call. Only
+// counts this app's logged calls — the OpenAI dashboard's own usage limit is the backstop.
+const DEFAULT_MONTHLY_BUDGET_USD = 10;
+let budgetCache = { at: 0, spent: 0, budget: DEFAULT_MONTHLY_BUDGET_USD };
+
+async function assertWithinBudget() {
+  if (Date.now() - budgetCache.at > 60000) {
+    const { getSetting } = require('../services/settingsService');
+    const budget = Number(await getSetting('OPENAI_MONTHLY_BUDGET_USD')) || DEFAULT_MONTHLY_BUDGET_USD;
+    const result = await pool.query(
+      `SELECT COALESCE(SUM(cost_usd), 0) AS spent FROM ai_usage_logs WHERE created_at >= date_trunc('month', NOW())`
+    );
+    budgetCache = { at: Date.now(), spent: Number(result.rows[0].spent), budget };
+  }
+  if (budgetCache.spent >= budgetCache.budget) {
+    const err = new Error(`OpenAI monthly budget reached ($${budgetCache.spent.toFixed(2)} of $${budgetCache.budget}) — AI paused until next month`);
+    err.code = 'budget_exceeded';
+    throw err;
+  }
+}
+
 // Drop-in replacement for client.chat.completions.create(params): identical return value and
 // error behavior, plus one ai_usage_logs row per successful response. The INSERT is wrapped in
 // its own try/catch — a logging failure must never break the AI call that paid for the tokens.
 async function trackedCompletion(client, params, { purpose, leadId = null } = {}) {
+  await assertWithinBudget();
   const t0 = Date.now();
   const response = await client.chat.completions.create(params);
   const durationMs = Date.now() - t0;
