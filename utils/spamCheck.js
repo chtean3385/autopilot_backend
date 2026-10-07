@@ -30,9 +30,18 @@ const SPAM_PATTERNS = [
   { label: 'winner / you won', pattern: /\bwinner\b|\byou (have )?won\b/i },
   { label: 'millions of dollars/rupees', pattern: /\bmillions? (of )?(dollars|rupees)\b/i },
   { label: 'exclusive deal', pattern: /\bexclusive (deal|offer)\b/i },
-  { label: "don't miss", pattern: /\bdon'?t miss\b/i },
+  { label: "don't miss", pattern: /\bdon['’]?t miss\b/i },
   { label: 'lowest/best price', pattern: /\b(lowest|best) price\b/i },
   { label: 'satisfaction guaranteed', pattern: /\bsatisfaction guaranteed\b/i },
+  // Not spam-filter triggers, but the stock cold-email phrases that get these opened and ignored
+  // (added 2026-10-07) — routed through the same one-recompose lint loop.
+  { label: '"hope this finds you well"', pattern: /\bhope (this|my) (message|email|note)? ?finds you\b/i },
+  { label: '"hope you\'re doing well"', pattern: /\bhope you(['’]| a)re (doing )?well\b/i },
+  { label: '"circle back"', pattern: /\bcircl(e|ing) back\b/i },
+  { label: '"just following up"', pattern: /\bjust (following|checking) (up|in)\b/i },
+  { label: '"I wanted to reach out"', pattern: /\bwanted to reach out\b/i },
+  { label: '"we specialize in"', pattern: /\bwe speciali[sz]e in\b/i },
+  { label: 'jargon (streamline/leverage/enhance/cohesive/seamless)', pattern: /\b(streamlin\w*|leverag\w*|enhanc\w*|cohesive|seamless\w*)\b/i },
 ];
 
 function checkSpamContent(subject, body) {

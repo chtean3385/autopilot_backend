@@ -172,12 +172,26 @@ async function scoreReply(context, draftText) {
 // personalization grounded in real research (not generic), a clear single CTA, appropriate
 // brevity for a cold email, and — for follow-ups — genuinely reads as a fresh touch rather
 // than a repeat of an earlier one in the thread.
+// What a "5" looks like depends on the step — mirrors the three stage notes in
+// sequenceEmailWorker.js buildSystemPrompt, so a correct last-touch "close your file?" email
+// isn't marked down for not opening with a business question and recomposed for nothing.
 function buildColdEmailScorePrompt(stepNumber) {
-  const stageNote = stepNumber === 0
-    ? 'This is a FIRST cold outreach email (no prior emails sent to this lead).'
-    : `This is FOLLOW-UP #${stepNumber} in an outreach sequence — it must read as a genuinely new, short touch, not a rehash of earlier emails in the same thread.`;
-  return `You are a strict quality reviewer for cold/follow-up sales emails sent by Dreams Technology, a business management software company in India. ${stageNote}
-Score the draft from 1 (bad) to 5 (excellent) based on: genuine personalization grounded in the specific business (not generic filler), a single clear low-pressure CTA, appropriate brevity, professional warm tone with no hype/spam language, and — for follow-ups — that it doesn't just repeat an earlier email's subject/angle/wording.
+  const { stageNote, fiveLooksLike } = stepNumber === 0
+    ? {
+        stageNote: 'This is a FIRST cold outreach email (no prior emails sent to this lead).',
+        fiveLooksLike: 'under 60 words, opens with a specific question about THIS business (not "I hope..." or an introduction), frames the value as the owner\'s outcome in plain words, and ends with one easy yes/no question',
+      }
+    : stepNumber === 1
+      ? {
+          stageNote: 'This is FOLLOW-UP #1 in an outreach sequence — it must read as a genuinely new, short touch, not a rehash of earlier emails in the same thread.',
+          fiveLooksLike: '2-3 short sentences, offers ONE new useful idea or example relevant to their industry (different from the first email) without saying it is a follow-up, and ends with one easy yes/no question',
+        }
+      : {
+          stageNote: `This is the LAST email (touch #${stepNumber + 1}) in an outreach sequence — a short, polite break-up note.`,
+          fiveLooksLike: 'at most 2 sentences, politely says there has been no reply so the timing probably isn\'t right, and asks one easy question like whether to close their file or reconnect later — no new pitch',
+        };
+  return `You are a strict quality reviewer for cold/follow-up sales emails sent by Dreams Technology, a software company in India, to busy Indian business owners. ${stageNote}
+Score the draft from 1 (bad) to 5 (excellent). A 5 reads like a quick personal note from a founder: ${fiveLooksLike}. Score 2 or lower if it has any of: a pleasantry opener ("I hope this finds you well", "I wanted to reach out"), "circling back"/"just following up", tech or marketing jargon (CRM, GA4, integration, solution, streamline, enhance, leverage), criticism of their website, a demo pitch, more than ~80 words, or generic filler that could be sent to any business. For follow-ups, also score low if it repeats an earlier email's subject/angle/wording.
 Respond with ONLY a JSON object: {"score": <1-5 integer>, "feedback": "short reason, especially if below 4"}.`;
 }
 

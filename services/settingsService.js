@@ -16,6 +16,8 @@ const SETTINGS_DEFS = [
   { key: 'OWNER_NOTIFY_EMAIL',       category: 'Email',           description: 'Email address notified on pending approvals (estimates, low-score replies)' },
   { key: 'UNSUBSCRIBE_SECRET',       category: 'Email',           description: 'Secret used to sign unsubscribe link tokens', sensitive: true },
   { key: 'OWNER_WEBSITE_URL',        category: 'Portfolio',       description: 'Your business website — scraped and cached for context in portfolio auto-replies' },
+  { key: 'EMAIL_SIGNATURE',          category: 'Email',           description: 'Sign-off appended to every sequence email; use \\n for line breaks (default "Chetan\\nDreams Technology, Gandhinagar · +91 97252 25519")' },
+  { key: 'OWN_EMAIL_DOMAINS',        category: 'Email',           description: 'Comma-separated domains that are ours — leads on these are never cold-emailed (default dreamstechnology.in,dreams-technology.com)' },
   { key: 'SEND_WINDOW_START_HOUR',   category: 'Email',           description: 'Cold/follow-up sequence sends start hour, 24h IST (default 9). All leads are India-based, so IST is the one recipient timezone in this system.' },
   { key: 'SEND_WINDOW_END_HOUR',     category: 'Email',           description: 'Cold/follow-up sequence sends end hour, 24h IST (default 18)' },
   { key: 'SEND_WINDOW_DAYS',         category: 'Email',           description: 'Days sequence sends are allowed, comma-separated 0-6 (0=Sun..6=Sat), default 1,2,3,4,5 (Mon-Fri)' },

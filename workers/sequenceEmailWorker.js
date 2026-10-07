@@ -13,9 +13,10 @@ const { trackedCompletion } = require('../utils/aiUsage');
 const { renderEmailBody } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
 const { checkSpamContent } = require('../utils/spamCheck');
-const { generateTrackingToken, buildPixelUrl, buildClickUrl } = require('../utils/emailTracking');
+const { generateTrackingToken, buildClickUrl } = require('../utils/emailTracking');
 const { getThreadHeaders } = require('../utils/emailThreading');
 const { isWithinSendWindow } = require('../utils/sendWindow');
+const { getSetting } = require('../services/settingsService');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const BATCH_SIZE = 50;
@@ -28,8 +29,19 @@ const MAX_SEND_FAIL_ATTEMPTS = 3; // same cap convention as RESEARCH_MAX_ATTEMPT
 // as "probably fine" rather than blocking the lead forever — an explicit bounce still kills the
 // sequence immediately via routes/brevoWebhook.js, long before this timeout matters.
 const DELIVERY_CONFIRM_TIMEOUT_HOURS = 24;
+// Hard cap on emails per lead per sequence (1 cold + 2 follow-ups), same 1+2 cap the WhatsApp
+// channel adopted 2026-08-29. Without it, recurring_interval_days kept emailing non-repliers
+// weekly forever — the main driver of spam complaints/domain-reputation damage.
+const MAX_SEQUENCE_EMAILS = 3;
+const DEFAULT_SIGNATURE = 'Chetan Makwana\nDreams Technology, Gandhinagar · +91 97252 25519';
+const DEFAULT_OWN_DOMAINS = 'dreamstechnology.in,dreams-technology.com';
 
 let isRunning = false;
+
+async function getOwnDomains() {
+  const raw = (await getSetting('OWN_EMAIL_DOMAINS')) || DEFAULT_OWN_DOMAINS;
+  return raw.split(',').map(d => d.trim().toLowerCase()).filter(Boolean);
+}
 
 async function fetchPortfolioItems() {
   const result = await pool.query(
@@ -96,8 +108,9 @@ const GENERIC_SUBJECT_EXAMPLES = [
 
 function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead) {
   const portfolioText = portfolioItems.length
-    ? `\n\nSome of our recent work you can reference if it fits naturally:\n` +
-      portfolioItems.map(p => `- ${p.title}${p.url ? ` (${p.url})` : ''}${p.description ? `: ${p.description}` : ''}`).join('\n')
+    // URLs deliberately left out (2026-10-07) — the hard rules forbid links in sequence emails.
+    ? `\n\nSome of our recent work you can mention in plain words if it fits naturally (never as a link):\n` +
+      portfolioItems.map(p => `- ${p.title}${p.description ? `: ${p.description}` : ''}`).join('\n')
     : '';
   const playbookText = ReplyQualityService.buildPlaybookText(playbookContext?.fewShotExamples);
   const notesText = ReplyQualityService.buildPlaybookNotesText(playbookContext?.notes);
@@ -112,9 +125,8 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
   const industry = (lead?.business_category || '').trim();
 
   // Three branches: real per-lead website research (best case) → CRM-only industry fallback
-  // (no website, or research permanently failed after RESEARCH_MAX_ATTEMPTS — sequenceEmailWorker's
-  // gate lets these through rather than blocking the lead forever) → bare minimum if neither
-  // exists. The middle branch is what used to be missing: a lead with no research previously fell
+  // (lead has no website at all — a lead whose research permanently failed is stopped by the gate
+  // in processRow since 2026-10-07 and never reaches here) → bare minimum if neither exists. The middle branch is what used to be missing: a lead with no research previously fell
   // straight through to a bare "sell a software demo" prompt with zero lead-specific grounding,
   // which is exactly what produced the generic emails this whole rewrite is fixing.
   const researchText = hasRealResearch
@@ -149,41 +161,42 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
     `to any business): ${GENERIC_SUBJECT_EXAMPLES.map(s => `"${s}"`).join(', ')}. It must also differ ` +
     `from every subject already sent, listed below if any.`;
 
-  // Three tiers instead of a flat first/follow-up split — a step-4 nudge should read very
-  // differently from a step-1 nudge, both in length and in how much it still "pitches." Step 0
-  // is now an explicit 3-beat structure (intro → their specific situation → soft question) instead
-  // of a loose "introduce warmly then pitch" instruction, which is what let the model collapse
-  // straight into a feature-dump sales pitch with no actual introduction first.
+  // Reworked 2026-10-07 after ~6k sends got a 27% open but 0.3% reply rate: the old "warm intro
+  // sentence first" structure reliably produced "I hope this message finds you well…" openers and
+  // 80-120 word mini-pitches that people opened and ignored. Now: open on a question about THEIR
+  // business, one outcome line, one yes/no ask — under 60 words. MAX_SEQUENCE_EMAILS caps it at 3.
   const stageNote = stepNumber === 0
-    ? `This is the FIRST email in the sequence. Write it in exactly this order — do not skip a beat ` +
-      `or jump straight to a pitch:\n` +
-      `1. One short, warm sentence introducing yourself and Dreams Technology by name. No selling yet.\n` +
-      `2. 1-2 sentences naming a SPECIFIC, concrete observation about THEIR business, using the ` +
-      `research/angle or industry detail below — this must read like you actually looked into them, ` +
-      `never like a form letter.\n` +
-      `3. Close with ONE soft, curiosity-driven question inviting a reply (e.g. "is that something ` +
-      `you've already got sorted, or still fairly manual?") — NOT "let me know if you'd like a free ` +
-      `demo." Do not pitch product features or list services in this email; the goal is a reply, not a ` +
-      `booked demo.`
+    ? `This is the FIRST email. Exactly 3 short lines:\n` +
+      `1. A specific question about how THEIR business handles something, grounded in the research/industry ` +
+      `detail below (e.g. "When a contractor asks Kirit Pumps for a quote on a bitumen pump, how does your team ` +
+      `make sure someone follows up?"). Do NOT start the email with "I".\n` +
+      `2. One sentence on what we do, framed as THEIR outcome (more customers, fewer missed inquiries, less manual ` +
+      `work) — not as our product or services.\n` +
+      `3. One easy yes/no question, e.g. "Worth a 10-minute call?" or "Is this something you're dealing with?"`
     : stepNumber === 1
-      ? 'This is the FIRST FOLLOW-UP — a brief, low-pressure nudge. Acknowledge you reached out before without repeating what you said last time; lead with the new angle/industry detail above instead of restating the original message. Still no hard pitch — end with an easy, low-effort question.'
-      : 'This is a LATER FOLLOW-UP — keep it very short (2-4 sentences), low-key, "just circling back" energy. Assume they are busy; give one simple, easy next step rather than re-pitching.';
+      ? `This is FOLLOW-UP 1. Max 2-3 short sentences. Do NOT say you are "following up", "circling back" or ` +
+        `"checking in" — instead give ONE new, genuinely useful idea or example relevant to their industry ` +
+        `(different from the earlier email), then one easy yes/no question.`
+      : `This is the LAST email. Max 2 sentences, e.g. "Haven't heard back, so I'll assume the timing isn't ` +
+        `right. Should I close your file, or is it worth reconnecting in a few months?" Adapt it to their business.`;
 
   const feedbackNote = feedback
     ? `\n\nA previous draft needs improvement: ${feedback} Rewrite addressing this while keeping the message natural.`
     : '';
 
-  return `You are a sales copywriter for Dreams Technology, a business management software company in India, writing a cold outreach email to a business owner.
+  return `You write cold emails for Chetan, founder of Dreams Technology (a software company in Gandhinagar, India), to an Indian business owner. Write like a busy founder typing a quick personal note — not like marketing.
 
 ${stageNote}
 
-Goals:
-- Earn a reply — the goal of this email is to start a conversation, not to close a demo booking in message 1.
-- Keep it SHORT (3-6 sentences for the first email or first follow-up; 2-4 sentences for later follow-ups), professional, warm, no hype or spammy language.
-- Never mention you are an AI.
-- Do not fabricate facts about the recipient's business beyond what's given below.${portfolioText}${playbookText}${notesText}${researchText}${priorEmailsText}${subjectRules}${feedbackNote}
+Hard rules:
+- Body under 60 words (follow-ups even shorter). Plain text, no links, no bullet points, no exclamation marks.
+- Simple everyday English a busy owner reads in 10 seconds. NO tech or marketing words: CRM, ERP, GA4, API, integrate/integration, solution(s), streamline, leverage, enhance, optimize, cohesive, seamless, digital transformation.
+- NEVER write: "I hope this message finds you well", "I hope you're doing well", "I wanted to reach out", "circle back", "just following up", "we specialize in", "free demo", "I noticed your website lacks/doesn't have".
+- Don't criticise their website or business; ask about it instead.
+- Never mention you are an AI. Never invent facts about their business beyond what's given below.
+- Subject: 2-5 words, lowercase, reads like a note from a colleague (e.g. "quote follow-ups at kirit pumps"). No title case, no hype.${portfolioText}${playbookText}${notesText}${researchText}${priorEmailsText}${subjectRules}${feedbackNote}
 
-Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between paragraphs (no HTML, no signature, no unsubscribe line — those are appended separately).`;
+Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between lines/paragraphs. Start the body with "Hi <first name>," if the owner's name is known, otherwise "Hi,". Do NOT add a sign-off, signature, P.S. or unsubscribe line — those are appended automatically.`;
 }
 
 async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails = [], feedback = null) {
@@ -249,6 +262,20 @@ async function processRow(row, sequenceCapTracker) {
     return 'stopped';
   }
 
+  // Our own addresses ended up in the lead list via scraping/imports and were being cold-emailed.
+  const emailDomain = String(row.lead_email).split('@')[1]?.toLowerCase();
+  if (emailDomain && (await getOwnDomains()).includes(emailDomain)) {
+    console.log(`[SequenceEmail] ${row.lead_email} is one of our own domains — stopping sequence`);
+    await killSequence(leadSequenceId, leadId, 'own_domain');
+    return 'stopped';
+  }
+
+  if (row.current_step >= MAX_SEQUENCE_EMAILS) {
+    console.log(`[SequenceEmail] Lead ${leadId} already got ${row.current_step} emails (cap ${MAX_SEQUENCE_EMAILS}) — ending sequence`);
+    await killSequence(leadSequenceId, leadId, 'sequence_complete');
+    return 'stopped';
+  }
+
   // Delivery gate: don't send a follow-up (step > 0) blind — confirm the previous email in this
   // sequence was actually delivered first. A "sent" row just means Brevo's API accepted it
   // synchronously; delivered_at is only stamped once Brevo's webhook confirms real delivery. An
@@ -285,13 +312,19 @@ async function processRow(row, sequenceCapTracker) {
   // Research gate: a lead with a website must have completed research before ANY email goes out
   // — workers/researchWorker.js front-loads that crawl on its own 5-min cron, well ahead of send
   // time, so this just reads whatever's cached rather than triggering a crawl inline. A lead with
-  // no website at all, or whose research permanently failed after RESEARCH_MAX_ATTEMPTS, falls
-  // through and composes from the CRM-only industry fallback in buildSystemPrompt instead of
-  // waiting forever on a crawl that can never succeed.
+  // no website at all composes from the CRM-only industry fallback in buildSystemPrompt. A lead
+  // whose research permanently failed after RESEARCH_MAX_ATTEMPTS is NOT emailed (changed
+  // 2026-10-07): those produced the generic emails that got opened and ignored, and every ignored
+  // cold email costs sender reputation for the good ones.
   const research = row.website ? await getCachedResearch(leadId) : null;
-  if (row.website && !research && (row.research_attempts || 0) < RESEARCH_MAX_ATTEMPTS) {
-    console.log(`[SequenceEmail] Lead ${leadId} has a website but research isn't ready yet — waiting for researchWorker`);
-    return 'awaiting_research';
+  if (row.website && !research) {
+    if ((row.research_attempts || 0) < RESEARCH_MAX_ATTEMPTS) {
+      console.log(`[SequenceEmail] Lead ${leadId} has a website but research isn't ready yet — waiting for researchWorker`);
+      return 'awaiting_research';
+    }
+    console.log(`[SequenceEmail] Lead ${leadId} research permanently failed — not sending a generic email, stopping sequence`);
+    await killSequence(leadSequenceId, leadId, 'research_failed');
+    return 'stopped';
   }
 
   const remainingCap = sequenceCapTracker.get(sequenceId);
@@ -365,11 +398,21 @@ async function processRow(row, sequenceCapTracker) {
 
   // Follow-ups (step > 0) thread onto the conversation so far; a step-0 cold email has no
   // logged messages yet, so getThreadHeaders returns nulls and it starts a fresh thread.
+  // No open-tracking pixel on sequence emails (removed 2026-10-07): a hidden 1x1 image is a
+  // classic bulk-mail signal for Gmail/Outlook filters, and opens are inflated by Apple Mail
+  // privacy/scanners anyway — replies are the metric that matters. Click tracking stays (the
+  // prompt asks for no links, so it rarely fires). Brevo's own open events still flow in via webhook.
   const trackingToken = generateTrackingToken();
-  const tracking = { pixelUrl: buildPixelUrl(trackingToken), trackUrl: (url) => buildClickUrl(trackingToken, url) };
+  const tracking = { trackUrl: (url) => buildClickUrl(trackingToken, url) };
   const { inReplyTo, references } = await getThreadHeaders(leadId);
 
-  const { html, text } = renderEmailBody(composed.body, unsubscribeUrl, tracking);
+  // A real person's sign-off + an easy way to say no — a reply of "no" is still a reply, and
+  // it's far better for sender reputation than a spam-button click.
+  const signature = (await getSetting('EMAIL_SIGNATURE')) || DEFAULT_SIGNATURE;
+  const fullBody = `${composed.body}\n\n${signature.replace(/\\n/g, '\n')}\n\n` +
+    `P.S. If this isn't relevant, just reply "no" and I won't write again.`;
+
+  const { html, text } = renderEmailBody(fullBody, unsubscribeUrl, tracking);
   const sendResult = await EmailSenderService.send(sender, {
     to: row.lead_email, subject: composed.subject, html, text,
     unsubscribeUrl, inReplyTo, references,
@@ -581,7 +624,7 @@ async function runSequenceForLead(leadId) {
 
     const messages = {
       sent: `Step ${stepBefore + 1} sent to ${row.lead_email}.`,
-      stopped: 'Sequence was stopped — the lead is bounced, suppressed, invalid, or has no email.',
+      stopped: 'Sequence was stopped — the lead is bounced, suppressed, invalid, has no email, is on one of our own domains, already got the max 3 emails, or its website research permanently failed. The lead\'s activity log has the exact reason.',
       no_sender: 'No sender capacity right now (daily caps / warmup ramp) — try later or raise the sender cap.',
       awaiting_research: 'This lead has a website but hasn\'t been researched yet — workers/researchWorker.js checks every 5 minutes, or click "Research Now" on the lead to run it immediately.',
       awaiting_delivery: `The previous email hasn't been confirmed delivered yet — waiting up to ${DELIVERY_CONFIRM_TIMEOUT_HOURS}h for Brevo's delivery webhook before sending the next step anyway.`,
