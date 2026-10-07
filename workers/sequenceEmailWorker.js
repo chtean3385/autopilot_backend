@@ -406,13 +406,15 @@ async function processRow(row, sequenceCapTracker) {
   const tracking = { trackUrl: (url) => buildClickUrl(trackingToken, url) };
   const { inReplyTo, references } = await getThreadHeaders(leadId);
 
-  // A real person's sign-off + an easy way to say no — a reply of "no" is still a reply, and
-  // it's far better for sender reputation than a spam-button click.
+  // A real person's sign-off + an easy way to say no — a "stop" reply is still a reply (the
+  // reply worker classifies it not_interested and ends the sequence), and it's far better for
+  // sender reputation than a spam-button click. No visible unsubscribe link: this line is the
+  // opt-out, backed by the List-Unsubscribe headers EmailSenderService.send() sets.
   const signature = (await getSetting('EMAIL_SIGNATURE')) || DEFAULT_SIGNATURE;
   const fullBody = `${composed.body}\n\n${signature.replace(/\\n/g, '\n')}\n\n` +
-    `P.S. If this isn't relevant, just reply "no" and I won't write again.`;
+    `P.S. Not relevant? Just reply "stop" or "not interested" and I won't write again.`;
 
-  const { html, text } = renderEmailBody(fullBody, unsubscribeUrl, tracking);
+  const { html, text } = renderEmailBody(fullBody, unsubscribeUrl, tracking, { visibleFooter: false });
   const sendResult = await EmailSenderService.send(sender, {
     to: row.lead_email, subject: composed.subject, html, text,
     unsubscribeUrl, inReplyTo, references,

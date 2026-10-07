@@ -38,13 +38,21 @@ function unsubscribeFooterHtml(unsubscribeUrl, pixelUrl) {
 // Plain-text body -> {html, text} with the unsubscribe footer required on every outbound email.
 // `tracking` ({ pixelUrl, trackUrl }) comes from utils/emailTracking.js — optional so previews
 // and owner notifications render untracked. The text part always keeps the original URLs.
-function renderEmailBody(body, unsubscribeUrl, tracking = {}) {
-  const text = `${body}\n\n—\nDreams Technology\nDon't want these emails? Unsubscribe: ${unsubscribeUrl}`;
+// `visibleFooter: false` (cold sequence emails, 2026-10-07) drops the visible unsubscribe link so
+// the email reads like a personal note — opt-out then rests on the body's "reply stop" line plus
+// the RFC 8058 List-Unsubscribe headers EmailSenderService.send() still sets from unsubscribeUrl,
+// which Gmail/Yahoo render as their own native Unsubscribe button.
+function renderEmailBody(body, unsubscribeUrl, tracking = {}, { visibleFooter = true } = {}) {
+  const text = visibleFooter
+    ? `${body}\n\n—\nDreams Technology\nDon't want these emails? Unsubscribe: ${unsubscribeUrl}`
+    : body;
   const htmlBody = body
     .split(/\n\n+/)
     .map(p => `<p>${paragraphToHtml(p, tracking.trackUrl)}</p>`)
     .join('\n');
-  const html = `${htmlBody}\n${unsubscribeFooterHtml(unsubscribeUrl, tracking.pixelUrl)}`;
+  const html = visibleFooter
+    ? `${htmlBody}\n${unsubscribeFooterHtml(unsubscribeUrl, tracking.pixelUrl)}`
+    : htmlBody;
   return { html, text };
 }
 
