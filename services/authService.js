@@ -1,50 +1,79 @@
 const crypto = require('crypto');
 const totp = require('../utils/totp');
 
-// Login for the CRM (owner, 2026-10-08): the only credential is the 6-digit code from an authenticator
-// app — no email, no password. Before this, the "login" was a hardcoded user list checked in the browser
-// and every /api route answered anyone on the internet, including /api/settings?reveal=1 (all keys).
+// CRM login (owner, 2026-10-08), checked here on the server — before this the "login" was a hardcoded
+// user list checked in the browser and every /api route answered anyone, incl. /api/settings?reveal=1.
 //
-//   TOTP_SECRET          base32 key shared with the authenticator app (set once on the server, .env only)
-//   AUTH_SESSION_SECRET  HMAC key that signs session tokens; changing it logs every browser out
-//   AUTH_SESSION_DAYS    how long a login lasts (default 7)
-//   AUTH_DISABLED=true   local/test servers only (scripts/run_test_server.sh) — never on the VPS
+// Two modes, one at a time:
+//   password  (until the authenticator is activated)  admin@admin.com / 12345678 — temporary, by owner's call
+//   code      (after Settings → Login & Security → Activate authenticator, scan QR, confirm a code)
+//             the 6-digit authenticator code is the ONLY login; email/password stop working.
 //
-// Sessions are stateless signed tokens (payload.signature), checked by requireAuth on every /api call.
-// Brute force: 5 wrong codes per IP per 15 min, 20 in total per 15 min → 429 until the window passes.
-// A code can be used once (replay of a just-seen code is refused).
+// Stored in the `settings` table (keys are NOT in SETTINGS_DEFS, so /api/settings never lists them),
+// so a deploy needs no .env change:
+//   AUTH_TOTP_SECRET   active authenticator key; empty = password mode
+//   AUTH_TOTP_PENDING  key shown as a QR, waiting for its first code before it becomes AUTH_TOTP_SECRET
+//   AUTH_SESSION_KEY   signs session tokens (auto-created). Optional AUTH_SESSION_SECRET in .env is mixed in.
+// .env: AUTH_SESSION_DAYS (default 7); AUTH_DISABLED=true on local/test servers only — never on the VPS.
+// Lost the phone? On the server: node scripts/auth_reset.js && pm2 restart autoagent-backend
+//
+// Brute force: 5 failed logins per IP per 15 min, 20 in total per 15 min → 429 until the window passes.
+// An authenticator code can be used once (replay of a just-seen code is refused).
 
+const LOGIN_EMAIL = 'admin@admin.com';
+const LOGIN_PASSWORD = '12345678';
 const DEFAULT_SESSION_DAYS = 7;
 const WINDOW_MS = 15 * 60 * 1000;
 const MAX_FAILS_PER_IP = 5;
 const MAX_FAILS_TOTAL = 20;
 
+let store = require('./settingsService'); // { getSetting, setSetting } — swapped in tests
 const failsByIp = new Map(); // ip → [timestamps]
 let failsTotal = [];
 let lastUsedCounter = -1;
+let cachedSessionKey = null;
 
 const isDisabled = () => String(process.env.AUTH_DISABLED || '').toLowerCase() === 'true';
-const isConfigured = () => Boolean(process.env.TOTP_SECRET && process.env.AUTH_SESSION_SECRET);
+const get = async (key) => (await store.getSetting(key)) || null;
+const set = (key, value) => store.setSetting(key, value);
 
 function sessionDays() {
   const n = Number.parseFloat(process.env.AUTH_SESSION_DAYS);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_SESSION_DAYS;
 }
 
-const b64url = (buf) => Buffer.from(buf).toString('base64url');
-const sign = (data) => crypto.createHmac('sha256', process.env.AUTH_SESSION_SECRET).update(data).digest('base64url');
-
-function issueToken() {
-  const exp = Date.now() + sessionDays() * 86400000;
-  const payload = b64url(JSON.stringify({ sub: 'owner', exp, n: crypto.randomBytes(8).toString('hex') }));
-  return { token: `${payload}.${sign(payload)}`, expiresAt: new Date(exp).toISOString() };
+// Constant-time string compare (hash first so lengths always match).
+function safeEqual(a, b) {
+  const x = crypto.createHash('sha256').update(String(a)).digest();
+  const y = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(x, y);
 }
 
-function verifyToken(token) {
-  if (!isConfigured() || typeof token !== 'string') return null;
+// ── session tokens (stateless: payload.signature) ────────────────────────────
+async function sessionKey() {
+  if (!cachedSessionKey) {
+    let key = await get('AUTH_SESSION_KEY');
+    if (!key) {
+      key = crypto.randomBytes(32).toString('hex');
+      await set('AUTH_SESSION_KEY', key);
+    }
+    cachedSessionKey = key;
+  }
+  return (process.env.AUTH_SESSION_SECRET || '') + cachedSessionKey;
+}
+
+async function issueToken() {
+  const exp = Date.now() + sessionDays() * 86400000;
+  const payload = Buffer.from(JSON.stringify({ sub: 'owner', exp, n: crypto.randomBytes(8).toString('hex') })).toString('base64url');
+  const sig = crypto.createHmac('sha256', await sessionKey()).update(payload).digest('base64url');
+  return { token: `${payload}.${sig}`, expiresAt: new Date(exp).toISOString() };
+}
+
+async function verifyToken(token) {
+  if (typeof token !== 'string') return null;
   const [payload, sig] = token.split('.');
   if (!payload || !sig) return null;
-  const expected = sign(payload);
+  const expected = crypto.createHmac('sha256', await sessionKey()).update(payload).digest('base64url');
   if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
@@ -54,9 +83,14 @@ function verifyToken(token) {
   }
 }
 
-function recentFails(list, now) {
-  return list.filter((t) => now - t < WINDOW_MS);
+// New key → every existing login (all browsers) ends.
+async function rotateSessionKey() {
+  cachedSessionKey = crypto.randomBytes(32).toString('hex');
+  await set('AUTH_SESSION_KEY', cachedSessionKey);
 }
+
+// ── rate limiting ────────────────────────────────────────────────────────────
+const recentFails = (list, now) => list.filter((t) => now - t < WINDOW_MS);
 
 function lockedOut(ip, now = Date.now()) {
   failsTotal = recentFails(failsTotal, now);
@@ -70,37 +104,97 @@ function recordFail(ip, now = Date.now()) {
   failsTotal.push(now);
 }
 
-// → { ok: true, token, expiresAt } | { ok: false, status, error }
-function login(code, ip = 'unknown') {
-  if (!isConfigured()) return { ok: false, status: 503, error: 'Login is not set up on the server yet.' };
-  if (lockedOut(ip)) return { ok: false, status: 429, error: 'Too many wrong codes. Wait 15 minutes and try again.' };
-  const counter = totp.verify(process.env.TOTP_SECRET, code);
-  if (counter === null || counter <= lastUsedCounter) {
-    recordFail(ip);
-    return { ok: false, status: 401, error: counter === null ? 'Wrong code. Check the code in your authenticator app.' : 'That code was already used. Wait for the next one.' };
-  }
+// A code is good once: the same 30 s code can't be replayed.
+function useCode(secret, code) {
+  const counter = totp.verify(secret, code);
+  if (counter === null || counter <= lastUsedCounter) return false;
   lastUsedCounter = counter;
-  failsByIp.delete(ip);
-  return { ok: true, ...issueToken() };
+  return true;
 }
 
-// Paths under /api that stay public: the login itself, and template header images (Meta downloads
-// them when a template is submitted and when it is sent, without any login).
-const PUBLIC_API = [/^\/auth\/login\/?$/, /^\/templates\/media\/[^/]+\/?$/];
+// ── login ────────────────────────────────────────────────────────────────────
+// Which login screen to show. Public.
+async function mode() {
+  return (await get('AUTH_TOTP_SECRET')) ? 'code' : 'password';
+}
+
+// password mode: { email, password }   code mode: { code }
+// → { ok: true, token, expiresAt } | { ok: false, status, error, mode }
+async function login({ email, password, code } = {}, ip = 'unknown') {
+  if (lockedOut(ip)) return { ok: false, status: 429, error: 'Too many failed attempts. Wait 15 minutes and try again.' };
+  const secret = await get('AUTH_TOTP_SECRET');
+  if (secret) {
+    if (!useCode(secret, code)) {
+      recordFail(ip);
+      return { ok: false, status: 401, mode: 'code', error: 'Wrong or already-used code. Check your authenticator app.' };
+    }
+  } else {
+    const ok = safeEqual(String(email || '').trim().toLowerCase(), LOGIN_EMAIL) & safeEqual(String(password || ''), LOGIN_PASSWORD);
+    if (!ok) {
+      recordFail(ip);
+      return { ok: false, status: 401, mode: 'password', error: 'Invalid email or password.' };
+    }
+  }
+  failsByIp.delete(ip);
+  return { ok: true, ...(await issueToken()) };
+}
+
+// ── Settings → Login & Security (behind requireAuth) ─────────────────────────
+// Step 1: a new key shown as a QR. Nothing changes until it is confirmed.
+async function startTwoFactor() {
+  const secret = totp.generateSecret();
+  await set('AUTH_TOTP_PENDING', secret);
+  const otpauthUrl = totp.otpauthUrl(secret);
+  const qr = await require('qrcode').toDataURL(otpauthUrl, { width: 240, margin: 1 });
+  return { ok: true, secret, otpauthUrl, qr };
+}
+
+// Step 2: a code from the freshly scanned app proves the phone has the key → it becomes the only login.
+// Every browser is logged out (including this one) so the next login uses the app.
+async function confirmTwoFactor(code) {
+  const pending = await get('AUTH_TOTP_PENDING');
+  if (!pending) return { ok: false, status: 400, error: 'Press "Activate authenticator" first to get a QR code.' };
+  if (!useCode(pending, code)) return { ok: false, status: 400, error: 'That code does not match. Scan the QR again or wait for the next code.' };
+  await set('AUTH_TOTP_SECRET', pending);
+  await set('AUTH_TOTP_PENDING', '');
+  await rotateSessionKey();
+  return { ok: true };
+}
+
+// Back to email + password login. Needs a current code from the app.
+async function disableTwoFactor(code) {
+  const secret = await get('AUTH_TOTP_SECRET');
+  if (!secret) return { ok: true };
+  if (!useCode(secret, code)) return { ok: false, status: 400, error: 'Enter a current code from the authenticator app.' };
+  await set('AUTH_TOTP_SECRET', '');
+  await rotateSessionKey();
+  return { ok: true };
+}
+
+// ── middleware ───────────────────────────────────────────────────────────────
+// Paths under /api that stay public: the login screen's two calls, and template header images (Meta
+// downloads them when a template is submitted and when it is sent, without any login).
+const PUBLIC_API = [/^\/auth\/login\/?$/, /^\/auth\/mode\/?$/, /^\/templates\/media\/[^/]+\/?$/];
 
 // Express middleware for app.use('/api', requireAuth). req.path is relative to /api here.
-function requireAuth(req, res, next) {
-  if (isDisabled()) return next();
-  if (req.method === 'OPTIONS') return next();
-  if (PUBLIC_API.some((re) => re.test(req.path))) return next();
-  if (!isConfigured()) return res.status(503).json({ error: 'Login is not set up on the server yet.' });
+async function requireAuth(req, res, next) {
+  if (isDisabled() || req.method === 'OPTIONS' || PUBLIC_API.some((re) => re.test(req.path))) return next();
   const header = req.get('authorization') || '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
-  if (!verifyToken(token)) return res.status(401).json({ error: 'Please log in again.' });
+  try {
+    if (!(await verifyToken(token))) return res.status(401).json({ error: 'Please log in again.' });
+  } catch (err) {
+    console.error('[auth] session check failed:', err.message);
+    return res.status(503).json({ error: 'Login check failed on the server. Try again shortly.' });
+  }
   return next();
 }
 
-// Test hook: reset the in-memory counters.
-function _reset() { failsByIp.clear(); failsTotal = []; lastUsedCounter = -1; }
+// Test hooks.
+function _reset() { failsByIp.clear(); failsTotal = []; lastUsedCounter = -1; cachedSessionKey = null; }
+function _setStore(s) { store = s; _reset(); }
 
-module.exports = { login, requireAuth, verifyToken, issueToken, isConfigured, isDisabled, _reset, PUBLIC_API };
+module.exports = {
+  mode, login, startTwoFactor, confirmTwoFactor, disableTwoFactor,
+  requireAuth, verifyToken, issueToken, isDisabled, PUBLIC_API, LOGIN_EMAIL, LOGIN_PASSWORD, _reset, _setStore,
+};

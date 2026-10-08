@@ -617,8 +617,9 @@ app.use('/webhook', require('./routes/webhook'));
 app.use('/webhooks/brevo', require('./routes/brevoWebhook'));
 app.use('/unsubscribe', require('./routes/unsubscribe'));
 app.use('/t', require('./routes/tracking'));
-// Everything under /api needs a login (authenticator-app code → session token), except the login
-// itself and template header images Meta downloads — see services/authService.js. Webhooks,
+// Everything under /api needs a login (email+password, or only the authenticator code once it is
+// activated in Settings → session token), except the login screen and template header images Meta
+// downloads — see services/authService.js. Webhooks,
 // unsubscribe and tracking above stay public. nginx is the only proxy in front (loopback), so its
 // X-Forwarded-For gives the real client IP for login rate limiting.
 app.set('trust proxy', 'loopback');
