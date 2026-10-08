@@ -33,7 +33,6 @@ const DELIVERY_CONFIRM_TIMEOUT_HOURS = 24;
 // channel adopted 2026-08-29. Without it, recurring_interval_days kept emailing non-repliers
 // weekly forever — the main driver of spam complaints/domain-reputation damage.
 const MAX_SEQUENCE_EMAILS = 3;
-const DEFAULT_SIGNATURE = 'Chetan Makwana\nDreams Technology, Gandhinagar · +91 97252 25519';
 const DEFAULT_OWN_DOMAINS = 'dreamstechnology.in,dreams-technology.com';
 
 let isRunning = false;
@@ -319,8 +318,8 @@ async function composeAndSendColdEmail({ leadId, lead, leadEmail, stepNumber, se
   // reply worker classifies it not_interested and ends the sequence), and it's far better for
   // sender reputation than a spam-button click. No visible unsubscribe link: this line is the
   // opt-out, backed by the List-Unsubscribe headers EmailSenderService.send() sets.
-  const signature = (await getSetting('EMAIL_SIGNATURE')) || DEFAULT_SIGNATURE;
-  const fullBody = `${composed.body}\n\n${signature.replace(/\\n/g, '\n')}\n\n` +
+  const signature = await EmailSenderService.signatureFor(sender);
+  const fullBody = `${composed.body}\n\n${signature}\n\n` +
     `P.S. Not relevant? Just reply "stop" or "not interested" and I won't write again.`;
 
   const { html, text } = renderEmailBody(fullBody, unsubscribeUrl, tracking, { visibleFooter: false });

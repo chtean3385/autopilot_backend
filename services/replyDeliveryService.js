@@ -60,7 +60,9 @@ async function sendOrQueueReply({ lead, leadSeq, sender, result, subject, sentAc
     const trackingToken = generateTrackingToken();
     const tracking = { pixelUrl: buildPixelUrl(trackingToken), trackUrl: (url) => buildClickUrl(trackingToken, url) };
     const thread = await getThreadHeaders(lead.id, inReplyTo);
-    const { html, text } = renderEmailBody(result.text, unsubscribeUrl, tracking);
+    // Same per-mailbox sign-off as cold emails (the reply drafter is told not to write one).
+    const signedText = `${result.text}\n\n${await EmailSenderService.signatureFor(sender)}`;
+    const { html, text } = renderEmailBody(signedText, unsubscribeUrl, tracking);
     const sendResult = await EmailSenderService.send(sender, {
       to: lead.email, subject, html, text,
       unsubscribeUrl, inReplyTo: thread.inReplyTo, references: thread.references,

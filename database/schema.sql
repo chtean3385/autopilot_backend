@@ -582,3 +582,5 @@ ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS address TEXT;
 ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_lookup_attempts INT NOT NULL DEFAULT 0;
 ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS last_email_lookup_at TIMESTAMP;
 CREATE INDEX IF NOT EXISTS idx_leads_score ON hotel_leads(lead_score DESC);
+-- Per-mailbox email signature (migrate_sender_signature.sql)
+ALTER TABLE email_senders ADD COLUMN IF NOT EXISTS signature TEXT;

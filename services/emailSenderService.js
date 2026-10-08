@@ -8,6 +8,8 @@ const WARMUP_START_CAP = 10; // day 1 daily cap during warmup
 const WARMUP_STEP = 10;      // added per full week elapsed
 const ROTATION_BATCH_DEFAULT = 10;                   // new leads per sender before moving to the next
 const ROTATION_STATE_KEY = 'EMAIL_ROTATION_STATE';
+const COMPANY_LINE = 'Dreams Technology, Gandhinagar · +91 84607 65785';
+const WEBSITE_LINE = 'https://dreamstechnology.in/';
 
 class EmailSenderService {
   static async getAll() {
@@ -24,8 +26,8 @@ class EmailSenderService {
     const result = await pool.query(
       `INSERT INTO email_senders
          (label, provider, api_key, smtp_config, from_name, from_email, sending_domain,
-          daily_cap, warmup_started_at, sent_today, last_reset_date, imap_config, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, NOW()), 0, CURRENT_DATE, $10, COALESCE($11, 'active'))
+          daily_cap, warmup_started_at, sent_today, last_reset_date, imap_config, status, signature)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, NOW()), 0, CURRENT_DATE, $10, COALESCE($11, 'active'), $12)
        RETURNING *`,
       [
         data.label,
@@ -39,6 +41,7 @@ class EmailSenderService {
         data.warmup_started_at || null,
         data.imap_config ? JSON.stringify(data.imap_config) : null,
         data.status || null,
+        data.signature ? String(data.signature).trim() : null,
       ]
     );
     return result.rows[0];
@@ -89,6 +92,7 @@ class EmailSenderService {
       set('imap_config', imapConfig ? JSON.stringify(imapConfig) : null);
     }
     if (data.status !== undefined) set('status', data.status);
+    if (data.signature !== undefined) set('signature', String(data.signature || '').trim() || null);
 
     if (fields.length === 0) return this.getById(id);
 
@@ -140,6 +144,18 @@ class EmailSenderService {
       [senderId]
     );
     await pool.query('UPDATE email_senders SET sent_today = sent_today + 1 WHERE id = $1', [senderId]);
+  }
+
+  // Sign-off for mail sent from this mailbox: its own signature if set, else the EMAIL_SIGNATURE
+  // setting, else "<From name> / Dreams Technology, Gandhinagar · phone / website" on three lines.
+  // A literal "\n" typed into a one-line settings box becomes a real line break.
+  static async signatureFor(sender) {
+    const own = String(sender?.signature || '').trim();
+    if (own) return own.replace(/\\n/g, '\n');
+    const global = String((await getSetting('EMAIL_SIGNATURE')) || '').trim();
+    if (global) return global.replace(/\\n/g, '\n');
+    const name = String(sender?.from_name || '').trim() || 'Chetan Makwana';
+    return `${name}\n${COMPANY_LINE}\n${WEBSITE_LINE}`;
   }
 
   static hasCapacity(sender) {

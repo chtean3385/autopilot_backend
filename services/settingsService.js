@@ -17,7 +17,7 @@ const SETTINGS_DEFS = [
   { key: 'UNSUBSCRIBE_SECRET',       category: 'Email',           description: 'Secret used to sign unsubscribe link tokens', sensitive: true },
   { key: 'OWNER_WEBSITE_URL',        category: 'Portfolio',       description: 'Your business website — scraped and cached for context in portfolio auto-replies' },
   { key: 'OPENAI_MONTHLY_BUDGET_USD', category: 'AI',              description: 'Hard monthly cap on OpenAI spend in USD (default 10). Once reached, all AI calls pause until the 1st of next month.' },
-  { key: 'EMAIL_SIGNATURE',         category: 'Email',           description: 'Sign-off appended to every sequence email; use \\n for line breaks (default "Chetan\\nDreams Technology, Gandhinagar · +91 97252 25519")' },
+  { key: 'EMAIL_SIGNATURE',         category: 'Email',           description: 'Fallback email sign-off, used only for a sender with no own Signature (Settings → Email Senders); use \\n for line breaks. Empty = "<sender From name>\\nDreams Technology, Gandhinagar · +91 84607 65785\\nhttps://dreamstechnology.in/"' },
   { key: 'OWN_EMAIL_DOMAINS',        category: 'Email',           description: 'Comma-separated domains that are ours — leads on these are never cold-emailed (default dreamstechnology.in,dreams-technology.com)' },
   { key: 'EMAIL_ROTATION_BATCH',     category: 'Email',           description: 'New leads sent from one sender before rotating to the next active sender (default 10). Follow-ups always stay on the mailbox that sent the first email, and wait if it is full' },
   { key: 'SEND_WINDOW_START_HOUR',   category: 'Email',           description: 'Cold/follow-up sequence sends start hour, 24h IST (default 9). All leads are India-based, so IST is the one recipient timezone in this system.' },

@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../config/db');
+const { htmlToText } = require('../utils/emailRender');
 
 const router = express.Router();
 const SCORE_MATCH_WINDOW_MS = 5 * 60 * 1000; // agent_actions and email_logs are written moments apart
@@ -80,7 +81,7 @@ router.get('/', async (req, res) => {
       statusByLead = Object.fromEntries(seqRes.rows.map(r => [r.lead_id, r.status]));
     }
 
-    res.json(conversations.rows.map(row => ({ ...row, sequence_status: statusByLead[row.lead_id] || null })));
+    res.json(conversations.rows.map(row => ({ ...row, body: htmlToText(row.body), sequence_status: statusByLead[row.lead_id] || null })));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -126,7 +127,7 @@ router.get('/thread/:leadId', async (req, res) => {
       id: log.id,
       direction: log.direction === 'out' ? 'outgoing' : 'incoming',
       subject: log.subject,
-      text: log.body,
+      text: htmlToText(log.body),
       timestamp: log.sent_at || log.created_at,
       opened_at: log.opened_at,
       open_count: log.open_count,

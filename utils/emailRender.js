@@ -6,6 +6,13 @@ function escapeHtml(str) {
 // punctuation is trimmed separately so "see https://x.com." links cleanly.
 const URL_PATTERN = /https?:\/\/[^\s<>"')\]]+/g;
 
+// Our own site (the signature link) is never routed through the click tracker: a redirect via a
+// different domain is a spam-filter signal, and a direct link to dreamstechnology.in reads as genuine.
+const UNTRACKED_HOSTS = /(^|\.)dreamstechnology\.in$/i;
+function isUntracked(url) {
+  try { return UNTRACKED_HOSTS.test(new URL(url).hostname); } catch { return false; }
+}
+
 function trimTrailingPunctuation(url) {
   return url.replace(/[.,!?;:]+$/, '');
 }
@@ -19,7 +26,7 @@ function paragraphToHtml(paragraph, trackUrl) {
   for (const match of paragraph.matchAll(URL_PATTERN)) {
     const url = trimTrailingPunctuation(match[0]);
     html += escapeHtml(paragraph.slice(last, match.index));
-    const href = trackUrl ? trackUrl(url) : url;
+    const href = trackUrl && !isUntracked(url) ? trackUrl(url) : url;
     html += `<a href="${escapeHtml(href)}">${escapeHtml(url)}</a>`;
     last = match.index + url.length;
   }
@@ -56,4 +63,27 @@ function renderEmailBody(body, unsubscribeUrl, tracking = {}, { visibleFooter = 
   return { html, text };
 }
 
-module.exports = { escapeHtml, renderEmailBody, unsubscribeFooterHtml };
+// Stored email bodies are HTML (what was sent). For showing them in the CRM, turn them back into
+// readable text: paragraphs → blank lines, <br> → line breaks, tags stripped, common entities decoded.
+// Plain-text bodies (e.g. some inbound mail) pass through unchanged.
+const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', middot: '·', ndash: '–', mdash: '—', hellip: '…', rsquo: '’', lsquo: '‘', rdquo: '”', ldquo: '“' };
+function htmlToText(html) {
+  const s = String(html || '');
+  // Only real markup counts — a plain-text reply quoting "John <john@x.com> wrote:" stays as-is.
+  if (!/<\/?(p|br|div|span|a|html|body|table|tr|td|hr|b|strong|i|em|ul|ol|li|blockquote|h[1-6])\b[^>]*>/i.test(s)) return s;
+  return s
+    .replace(/<(style|script|head)[^>]*>[\s\S]*?<\/\1>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|tr|h[1-6]|li|blockquote)>/gi, '\n\n')
+    .replace(/<hr[^>]*>/gi, '\n—\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&(#\d+|#x[0-9a-f]+|[a-z]+);/gi, (m, e) => {
+      if (e[0] === '#') return String.fromCodePoint(e[1].toLowerCase() === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10));
+      return ENTITIES[e.toLowerCase()] ?? m;
+    })
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+module.exports = { escapeHtml, renderEmailBody, unsubscribeFooterHtml, htmlToText };
