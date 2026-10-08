@@ -1,6 +1,8 @@
 const pool = require('../config/db');
 const LeadService = require('./leadService');
 const { findEmail } = require('./enrichmentService');
+const { normalizeMobileNumber } = require('../utils/phone');
+const { refreshScores } = require('./leadScoreService');
 
 // Directory outreach step 2 (_docs/directory-outreach-plan.md): turns crawled directory_entries into
 // hotel_leads (cadence_managed = TRUE). Promotion contacts nobody — the cadence worker (off by default)
@@ -12,9 +14,16 @@ const { findEmail } = require('./enrichmentService');
 //   - email verification happens inside LeadService.addLeads() (mails.so), exactly as for every
 //     other email lead; unverifiable just means the cadence uses WhatsApp only
 //   - an existing lead with the same mobile or email is linked, never modified or re-contacted
+//   - the website lookup also fills a missing contact person / mobile from the business's own site
+//   - a lead promoted without an email but with a website is retried later (backfillWebsiteEmails,
+//     up to EMAIL_LOOKUP_MAX_ATTEMPTS, a day apart) — a site that was down once isn't lost
+//   - every new/updated lead gets its completeness score refreshed (leadScoreService)
 
 const SHARED_EMAIL_THRESHOLD = 3;
 const DEFAULT_BATCH = 25;
+const EMAIL_LOOKUP_MAX_ATTEMPTS = 3;
+const EMAIL_LOOKUP_RETRY_HOURS = 24;
+const DEFAULT_BACKFILL_BATCH = 10;
 
 // Short vowel-less tokens are acronyms (LLP, CNC, PVC, HDG) — keep them upper-case, except the
 // common abbreviations below, which read as words ("Pvt. Ltd.", "Mfg.").
@@ -94,19 +103,32 @@ async function promoteEntry(entry, source) {
   let email = await usableEmail(entry.email, source);
   let emailSource = email ? 'directory' : null;
   let foundEmail = null;
-  if (!email && entry.website) {
+  let siteOwner = null;
+  let sitePhone = null;
+  let lookedUp = false;
+  // The business's own website: email if the directory had none, plus a contact person / mobile
+  // when the directory didn't list those either.
+  if (entry.website && (!email || !entry.contact_person || !entry.phone_e164)) {
+    lookedUp = !email;
     try {
       const found = await findEmail({ id: null, hotel_name: entry.company, website: entry.website });
-      foundEmail = found?.email ? String(found.email).toLowerCase() : null;
-      email = await usableEmail(foundEmail, source);
-      if (email) emailSource = 'website';
+      if (!email) {
+        foundEmail = found?.email ? String(found.email).toLowerCase() : null;
+        email = await usableEmail(foundEmail, source);
+        if (email) emailSource = 'website';
+      }
+      siteOwner = found?.ownerName ? String(found.ownerName).trim() : null;
+      sitePhone = found?.phone ? normalizeMobileNumber(String(found.phone)) : null;
     } catch (err) {
       console.error(`[DirectoryPromotion] findEmail failed for entry ${entry.id}:`, err.message);
     }
   }
 
-  const phone = entry.phone_e164 || null;
-  if (!email && !phone) {
+  const phone = entry.phone_e164 || sitePhone || null;
+  // No email and no mobile yet is still worth keeping when there's a website (the backfill may find
+  // an email later — e.g. the site was down just now) or a landline a human can call. Such a lead
+  // scores cold and the cadence never picks it until a usable channel appears.
+  if (!email && !phone && !entry.website && !entry.phone_raw) {
     await markEntry(entry.id, { skipReason: 'no_contact', email: foundEmail });
     return 'no_contact';
   }
@@ -119,10 +141,10 @@ async function promoteEntry(entry, source) {
 
   const result = await LeadService.addLeads([{
     hotel_name: titleCase(entry.company).slice(0, 255),
-    owner_name: titleCase(entry.contact_person || '').slice(0, 255),
+    owner_name: titleCase(entry.contact_person || siteOwner || '').slice(0, 255),
     email: email || '',
     whatsapp_number: phone || '',
-    phone: phone ? null : (entry.phone_raw || null),
+    phone: phone ? null : (entry.phone_raw ? String(entry.phone_raw).slice(0, 20) : null),
     city: entry.city || source.city || '',
     website: entry.website || '',
     business_category: entry.category || null,
@@ -138,6 +160,15 @@ async function promoteEntry(entry, source) {
   if (!result.success) throw new Error(result.error || 'addLeads failed');
   const leadId = result.inserted[0]?.id || result.skippedList[0]?.id || null;
   if (!leadId) throw new Error('addLeads returned no lead id');
+  if (result.inserted[0]) {
+    // Columns addLeads doesn't take: the directory's address, and whether the website email lookup
+    // already ran once (the backfill retries only what's still missing).
+    await pool.query(
+      `UPDATE hotel_leads SET address = $2, email_lookup_attempts = $3, last_email_lookup_at = $4 WHERE id = $1`,
+      [leadId, entry.address || null, lookedUp ? 1 : 0, lookedUp ? new Date() : null]
+    );
+    await refreshScores([leadId]);
+  }
   await markEntry(entry.id, {
     leadId,
     skipReason: result.inserted[0] ? null : 'existing_lead', // addLeads' own name+city duplicate check
@@ -188,4 +219,68 @@ async function setCategoryFilter(sourceId, filter) {
   return r.rows[0];
 }
 
-module.exports = { promoteEntries, setCategoryFilter, titleCase, matchesFilter };
+// Website email backfill: directory leads that have a website but still no email get the website
+// looked at again (EMAIL_LOOKUP_MAX_ATTEMPTS total, EMAIL_LOOKUP_RETRY_HOURS apart). A found email
+// goes through the same rules as at promotion (not the directory's own / not shared by 3+ entries /
+// not already another lead's), is stored as 'found', and emailVerificationWorker verifies it within
+// the hour. channel='email' is what that worker selects on; the cadence uses both channels anyway.
+async function backfillWebsiteEmails({ limit = DEFAULT_BACKFILL_BATCH } = {}) {
+  const { rows } = await pool.query(
+    `SELECT hl.id, hl.hotel_name, hl.website, hl.owner_name, s.url AS source_url
+     FROM hotel_leads hl
+     JOIN LATERAL (SELECT source_id FROM directory_entries WHERE lead_id = hl.id ORDER BY id LIMIT 1) de ON TRUE
+     JOIN directory_sources s ON s.id = de.source_id
+     WHERE hl.source = 'directory'
+       AND COALESCE(TRIM(hl.email), '') = ''
+       AND COALESCE(TRIM(hl.website), '') <> ''
+       AND hl.email_lookup_attempts < $1
+       AND (hl.last_email_lookup_at IS NULL OR hl.last_email_lookup_at < NOW() - make_interval(hours => $2))
+       AND hl.status NOT IN ('not_interested', 'opted_out', 'dead')
+     ORDER BY hl.email_lookup_attempts, hl.id
+     LIMIT $3`,
+    [EMAIL_LOOKUP_MAX_ATTEMPTS, EMAIL_LOOKUP_RETRY_HOURS, limit]
+  );
+
+  const stats = { checked: rows.length, found: 0, none: 0, errors: 0 };
+  for (const lead of rows) {
+    await pool.query(
+      `UPDATE hotel_leads SET email_lookup_attempts = email_lookup_attempts + 1, last_email_lookup_at = NOW() WHERE id = $1`,
+      [lead.id]
+    );
+    try {
+      const found = await findEmail({ id: lead.id, hotel_name: lead.hotel_name, website: lead.website });
+      let email = await usableEmail(found?.email, { url: lead.source_url });
+      if (email) {
+        const taken = await pool.query(
+          'SELECT 1 FROM hotel_leads WHERE LOWER(email) = $1 AND id <> $2 LIMIT 1', [email, lead.id]
+        );
+        if (taken.rows[0]) email = null;
+      }
+      const owner = !lead.owner_name && found?.ownerName ? titleCase(String(found.ownerName)).slice(0, 255) : null;
+      if (email) {
+        await pool.query(
+          `UPDATE hotel_leads
+           SET email = $2, email_status = 'found', email_source = 'website', channel = 'email',
+               email_verify_attempts = 0, owner_name = COALESCE(NULLIF($3, ''), owner_name), updated_at = NOW()
+           WHERE id = $1 AND COALESCE(TRIM(email), '') = ''`,
+          [lead.id, email, owner]
+        );
+        await pool.query('UPDATE directory_entries SET email = COALESCE(email, $2) WHERE lead_id = $1', [lead.id, email]);
+        stats.found++;
+      } else {
+        if (owner) await pool.query(`UPDATE hotel_leads SET owner_name = $2 WHERE id = $1 AND COALESCE(owner_name, '') = ''`, [lead.id, owner]);
+        stats.none++;
+      }
+    } catch (err) {
+      console.error(`[DirectoryPromotion] website email backfill failed for lead ${lead.id}:`, err.message);
+      stats.errors++;
+    }
+  }
+  if (rows.length) {
+    await refreshScores(rows.map((r) => r.id));
+    console.log(`[DirectoryPromotion] website email backfill: ${JSON.stringify(stats)}`);
+  }
+  return stats;
+}
+
+module.exports = { promoteEntries, backfillWebsiteEmails, setCategoryFilter, titleCase, matchesFilter, EMAIL_LOOKUP_MAX_ATTEMPTS };

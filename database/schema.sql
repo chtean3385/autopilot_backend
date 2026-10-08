@@ -575,3 +575,10 @@ ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS quality_note TEXT;
 -- The niche of the directory a lead came from — picks that niche's WhatsApp templates.
 ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS niche VARCHAR(100);
 ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP;
+-- Lead completeness score + website email backfill (migrate_lead_scoring.sql)
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS lead_score INT NOT NULL DEFAULT 0;
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS lead_tier VARCHAR(10) NOT NULL DEFAULT 'cold';
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS address TEXT;
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_lookup_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS last_email_lookup_at TIMESTAMP;
+CREATE INDEX IF NOT EXISTS idx_leads_score ON hotel_leads(lead_score DESC);

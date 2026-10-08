@@ -30,12 +30,42 @@ function isRetryableError(error) {
   return !error.response || error.response.status >= 500;
 }
 
+// Some sites (e.g. *.idbf.in) answer a first visit with a tiny page whose only job is to set a
+// cookie in JS and reload — a browser passes it invisibly, a plain HTTP fetch sees an empty page
+// forever. Not a CAPTCHA: no challenge to solve, just a cookie the page hands out. We set the same
+// cookie and fetch again, remembering it per host for the rest of the process.
+const JS_COOKIE_STUB_MAX_BYTES = 2000;
+const hostCookies = new Map(); // hostname → "name=value"
+
+function jsCookieFromStub(data) {
+  if (typeof data !== 'string' || data.length > JS_COOKIE_STUB_MAX_BYTES) return null;
+  if (!/location\.reload\s*\(/.test(data)) return null;
+  const m = data.match(/document\.cookie\s*=\s*["']\s*([^"';=\s]+=[^"';]*)/);
+  return m ? m[1].trim() : null;
+}
+
+function hostOfUrl(url) {
+  try { return new URL(url).hostname.toLowerCase(); } catch { return ''; }
+}
+
+async function getOnce(url) {
+  const cookie = hostCookies.get(hostOfUrl(url));
+  const headers = cookie ? { ...BROWSER_HEADERS, Cookie: cookie } : BROWSER_HEADERS;
+  return axios.get(url, { timeout: REQUEST_TIMEOUT_MS, headers });
+}
+
 // One retry on a transient failure so a single dropped connection doesn't kill a page for the
 // whole crawl. Shared by fetchPage/fetchPageWithMeta below.
 async function getWithRetry(url) {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await axios.get(url, { timeout: REQUEST_TIMEOUT_MS, headers: BROWSER_HEADERS });
+      const response = await getOnce(url);
+      const cookie = jsCookieFromStub(response.data);
+      if (cookie && hostCookies.get(hostOfUrl(url)) !== cookie) {
+        hostCookies.set(hostOfUrl(url), cookie);
+        return await getOnce(url);
+      }
+      return response;
     } catch (error) {
       if (attempt >= MAX_FETCH_RETRIES || !isRetryableError(error)) throw error;
       await sleep(RETRY_DELAY_MS);
@@ -201,8 +231,8 @@ function toArray(value) {
 
 // Parses one sitemap XML payload: adds its <urlset> locs to `urls`, or (one level deep only,
 // capped at MAX_NESTED_SITEMAPS) recurses into a <sitemapindex>'s nested sitemap files.
-async function collectFromSitemapUrl(sitemapUrl, urls, depth = 0) {
-  if (urls.size >= MAX_SITEMAP_URLS) return;
+async function collectFromSitemapUrl(sitemapUrl, urls, depth = 0, maxUrls = MAX_SITEMAP_URLS) {
+  if (urls.size >= maxUrls) return;
   const xml = await fetchPage(sitemapUrl);
   if (!xml) return;
 
@@ -216,7 +246,7 @@ async function collectFromSitemapUrl(sitemapUrl, urls, depth = 0) {
   if (parsed?.urlset) {
     for (const urlEntry of toArray(parsed.urlset.url)) {
       if (urlEntry?.loc) urls.add(urlEntry.loc);
-      if (urls.size >= MAX_SITEMAP_URLS) break;
+      if (urls.size >= maxUrls) break;
     }
     return;
   }
@@ -224,8 +254,8 @@ async function collectFromSitemapUrl(sitemapUrl, urls, depth = 0) {
   if (parsed?.sitemapindex && depth < 1) {
     const nested = toArray(parsed.sitemapindex.sitemap).slice(0, MAX_NESTED_SITEMAPS);
     for (const entry of nested) {
-      if (urls.size >= MAX_SITEMAP_URLS) break;
-      if (entry?.loc) await collectFromSitemapUrl(entry.loc, urls, depth + 1);
+      if (urls.size >= maxUrls) break;
+      if (entry?.loc) await collectFromSitemapUrl(entry.loc, urls, depth + 1, maxUrls);
     }
   }
 }
@@ -235,8 +265,9 @@ async function collectFromSitemapUrl(sitemapUrl, urls, depth = 0) {
 // pointing at further sitemaps (followed one level deep only, capped at MAX_NESTED_SITEMAPS files).
 // Returns null (not []) when no sitemap was found/parseable at all, so callers can distinguish
 // "this site has no sitemap, fall back to nav-link discovery" from "sitemap exists but is empty."
-// Out of scope for this pass: .xml.gz sitemaps.
-async function discoverSitemapUrls(baseUrl, extraSitemapUrls = []) {
+// Out of scope for this pass: .xml.gz sitemaps. maxUrls defaults to 500 (enough for a business's
+// own site); the directory crawler passes its own, larger page budget.
+async function discoverSitemapUrls(baseUrl, extraSitemapUrls = [], { maxUrls = MAX_SITEMAP_URLS } = {}) {
   const base = baseUrl.replace(/\/$/, '');
 
   let rootHost;
@@ -247,10 +278,12 @@ async function discoverSitemapUrls(baseUrl, extraSitemapUrls = []) {
   }
 
   const urls = new Set();
-  const candidateSitemaps = [`${base}/sitemap.xml`, ...extraSitemapUrls];
+  // robots.txt may give "Sitemap: /city-sitemap.xml" — resolve relative paths against the site.
+  const resolved = extraSitemapUrls.map((u) => { try { return new URL(u, `${base}/`).toString(); } catch { return null; } }).filter(Boolean);
+  const candidateSitemaps = [`${base}/sitemap.xml`, ...resolved];
   for (const sitemapUrl of candidateSitemaps) {
-    if (urls.size >= MAX_SITEMAP_URLS) break;
-    await collectFromSitemapUrl(sitemapUrl, urls);
+    if (urls.size >= maxUrls) break;
+    await collectFromSitemapUrl(sitemapUrl, urls, 0, maxUrls);
   }
   if (urls.size === 0) return null;
 

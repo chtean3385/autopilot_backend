@@ -176,9 +176,10 @@ router.get('/search', async (req, res) => {
   }
 });
 
-// Get all leads — paginated, enriched with score + group + campaign + message_sent
+// Get all leads — paginated, enriched with group + campaign + message_sent. lead_score / lead_tier are
+// the stored completeness score (services/leadScoreService.js); ?tier=hot|warm|cold filters on it.
 router.get('/', async (req, res) => {
-  const { city, status, emailStatus, q, channel, sequenceEnrollment, page = 1, pageSize = 25 } = req.query;
+  const { city, status, emailStatus, q, channel, sequenceEnrollment, tier, page = 1, pageSize = 25 } = req.query;
   const limit = Math.min(Math.max(Number(pageSize) || 25, 1), 500);
   const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
@@ -194,6 +195,7 @@ router.get('/', async (req, res) => {
   if (status) conditions.push(`hl.status = ${addParam(status)}`);
   if (emailStatus) conditions.push(`hl.email_status = ${addParam(emailStatus)}`);
   if (channel) conditions.push(`hl.channel = ${addParam(channel)}`);
+  if (tier) conditions.push(`hl.lead_tier = ${addParam(tier)}`);
   if (q) {
     const p = addParam(`%${q}%`);
     conditions.push(`(hl.hotel_name ILIKE ${p} OR hl.whatsapp_number LIKE ${p} OR hl.owner_name ILIKE ${p})`);
@@ -221,21 +223,6 @@ router.get('/', async (req, res) => {
 
     const query = `
       SELECT hl.*,
-        LEAST(100,
-          CASE WHEN hl.whatsapp_number IS NOT NULL AND hl.whatsapp_number != '' THEN 20 ELSE 0 END
-          + CASE WHEN hl.owner_name IS NOT NULL AND hl.owner_name != ''
-                      AND LOWER(hl.owner_name) != LOWER(hl.hotel_name) THEN 10 ELSE 0 END
-          + CASE WHEN hl.status = 'demo_qualified' THEN 50
-                 WHEN hl.status = 'responded' THEN 35
-                 WHEN hl.status = 'interested' THEN 25
-                 ELSE 0 END
-          + 0
-          + CASE WHEN hl.email IS NOT NULL AND hl.email != '' THEN 5 ELSE 0 END
-          + CASE WHEN EXISTS(
-                   SELECT 1 FROM outreach_logs WHERE lead_id = hl.id AND response_received = true
-                 ) THEN 20 ELSE 0 END
-          + CASE WHEN hl.created_at > NOW() - INTERVAL '7 days' THEN 10 ELSE 0 END
-        ) AS lead_score,
         (SELECT STRING_AGG(lg.name, ', ' ORDER BY lg.name)
          FROM lead_group_members lgm
          JOIN lead_groups lg ON lg.id = lgm.group_id
@@ -252,7 +239,7 @@ router.get('/', async (req, res) => {
         EXISTS(SELECT 1 FROM outreach_logs WHERE lead_id = hl.id) AS message_sent
       FROM hotel_leads hl
       ${where}
-      ORDER BY lead_score DESC, hl.created_at DESC
+      ORDER BY hl.lead_score DESC, hl.created_at DESC
       LIMIT ${limitP} OFFSET ${offsetP}
     `;
 

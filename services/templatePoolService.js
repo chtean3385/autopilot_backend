@@ -3,7 +3,7 @@ const pool = require('../config/db');
 const WABAService = require('./wabaService');
 const settingsService = require('./settingsService');
 const { trackedCompletion, isAiAvailable } = require('../utils/aiUsage');
-const { WRITING_RULES, SCORING_RUBRIC } = require('../utils/humanTone');
+const { SCORING_RUBRIC } = require('../utils/humanTone');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -12,7 +12,10 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 //
 // For every niche in use (directory_sources.niche, plus 'directory' as the generic fallback):
 //   1. keep WA_TEMPLATE_MIN_POOL message ideas ("groups") alive — approved, waiting for Meta, or drafted
-//   2. a missing idea is written by GPT as WA_TEMPLATE_VARIANTS versions, in that trade's language
+//   2. a missing idea is written by GPT as WA_TEMPLATE_VARIANTS (default 2) versions, in that trade's words;
+//      WA_TEMPLATE_HINDI_IDEAS (1) ideas in Hindi, WA_TEMPLATE_HINGLISH_IDEAS (2) in Hinglish, the rest simple English.
+//      Every message says who we are and why we are writing. An idea that repeats a live idea's meaning
+//      (any language) is dropped before scoring (dropDuplicates)
 //   3. every version is scored 0-5 for "personal, human, specific, not AI" (utils/humanTone.js);
 //      only versions >= WA_TEMPLATE_MIN_SCORE (4.5) are kept, and an idea needs >= 2 kept versions
 //      (one rewrite with the reviewer's feedback, else dropped)
@@ -24,16 +27,36 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const GENERIC_NICHE = 'directory';
 const FOOTER = 'Reply STOP to opt out';
-const DEFAULTS = { groups: 5, variants: 3, minScore: 4.5, maxSubmitPerDay: 15 };
+const DEFAULTS = { groups: 5, variants: 2, minScore: 4.5, maxSubmitPerDay: 15, hindiIdeas: 1, hinglishIdeas: 2 };
+
+// Owner's brief (2026-10-08): Indian owners, so plain words anyone understands, say who we are and why
+// we are writing, and mix in Hinglish and Hindi. The language lives in the group name (_en_/_hing_/_hi_);
+// Meta gets 'hi' for Devanagari text, 'en_US' for everything else (Hinglish is written in English letters).
+const LANGS = {
+  en: 'very simple Indian English. Short, everyday words a shop or factory owner uses. No formal phrases like "would you be open to", "how do you manage", "keep track of", "streamline".',
+  hing: 'Hinglish: Hindi written in English letters, mixed with common English words, the way people type on WhatsApp (e.g. "aapke paas customer ka enquiry WhatsApp pe aata hai?"). Simple and friendly.',
+  hi: 'simple spoken Hindi in Devanagari script (common English words like website, email, WhatsApp, order may stay in English). Not formal or bookish Hindi.',
+};
+// Groups are named <niche>_<lang>_<idea>_<stamp>; older groups have no language part and count as English.
+function langOfGroup(group, niche) {
+  const prefix = `${slug(niche, 20)}_`;
+  const rest = String(group || '').startsWith(prefix) ? String(group).slice(prefix.length) : '';
+  return rest.startsWith('hing_') ? 'hing' : rest.startsWith('hi_') ? 'hi' : 'en';
+}
+const metaLanguage = (body) => (/[ऀ-ॿ]/.test(String(body || '')) ? 'hi' : 'en_US');
 
 async function cfg() {
   const n = async (k, d) => { const v = Number.parseFloat(await settingsService.getSetting(k)); return Number.isFinite(v) && v > 0 ? v : d; };
+  // Like n(), but 0 is allowed ("no Hindi ideas").
+  const count0 = async (k, d) => { const v = Number.parseInt(await settingsService.getSetting(k), 10); return Number.isFinite(v) && v >= 0 ? v : d; };
   const autoRaw = await settingsService.getSetting('WA_TEMPLATE_AUTO_SUBMIT');
   return {
     groups: Math.min(Math.round(await n('WA_TEMPLATE_MIN_POOL', DEFAULTS.groups)), 12),
-    variants: Math.min(Math.max(Math.round(await n('WA_TEMPLATE_VARIANTS', DEFAULTS.variants)), 2), 3),
+    variants: Math.min(Math.max(Math.round(await n('WA_TEMPLATE_VARIANTS', DEFAULTS.variants)), 2), 3), // owner: 2 per idea
     minScore: Math.min(await n('WA_TEMPLATE_MIN_SCORE', DEFAULTS.minScore), 5),
     maxSubmitPerDay: Math.round(await n('WA_TEMPLATE_MAX_SUBMIT_PER_DAY', DEFAULTS.maxSubmitPerDay)),
+    hindiIdeas: await count0('WA_TEMPLATE_HINDI_IDEAS', DEFAULTS.hindiIdeas),
+    hinglishIdeas: await count0('WA_TEMPLATE_HINGLISH_IDEAS', DEFAULTS.hinglishIdeas),
     autoSubmit: autoRaw === null || autoRaw === undefined || autoRaw === '' ? true : String(autoRaw).toLowerCase() === 'true',
   };
 }
@@ -72,17 +95,18 @@ async function poolStatus(niche = null) {
   return { approved: count('approved'), pending: count('pending_approval'), draft: count('draft'), rejected: count('rejected'), liveGroups: live.size, templates: rows };
 }
 
-async function liveGroupCount(niche) {
-  const r = await pool.query(
-    `SELECT COUNT(DISTINCT template_group)::int AS n FROM waba_templates
-     WHERE LOWER(industry) = $1 AND template_group IS NOT NULL AND status IN ('approved', 'pending_approval', 'draft')`,
-    [niche]
-  );
-  return r.rows[0].n;
-}
+// Template-only writing rules (the shared WRITING_RULES are English email/reply rules).
+const TEMPLATE_RULES = `Write like Chetan, founder of Dreams Technology, a small web team in Gandhinagar, typing a short WhatsApp message himself.
+- The FIRST sentence after the greeting says who he is and why he is writing, in plain words, e.g. "Chetan here from Dreams Technology, Gandhinagar. We make websites and business email for <trade> businesses." The reader must never wonder "who is this, why is he messaging me".
+- Then ONE real, everyday situation from their trade, said simply. Then ONE easy question they can answer in a word or two.
+- Simple words only. Short sentences. If a 10th-pass shop owner would need to read it twice, it is too hard.
+- No sales words or jargon: "solution", "leverage", "streamline", "boost", "CRM", "digital transformation", "next level", "seamless".
+- No AI tells: no "I hope this message finds you well", "I wanted to reach out", "I came across", no em dashes (—), no exclamation marks, no emojis, no lists, no flattery.
+- Never invent facts about them. Never criticise their business.`;
 
-async function writeIdeas(niche, count, variants, avoidBodies, rejectionNotes, feedback = null) {
+async function writeIdeas(niche, count, variants, avoidBodies, rejectionNotes, feedback = null, lang = 'en') {
   const trade = niche === GENERIC_NICHE ? 'small and new businesses of any kind (mostly manufacturers and traders in GIDC estates)' : niche;
+  const greeting = lang === 'en' ? '"Hi {{1}}," or "Hello {{1}},"' : '"Namaste {{1}} ji," or "Hi {{1}} ji,"';
   const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
     max_tokens: 2200,
@@ -95,15 +119,17 @@ async function writeIdeas(niche, count, variants, avoidBodies, rejectionNotes, f
           `You write WhatsApp opening messages from Dreams Technology (Gandhinagar) to owners of ${trade} businesses in Gujarat, ` +
           'found in industry association directories. What we can help with: a proper website, a business email (name@company.com), ' +
           'and a simple way to track every enquiry/customer. Do not list all three — pick what fits the idea.\n\n' +
-          `${WRITING_RULES}\n\n` +
+          `${TEMPLATE_RULES}\n\nLanguage: ${LANGS[lang]}\n\n` +
           'Format rules (Meta template):\n' +
-          '- 35-70 words. Start with "Hi {{1}}," or "Hello {{1}}," ({{1}} = first name). {{1}} appears exactly once; no other variables.\n' +
+          `- 35-70 words. Start with ${greeting} ({{1}} = first name). {{1}} appears exactly once; no other variables.\n` +
           '- No links, prices, discounts, "free", or ALL CAPS.\n\n' +
           'This is a template: the same text goes to every owner in the trade, only {{1}} changes. So be specific to the TRADE, ' +
           'not to one company: first list 4-6 concrete everyday situations owners in this trade really deal with (who asks them ' +
-          'for what, where enquiries come from, what gets lost or delayed), then build each idea on one of them, in the words they use.\n\n' +
+          'for what, where enquiries come from, what gets lost or delayed), then build each idea on one of them, in the words they use.\n' +
+          'Each idea must make a DIFFERENT point from every other idea and from the ones already in use (not the same problem in new words; ' +
+          '"messages get lost in WhatsApp" counts as one idea, however it is phrased).\n\n' +
           `Write ${count} DIFFERENT message ideas. For each idea write ${variants} versions that say the same thing in genuinely different words ` +
-          '(different opening line and question wording), each one strong on its own.\n' +
+          '(different opening line and question wording), each one strong on its own and about exactly that idea.\n' +
           'Reply JSON only: {"situations":["..."],"ideas":[{"idea":"2-4 word snake_case name","versions":["...","..."]}]}',
       },
       {
@@ -130,6 +156,10 @@ const TEMPLATE_REVIEW_CONTEXT =
   'one specific business, and it must end with a simple question. Do NOT deduct for that. "Specific" here means: does it describe ' +
   'a real, everyday situation that people in THIS trade recognise, in words they would use? A message that would fit any trade ' +
   'equally well is still generic and must score low.\n' +
+  'It may be in simple English, Hinglish (Hindi in English letters) or Hindi; judge all three the same way, never deduct for the language itself.\n' +
+  'Our readers are Indian small-business owners, many not comfortable with formal English. Score 4.0 or lower if: it does not say ' +
+  'early on who is writing (Chetan / Dreams Technology) and why; it uses formal or hard words ("would you be open to", "manage", ' +
+  '"keep track of", "streamline", bookish Hindi); or the question is not easy to answer in a word or two.\n' +
   'Also check Meta approval risk: high risk = misleading or vague claims, pressure, prices/offers, "free", links, ALL CAPS, ' +
   'threats, asking for sensitive info, or text that reads like spam/promotion more than a conversation opener.';
 
@@ -177,8 +207,9 @@ async function polishVersion(niche, body, note) {
       {
         role: 'system',
         content:
-          `You edit a WhatsApp template from Dreams Technology (Gandhinagar) to owners of ${trade} in Gujarat.\n${WRITING_RULES}\n\n` +
-          'Keep the same idea. Fix exactly what the reviewer said. Keep 35-70 words, start with "Hi {{1}}," or "Hello {{1}},", ' +
+          `You edit a WhatsApp template from Dreams Technology (Gandhinagar) to owners of ${trade} in Gujarat.\n${TEMPLATE_RULES}\n\n` +
+          'Keep the same idea and the same language (English, Hinglish or Hindi) and the same greeting. ' +
+          'Fix exactly what the reviewer said. Keep 35-70 words, ' +
           '{{1}} exactly once, no other variables, no links, prices, "free" or ALL CAPS, end with one easy question.\n' +
           'Reply JSON only: {"text": "..."}',
       },
@@ -223,9 +254,9 @@ async function scoreIdeas(niche, ideas, minScore) {
   return { kept, best, feedback: notes.filter(Boolean).slice(0, 4).join(' | ') };
 }
 
-async function insertGroup(niche, idea, versions) {
+async function insertGroup(niche, idea, versions, lang = 'en') {
   const stamp = new Date().toISOString().slice(2, 10).replace(/-/g, '') + Math.random().toString(36).slice(2, 5);
-  const group = `${slug(niche, 20)}_${slug(idea, 24)}_${stamp}`;
+  const group = `${slug(niche, 20)}_${lang}_${slug(idea, 24)}_${stamp}`;
   const names = [];
   for (let i = 0; i < versions.length; i++) {
     const v = versions[i];
@@ -265,7 +296,7 @@ async function submitDrafts({ limit } = {}) {
   const out = [];
   for (const t of rows) {
     const examples = Array.isArray(t.examples) ? t.examples : JSON.parse(t.examples || '[]');
-    const result = await WABAService.submitTemplateToMeta({ ...t, examples });
+    const result = await WABAService.submitTemplateToMeta({ ...t, examples, language: metaLanguage(t.body_text) });
     if (result.success) {
       await pool.query(
         `UPDATE waba_templates SET status = 'pending_approval', meta_template_id = COALESCE($1, meta_template_id),
@@ -303,33 +334,130 @@ async function syncPending() {
   return { checked: rows.length, changed };
 }
 
-async function ensureNiche(niche, c) {
-  const result = { niche, wrote: [], dropped: 0, bestScore: null, feedback: null };
-  const missing = c.groups - (await liveGroupCount(niche));
-  if (missing <= 0) return result;
-  if (!isAiAvailable()) return { ...result, aiSkipped: true };
+// How many of the missing ideas to write in each language: Hindi and Hinglish quotas first, rest English.
+function missingByLang(c, liveGroups, niche) {
+  const have = { en: 0, hing: 0, hi: 0 };
+  for (const g of liveGroups) have[langOfGroup(g, niche)]++;
+  const hi = Math.min(c.hindiIdeas, c.groups);
+  const hing = Math.min(c.hinglishIdeas, c.groups - hi);
+  const target = { hi, hing, en: c.groups - hi - hing };
+  let room = Math.max(0, c.groups - liveGroups.length);
+  const out = { hi: 0, hing: 0, en: 0 };
+  for (const lang of ['hi', 'hing', 'en']) {
+    out[lang] = Math.min(Math.max(0, target[lang] - have[lang]), room);
+    room -= out[lang];
+  }
+  // Pool short but every language at its quota (old groups count as English) → top up in English.
+  out.en += room;
+  return out;
+}
 
+// Duplicate check, layer 1 (no AI): a version that shares most of its words with a live template of this
+// niche is a reworded copy. The shared self-introduction is ignored, it is in every template by design.
+const INTRO_WORDS = new Set(('chetan here from dreams technology gandhinagar make websites website business email and for the you your ' +
+  'with are this that hai aap aapke aapka namaste hello main hum').split(' '));
+const words = (s) => new Set(String(s || '').toLowerCase().replace(/\{\{1\}\}/g, ' ')
+  .split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 2 && !INTRO_WORDS.has(w)));
+function wordOverlap(a, b) {
+  const A = words(a);
+  const B = words(b);
+  if (!A.size || !B.size) return 0;
+  let shared = 0;
+  for (const w of A) if (B.has(w)) shared++;
+  return shared / Math.min(A.size, B.size);
+}
+const WORD_OVERLAP_MAX = 0.75;
+
+// Layer 2 (GPT): the owner's rule is "not even a similar meaning". An idea that makes the same point as a
+// live idea (in any language) or as another new idea is dropped; a version that is not about its own idea
+// is dropped (the "tender" idea once came back with a "product catalogue" version).
+async function dropDuplicates(niche, ideas, known) {
+  const fresh = [];
+  for (const idea of ideas) {
+    const versions = (Array.isArray(idea.versions) ? idea.versions : [])
+      .filter((v) => !known.some((k) => wordOverlap(v, k.body) >= WORD_OVERLAP_MAX));
+    if (versions.length >= 2) fresh.push({ idea: idea.idea, versions });
+  }
+  if (!fresh.length) return { ideas: [], dropped: ideas.length };
+
+  const list = (arr) => arr.map((x, i) => `${x.label}${i + 1}: ${x.text}`).join('\n') || '(none)';
+  const response = await trackedCompletion(client, {
+    model: 'gpt-4o-mini',
+    max_tokens: 800,
+    temperature: 0,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You check WhatsApp message templates for repeats. Texts may be English, Hinglish or Hindi; compare MEANING, not words or language. ' +
+          'Two ideas are the same if they raise the same problem or ask about the same thing, even in different words ' +
+          '(e.g. "enquiries get lost in WhatsApp" and "hard to keep track of customer messages" are the same).\n' +
+          'For each NEW idea: same_as = the id of an EXISTING idea or an EARLIER new idea it repeats, else null. ' +
+          'off_topic = the letters of its versions that are not about the idea named (a different problem than the other version).\n' +
+          'Reply JSON only: {"ideas":[{"id":"N1","same_as":null,"off_topic":[]}]}',
+      },
+      {
+        role: 'user',
+        content:
+          `EXISTING ideas:\n${list(known.map((k) => ({ label: 'E', text: k.body })))}\n\nNEW ideas:\n` +
+          fresh.map((f, i) => `N${i + 1} (${f.idea}):\n${f.versions.map((v, j) => `  ${String.fromCharCode(97 + j)}) ${v}`).join('\n')}`).join('\n'),
+      },
+    ],
+  }, { purpose: 'wa_template_dedupe' });
+  const verdicts = JSON.parse(response.choices[0].message.content || '{}').ideas;
+  if (!Array.isArray(verdicts)) throw new Error('duplicate check returned no verdicts'); // fail closed: write nothing
+  const kept = [];
+  fresh.forEach((f, i) => {
+    const v = verdicts.find((x) => String(x.id).toUpperCase() === `N${i + 1}`);
+    if (!v || v.same_as) return;
+    const off = new Set((Array.isArray(v.off_topic) ? v.off_topic : []).map((l) => String(l).toLowerCase()));
+    const versions = f.versions.filter((_, j) => !off.has(String.fromCharCode(97 + j)));
+    if (versions.length >= 2) kept.push({ idea: f.idea, versions });
+  });
+  return { ideas: kept, dropped: ideas.length - kept.length };
+}
+
+async function ensureNiche(niche, c) {
+  const result = { niche, wrote: [], dropped: 0, duplicates: 0, bestScore: null, feedback: null };
   const existing = await pool.query(
-    `SELECT body_text, rejection_reason, status FROM waba_templates WHERE LOWER(industry) = $1 AND template_group IS NOT NULL ORDER BY id DESC LIMIT 40`,
+    `SELECT body_text, rejection_reason, status, template_group FROM waba_templates
+     WHERE LOWER(industry) = $1 AND template_group IS NOT NULL ORDER BY id DESC LIMIT 80`,
     [niche]
   );
+  // One representative text per live idea — what new ideas must not repeat.
+  const liveByGroup = new Map();
+  for (const r of existing.rows) {
+    if (['approved', 'pending_approval', 'draft'].includes(r.status) && !liveByGroup.has(r.template_group)) liveByGroup.set(r.template_group, r.body_text);
+  }
+  const missing = missingByLang(c, [...liveByGroup.keys()], niche);
+  if (missing.en + missing.hing + missing.hi <= 0) return result;
+  if (!isAiAvailable()) return { ...result, aiSkipped: true };
+
+  const known = [...liveByGroup.values()].map((body) => ({ body }));
   const avoid = existing.rows.filter((r) => r.status !== 'rejected').map((r) => r.body_text).slice(0, 15);
   const rejections = [...new Set(existing.rows.map((r) => r.rejection_reason).filter(Boolean))].slice(0, 5);
 
-  let feedback = null;
-  let need = missing;
-  for (let round = 1; round <= 2 && need > 0; round++) {
-    const ideas = await writeIdeas(niche, need, c.variants, avoid, rejections, feedback);
-    const scored = await scoreIdeas(niche, ideas, c.minScore);
-    result.dropped += ideas.length - scored.kept.length;
-    if (scored.best !== null && (result.bestScore === null || scored.best > result.bestScore)) result.bestScore = scored.best;
-    if (scored.feedback) result.feedback = scored.feedback;
-    for (const k of scored.kept.slice(0, need)) {
-      result.wrote.push(...(await insertGroup(niche, k.idea, k.versions)));
-      avoid.push(k.versions[0].body);
-      need--;
+  for (const lang of ['en', 'hing', 'hi']) {
+    let feedback = null;
+    let need = missing[lang];
+    for (let round = 1; round <= 2 && need > 0; round++) {
+      const ideas = await writeIdeas(niche, need, c.variants, avoid, rejections, feedback, lang);
+      const distinct = await dropDuplicates(niche, ideas, known);
+      result.duplicates += distinct.dropped;
+      const scored = await scoreIdeas(niche, distinct.ideas, c.minScore);
+      result.dropped += ideas.length - scored.kept.length;
+      if (scored.best !== null && (result.bestScore === null || scored.best > result.bestScore)) result.bestScore = scored.best;
+      if (scored.feedback) result.feedback = scored.feedback;
+      for (const k of scored.kept.slice(0, need)) {
+        result.wrote.push(...(await insertGroup(niche, k.idea, k.versions.slice(0, c.variants), lang)));
+        known.push({ body: k.versions[0].body });
+        avoid.push(k.versions[0].body);
+        need--;
+      }
+      feedback = [scored.feedback, distinct.dropped ? `${distinct.dropped} idea(s) repeated an existing idea, pick a clearly different problem` : '']
+        .filter(Boolean).join(' | ') || null;
     }
-    feedback = scored.feedback;
   }
   return result;
 }
@@ -399,4 +527,4 @@ async function runEnsurePool() {
 
 const isRunning = () => !!running;
 
-module.exports = { ensurePool, ensureNiche, poolStatus, lastRun, isRunning, submitDrafts, syncPending, validateBody, activeNiches, GENERIC_NICHE };
+module.exports = { ensurePool, ensureNiche, poolStatus, lastRun, isRunning, submitDrafts, syncPending, validateBody, activeNiches, wordOverlap, GENERIC_NICHE };

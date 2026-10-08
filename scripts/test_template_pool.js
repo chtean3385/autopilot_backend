@@ -11,7 +11,10 @@ process.env.WABA_API_TOKEN = '';
 // --- GPT stub: writes ideas; scores "LOWQ" versions 3.8, everything else 4.7 ---
 const aiUsage = require(B + 'utils/aiUsage');
 const prompts = [];
+const systems = [];
 let draftCalls = 0;
+let dedupeCalls = 0;
+let dupNext = false; // next duplicate check: call the first new idea a repeat of an existing one
 let aiDown = false;
 aiUsage.trackedCompletion = async (client, params, { purpose } = {}) => {
   if (aiDown) { const e = new Error('Incorrect API key provided (stub)'); e.status = 401; throw e; }
@@ -19,17 +22,29 @@ aiUsage.trackedCompletion = async (client, params, { purpose } = {}) => {
     draftCalls++;
     const user = params.messages[1].content;
     prompts.push(user);
-    const count = Number((params.messages[0].content.match(/Write (\d+) DIFFERENT/) || [])[1] || 1);
-    const variants = Number((params.messages[0].content.match(/write (\d+) versions/) || [])[1] || 3);
+    const system = params.messages[0].content;
+    systems.push(system);
+    const count = Number((system.match(/Write (\d+) DIFFERENT/) || [])[1] || 1);
+    const variants = Number((system.match(/write (\d+) versions/) || [])[1] || 3);
+    const hindi = /Devanagari/.test(system.match(/Language: .*/)?.[0] || '');
     const trade = (user.match(/^Trade: (.*)$/m) || [])[1] || 'x';
     const ideas = Array.from({ length: count }, (_, i) => {
       const weak = draftCalls === 1 && i === 0; // first idea of the first call: only one good version → dropped
+      const t = `q${draftCalls}x${i}`; // words unique to this idea, so the word-overlap check sees different ideas
       return {
         idea: `idea_${draftCalls}_${i}`,
         versions: Array.from({ length: variants }, (__, v) =>
-          `Hi {{1}}, ${weak && v > 0 ? 'LOWQ ' : ''}running a ${trade.slice(0, 30)} unit, when a new buyer asks for your company email, what do you share today? Version ${draftCalls}-${i}-${v}. Would it help if I showed you how others do it?`),
+          `${hindi ? 'Namaste {{1}} ji, नमस्ते' : 'Hi {{1}},'} Chetan here from Dreams Technology. ${weak && v > 0 ? 'LOWQ ' : ''}In ${trade.slice(0, 30)} work ` +
+          `${t}a ${t}b ${t}c ${t}d ${t}e ${t}f ${t}g happens often. Version ${draftCalls}-${i}-${v}. Does this happen with you too?`),
       };
     });
+    return { choices: [{ message: { content: JSON.stringify({ ideas }) } }], usage: {} };
+  }
+  if (purpose === 'wa_template_dedupe') {
+    dedupeCalls++;
+    const n = (params.messages[1].content.match(/^N\d+ \(/gm) || []).length;
+    const ideas = Array.from({ length: n }, (_, i) => ({ id: `N${i + 1}`, same_as: dupNext && i === 0 ? 'E1' : null, off_topic: [] }));
+    dupNext = false;
     return { choices: [{ message: { content: JSON.stringify({ ideas }) } }], usage: {} };
   }
   if (purpose === 'wa_template_score') {
@@ -59,19 +74,31 @@ const groupsOf = async (niche) => (await pool.query(
   const src = (await pool.query(
     `INSERT INTO directory_sources (url, name, niche, city, status) VALUES ($1, 'Tpl test dir', 'Engineering', 'Gandhinagar', 'paused') RETURNING id`,
     [`https://tpl-test-${Date.now()}.example/`])).rows[0];
-  for (const [k, v] of Object.entries({ WA_TEMPLATE_MIN_POOL: 2, WA_TEMPLATE_VARIANTS: 3, WA_TEMPLATE_MAX_SUBMIT_PER_DAY: 100 })) await setSetting(k, v);
-  await pool.query(`DELETE FROM settings WHERE key IN ('WA_TEMPLATE_AUTO_SUBMIT','WA_TEMPLATE_MIN_SCORE')`); // defaults: auto on, 4.5
+  for (const [k, v] of Object.entries({ WA_TEMPLATE_MIN_POOL: 2, WA_TEMPLATE_MAX_SUBMIT_PER_DAY: 100 })) await setSetting(k, v);
+  // defaults: auto on, 4.5, 2 versions per idea, 1 Hindi + 2 Hinglish ideas (pool of 2 → 1 Hindi, 1 Hinglish)
+  await pool.query(`DELETE FROM settings WHERE key IN ('WA_TEMPLATE_AUTO_SUBMIT','WA_TEMPLATE_MIN_SCORE','WA_TEMPLATE_VARIANTS','WA_TEMPLATE_HINDI_IDEAS','WA_TEMPLATE_HINGLISH_IDEAS')`);
+  const submittedLangs = [];
+  const origSubmit = WABAService.submitTemplateToMeta;
+  WABAService.submitTemplateToMeta = async (t) => { submittedLangs.push({ name: t.template_name, language: t.language }); return origSubmit.call(WABAService, t); };
 
-  // 1. First run: every niche gets 2 ideas × 2-3 versions, all >= 4.5, submitted automatically.
+  // 1. First run: every niche gets 2 ideas × 2 versions, all >= 4.5, submitted automatically.
   const r1 = await TP.ensurePool();
   console.log(`      niches: ${r1.niches.map((n) => `${n.niche} (+${n.wrote?.length || 0}, dropped ${n.dropped || 0})`).join(', ')}`);
   const eng = await groupsOf('engineering');
   const gen = await groupsOf('directory');
   check(eng.length === 2 && gen.length === 2, 'each niche (engineering + generic) has 2 live message ideas', `${eng.length}/${gen.length}`);
-  check([...eng, ...gen].every((g) => g.n >= 2 && g.n <= 3), 'every idea has 2-3 versions');
+  check([...eng, ...gen].every((g) => g.n === 2), 'every idea has exactly 2 versions (default)');
   check([...eng, ...gen].every((g) => g.min_score >= 4.5 && !g.lowq), 'no version below 4.5 was kept');
   check(r1.niches.some((n) => n.dropped >= 1), 'an idea with only one good version was dropped and rewritten');
-  check(r1.submitted.length === 12 && r1.submitted.every((s) => s.success), 'all passing versions submitted to Meta automatically (dry-run)', String(r1.submitted.length));
+  check(r1.submitted.length === 8 && r1.submitted.every((s) => s.success), 'all passing versions submitted to Meta automatically (dry-run)', String(r1.submitted.length));
+  check(eng.some((g) => /^engineering_hi_/.test(g.template_group)) && eng.some((g) => /^engineering_hing_/.test(g.template_group)),
+    'pool of 2 → one Hindi and one Hinglish idea', eng.map((g) => g.template_group).join(', '));
+  const hiSubs = submittedLangs.filter((s) => /_hi_/.test(s.name));
+  check(hiSubs.length > 0 && hiSubs.every((s) => s.language === 'hi') && submittedLangs.filter((s) => /_hing_/.test(s.name)).every((s) => s.language === 'en_US'),
+    "Hindi templates go to Meta as 'hi', Hinglish as 'en_US'");
+  check(systems.some((s) => /Chetan here from Dreams Technology/.test(s)) && systems.some((s) => /Hinglish/.test(s.match(/Language: .*/)?.[0] || '')),
+    'writer is told to say who we are, and to write Hinglish/Hindi');
+  check(dedupeCalls > 0, 'every batch of new ideas went through the duplicate check');
   check([...eng, ...gen].every((g) => g.st.every((s) => s === 'pending_approval')), 'submitted templates are pending_approval');
   check(prompts[0].includes('Trade: engineering') || prompts.some((p) => p.includes('Trade: engineering')), 'engineering templates were written for that trade');
 
@@ -96,10 +123,22 @@ const groupsOf = async (niche) => (await pool.query(
   const st = await TP.poolStatus('engineering');
   check(st.approved >= 2 && st.rejected >= 2, 'webhook recorded approvals and rejections', `approved ${st.approved}, rejected ${st.rejected}`);
 
-  // 4. Next run replaces the rejected idea and tells the writer why it was rejected.
+  // 4. Next run replaces the rejected idea and tells the writer why it was rejected. Its first new idea
+  //    is judged a repeat of a live one (same meaning) → dropped, a different one is written instead.
+  dupNext = true;
   const r3 = await TP.ensurePool();
   const engAfter = await groupsOf('engineering');
-  check(engAfter.length === 2 && r3.niches.find((n) => n.niche === 'engineering')?.wrote?.length >= 2, 'rejected idea replaced with a new one');
+  const engRun = r3.niches.find((n) => n.niche === 'engineering');
+  check(engAfter.length === 2 && engRun?.wrote?.length >= 2, 'rejected idea replaced with a new one');
+  check(engRun?.duplicates >= 1, 'an idea with the same meaning as a live idea was dropped', `duplicates ${engRun?.duplicates}`);
+  check(prompts.some((p) => p.includes('repeated an existing idea')), 'writer was told its idea was a repeat');
+
+  // 4b. Word-overlap guard (no AI): a reworded copy is caught; a different idea is not.
+  const a = 'Hi {{1}}, Chetan here from Dreams Technology. When a dealer asks for your price list on WhatsApp, the message gets buried under other chats. Does that happen with you?';
+  const b = 'Hello {{1}}, Chetan here from Dreams Technology. When a dealer asks for your price list on WhatsApp, it gets buried under other chats quickly. Does that happen to you?';
+  const d = 'Hi {{1}}, Chetan here from Dreams Technology. Tender forms often ask for a company email id and a website link. What do you put there today?';
+  check(TP.wordOverlap(a, b) >= 0.75 && TP.wordOverlap(a, d) < 0.75, 'word overlap: reworded copy flagged, different idea not',
+    `${TP.wordOverlap(a, b).toFixed(2)} / ${TP.wordOverlap(a, d).toFixed(2)}`);
   check(prompts[prompts.length - 1].includes('PROMOTIONAL_CONTENT_TOO_SALESY'), "Meta's rejection reason was given to the writer");
 
   // 5. Hourly sync safety net: pending for over an hour → ask Meta → approved.

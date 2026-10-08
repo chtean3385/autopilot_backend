@@ -165,7 +165,8 @@ async function discoverPages(source) {
   }
 
   const maxPages = await intSetting('DIRECTORY_MAX_PAGES', DEFAULT_MAX_PAGES);
-  const sitemapUrls = await discoverSitemapUrls(base, robots.sitemaps);
+  // Headroom over maxPages: non-member URLs are filtered out below, after collection.
+  const sitemapUrls = await discoverSitemapUrls(base, robots.sitemaps, { maxUrls: Math.min(maxPages * 2, 50000) });
 
   if (sitemapUrls) {
     const urls = [normalizeUrl(source.url), ...sitemapUrls]
@@ -273,6 +274,85 @@ function extractMembersByRules(html, pageUrl) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// schema.org JSON-LD extraction. Many directory platforms (e.g. *.idbf.in) put each business's
+// name / telephone / website / address in a LocalBusiness block for Google — structured, free and
+// exact, so it's tried before the "Label : value" rules and GPT. Returns:
+//   - [members]  when the page has business JSON-LD
+//   - []         when it's clearly a listing page (CollectionPage/ItemList/SearchResultsPage) with
+//                no contact details of its own — nothing to extract, and no GPT call wasted on it
+//   - null       otherwise (no usable JSON-LD → fall through to rules / GPT)
+// ---------------------------------------------------------------------------------------------
+const JSONLD_NON_BUSINESS = /^(WebSite|WebPage|CollectionPage|ItemList|ListItem|BreadcrumbList|FAQPage|Question|Answer|SearchResultsPage|SearchAction|Person|ImageObject|Article|BlogPosting|NewsArticle|Product|Offer|Review|AggregateRating|PostalAddress|GeoCoordinates|ContactPoint|SiteNavigationElement|Event|Place)$/i;
+const JSONLD_LISTING = /^(CollectionPage|ItemList|SearchResultsPage)$/i;
+
+function jsonLdNodes(html) {
+  const $ = require('cheerio').load(html);
+  const nodes = [];
+  const walk = (v) => {
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== 'object') return;
+    nodes.push(v);
+    if (v['@graph']) walk(v['@graph']);
+  };
+  $('script[type="application/ld+json"]').each((_, el) => {
+    try { walk(JSON.parse($(el).contents().text())); } catch { /* malformed block — skip it */ }
+  });
+  return nodes;
+}
+
+const typesOf = (node) => [].concat(node['@type'] || []).map(String);
+const firstString = (v) => (Array.isArray(v) ? v.find((x) => typeof x === 'string') : typeof v === 'string' ? v : null) || null;
+
+function jsonLdAddress(addr) {
+  if (!addr) return null;
+  if (typeof addr === 'string') return addr.trim() || null;
+  const parts = [addr.streetAddress, addr.addressLocality, addr.postalCode, addr.addressRegion]
+    .map((p) => (typeof p === 'string' ? p.trim() : '')).filter(Boolean);
+  return parts.length ? parts.join(', ') : null;
+}
+
+function extractMembersByJsonLd(html, pageUrl) {
+  const nodes = jsonLdNodes(html);
+  if (nodes.length === 0) return null;
+
+  // Breadcrumb "Home › Printing Presses › Puthawala Printers" → category = the item before the business.
+  const crumbs = nodes.find((n) => typesOf(n).includes('BreadcrumbList'));
+  const crumbNames = (Array.isArray(crumbs?.itemListElement) ? crumbs.itemListElement : [])
+    .sort((a, b) => (a.position || 0) - (b.position || 0)).map((i) => cleanText(String(i?.name || i?.item?.name || '')));
+
+  const members = [];
+  for (const node of nodes) {
+    const types = typesOf(node);
+    if (types.length === 0 || types.every((t) => JSONLD_NON_BUSINESS.test(t))) continue;
+    const name = cleanText(String(node.name || ''));
+    const phones = [].concat(node.telephone || []).map(String).filter(Boolean);
+    const emails = [].concat(node.email || []).map((e) => String(e).replace(/^mailto:/i, '')).filter(Boolean);
+    if (!name || (phones.length === 0 && emails.length === 0)) continue;
+    // The directory describing itself (Organization pointing at its own homepage) is not a member.
+    const ownUrl = firstString(node.url);
+    if (types.some((t) => /^Organization$/i.test(t)) && ownUrl && sameSite(ownUrl, pageUrl)) continue;
+
+    const nameIdx = crumbNames.lastIndexOf(name);
+    members.push({
+      company: name,
+      contacts: [],
+      phones,
+      emails,
+      website: ownUrl, // cleanWebsite() drops it if it's just the directory's own page
+      address: jsonLdAddress(node.address),
+      category: (nameIdx > 1 ? crumbNames[nameIdx - 1] : null) || null,
+      products: null,
+    });
+  }
+  if (members.length > 0) return members;
+
+  const isListing = nodes.some((n) => typesOf(n).some((t) => JSONLD_LISTING.test(t)));
+  const { mailtoEmails, telNumbers } = extractMailtoTel(html);
+  if (isListing && mailtoEmails.length === 0 && telNumbers.length === 0) return [];
+  return null;
+}
+
+// ---------------------------------------------------------------------------------------------
 // GPT extraction (fallback): one call per page → zero or more member businesses. Non-member pages
 // simply return []. Values must appear verbatim on the page (same rule as enrichmentService).
 // ---------------------------------------------------------------------------------------------
@@ -315,8 +395,10 @@ async function extractMembersWithGpt(html, pageUrl, source) {
   return Array.isArray(parsed.members) ? parsed.members : [];
 }
 
-// Rules first (free); GPT only for pages the rules don't recognise. Returns { members, via }.
+// JSON-LD, then rules (both free); GPT only for pages neither recognises. Returns { members, via }.
 async function extractMembers(html, pageUrl, source) {
+  const byJsonLd = extractMembersByJsonLd(html, pageUrl);
+  if (byJsonLd) return { members: byJsonLd, via: 'jsonld' };
   const byRules = extractMembersByRules(html, pageUrl);
   if (byRules) return { members: byRules, via: 'rules' };
   return { members: await extractMembersWithGpt(html, pageUrl, source), via: 'gpt' };
@@ -570,6 +652,6 @@ async function setStatus(id, status) {
 }
 
 module.exports = {
-  crawlSource, discoverPages, extractMembers, extractMembersByRules, toEntry, suggestSources, addSource, setStatus,
+  crawlSource, discoverPages, extractMembers, extractMembersByRules, extractMembersByJsonLd, toEntry, suggestSources, addSource, setStatus,
   isDisallowed, isBlockedDomain, BLOCKED_DOMAINS,
 };

@@ -183,7 +183,7 @@ class WABAService {
 
       const payload = {
         name: templateData.template_name,
-        language: 'en_US',
+        language: templateData.language || 'en_US', // 'hi' for Hindi directory templates (templatePoolService)
         category: templateData.template_category || 'MARKETING',
         components
       };

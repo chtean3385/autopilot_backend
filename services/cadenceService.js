@@ -189,7 +189,10 @@ async function enrollNewLeads(cfg) {
      LEFT JOIN lead_cadence lc ON lc.lead_id = hl.id
      WHERE hl.cadence_managed AND lc.lead_id IS NULL
        AND hl.status = 'new' AND hl.needs_attention = FALSE AND COALESCE(hl.ai_paused, FALSE) = FALSE
-     ORDER BY hl.id
+       -- a mobile or an email (verified now or pending) — leads with neither (landline/website only)
+       -- must not fill this window ahead of contactable ones
+       AND (hl.whatsapp_number ~ '^91[6-9][0-9]{9}$' OR COALESCE(TRIM(hl.email), '') <> '')
+     ORDER BY hl.lead_score DESC, hl.id -- hot leads (most complete contact data) start first
      LIMIT $1`,
     [(remaining.email + remaining.whatsapp) * 3]
   );
