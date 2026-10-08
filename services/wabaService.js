@@ -208,6 +208,37 @@ class WABAService {
     }
   }
 
+  // Meta template status → our waba_templates.status
+  static localStatus(metaStatus) {
+    const statusMap = {
+      APPROVED: 'approved',
+      REJECTED: 'rejected',
+      PENDING: 'pending_approval',
+      PENDING_DELETION: 'pending_approval',
+      DELETED: 'rejected',
+      DISABLED: 'rejected',
+      PAUSED: 'pending_approval'
+    };
+    return statusMap[metaStatus] || 'pending_approval';
+  }
+
+  // Every template on the WABA, all pages: Map(name → {id, status, rejected_reason}). Throws on any
+  // failed page — callers that delete local rows for "missing" names must never act on a partial list.
+  static async listAllMetaTemplates() {
+    if (isDryRun()) throw new Error('OUTBOUND_DRY_RUN: Meta template list not fetched');
+    const byName = new Map();
+    let url = `${WABA_API_URL}/${process.env.WABA_BUSINESS_ACCOUNT_ID}/message_templates`;
+    let params = { fields: 'name,status,id,rejected_reason', limit: 100 };
+    for (let page = 0; url && page < 100; page++) {
+      const response = await axios.get(url, { params, headers: { Authorization: `Bearer ${process.env.WABA_API_TOKEN}` } });
+      for (const t of response.data.data || []) byName.set(t.name, t);
+      url = response.data.paging?.next || null;
+      params = undefined; // the "next" URL already carries them
+    }
+    if (url) throw new Error('Meta template list too long (over 100 pages)');
+    return byName;
+  }
+
   // Fetch current approval status from Meta
   static async syncTemplateStatus(templateName) {
     try {
@@ -216,22 +247,13 @@ class WABAService {
         { headers: { Authorization: `Bearer ${process.env.WABA_API_TOKEN}` } }
       );
 
-      const template = response.data.data?.[0];
-      if (!template) return { success: false, error: 'Template not found on Meta' };
-
-      const statusMap = {
-        APPROVED: 'approved',
-        REJECTED: 'rejected',
-        PENDING: 'pending_approval',
-        PENDING_DELETION: 'pending_approval',
-        DELETED: 'rejected',
-        DISABLED: 'rejected',
-        PAUSED: 'pending_approval'
-      };
+      // Meta's ?name= filter is a partial match ("industries" also returns "industries_v2") — take the exact one.
+      const template = (response.data.data || []).find((t) => t.name === templateName);
+      if (!template) return { success: false, notFound: true, error: 'Template not found on Meta' };
 
       return {
         success: true,
-        status: statusMap[template.status] || 'pending_approval',
+        status: WABAService.localStatus(template.status),
         meta_status: template.status,
         quality_score: template.quality_score,
         meta_id: String(template.id || ''),

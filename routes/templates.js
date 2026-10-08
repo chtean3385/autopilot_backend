@@ -147,35 +147,65 @@ router.post('/:id/sync-status', async (req, res) => {
   }
 });
 
-// Sync all non-draft templates from Meta at once
+// Sync every template with Meta in one pass (Meta's full list, exact name match). A template we submitted
+// that Meta no longer has (deleted in WhatsApp Manager) is removed here too (owner, 2026-10-08); its old
+// campaign/outreach/task rows keep their history with template_id cleared. Drafts were never on Meta and
+// are left alone. If Meta's list can't be fetched, nothing is changed or removed.
 router.post('/sync-all', async (req, res) => {
   try {
-    const tplResult = await pool.query(
-      `SELECT * FROM waba_templates ORDER BY id`
-    );
-    const templates = tplResult.rows;
+    const onMeta = await WABAService.listAllMetaTemplates();
+    const { rows: templates } = await pool.query(`SELECT * FROM waba_templates ORDER BY id`);
     const results = [];
+    const gone = [];
 
     for (const t of templates) {
-      const sync = await WABAService.syncTemplateStatus(t.template_name);
-      if (sync.success) {
+      const m = onMeta.get(t.template_name);
+      if (m && !['DELETED', 'PENDING_DELETION'].includes(m.status)) {
+        const status = WABAService.localStatus(m.status);
         await pool.query(
           `UPDATE waba_templates
-           SET status = $1,
-               meta_template_id = COALESCE($2, meta_template_id),
+           SET status = $1::varchar, meta_template_id = COALESCE($2, meta_template_id),
+               rejection_reason = CASE WHEN $1::varchar = 'rejected' THEN COALESCE($3, rejection_reason) ELSE rejection_reason END,
                updated_at = NOW()
-           WHERE id = $3`,
-          [sync.status, sync.meta_id || null, t.id]
+           WHERE id = $4`,
+          [status, String(m.id || '') || null, m.rejected_reason && m.rejected_reason !== 'NONE' ? m.rejected_reason : null, t.id]
         );
-        results.push({ id: t.id, name: t.template_name, status: sync.status, meta_status: sync.meta_status });
-      } else {
-        results.push({ id: t.id, name: t.template_name, error: sync.error });
+        results.push({ id: t.id, name: t.template_name, status, meta_status: m.status });
+      } else if (t.status !== 'draft') {
+        gone.push(t);
       }
     }
 
-    res.json({ success: true, synced: results.length, results });
+    // Guard: an empty or unrelated list (wrong WABA id/token) would look like "everything was deleted".
+    const submitted = templates.filter((t) => t.status !== 'draft').length;
+    if (gone.length && onMeta.size === 0) {
+      return res.json({ success: true, synced: results.length, results, removed: [],
+        warning: `Meta returned no templates at all, so ${gone.length} local template(s) were NOT removed. Check the WABA account settings.` });
+    }
+
+    const removed = [];
+    for (const t of gone) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        for (const table of ['campaigns', 'outreach_logs', 'agent_tasks']) {
+          await client.query(`UPDATE ${table} SET template_id = NULL WHERE template_id = $1`, [t.id]);
+        }
+        await client.query('DELETE FROM waba_templates WHERE id = $1', [t.id]);
+        await client.query('COMMIT');
+        removed.push(t.template_name);
+      } catch (err) {
+        await client.query('ROLLBACK');
+        results.push({ id: t.id, name: t.template_name, error: `not on Meta, but could not remove: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    }
+    if (removed.length) console.log(`[Templates] sync-all removed ${removed.length} template(s) no longer on Meta: ${removed.join(', ')}`);
+
+    res.json({ success: true, synced: results.length, results, removed, submitted });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: `Could not read templates from Meta, nothing changed: ${err.response?.data?.error?.message || err.message}` });
   }
 });
 
