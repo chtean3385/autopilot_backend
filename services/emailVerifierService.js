@@ -1,5 +1,6 @@
 const axios = require('axios');
 const { getSetting } = require('./settingsService');
+const channelHealth = require('../utils/channelHealth');
 
 // mails.so — POST /v1/validate?email=... , auth via x-mails-api-key header.
 // Response shape: { data: { result: 'deliverable'|'undeliverable'|'risky'|'unknown', ... }, error: string|null }
@@ -24,7 +25,8 @@ async function verifyEmail(email) {
   const apiKey = await getSetting('VERIFIER_API_KEY');
   if (!apiKey) {
     console.error('[EmailVerifier] verifyEmail error: VERIFIER_API_KEY not configured');
-    return { valid: false, status: 'error' };
+    channelHealth.markError('verifier', 'VERIFIER_API_KEY not configured');
+    return { valid: false, status: 'error', providerDown: true };
   }
 
   try {
@@ -39,10 +41,20 @@ async function verifyEmail(email) {
     });
 
     const result = response.data?.data?.result || 'unknown';
+    channelHealth.markOk('verifier');
     return { valid: isValidResult(result), status: result };
   } catch (error) {
     console.error('[EmailVerifier] verifyEmail error:', error.response?.data || error.message);
-    return { valid: false, status: 'error' };
+    // providerDown: mails.so itself can't answer (no credit, bad key, outage, network) — says nothing
+    // about this address, so callers must not count it against the lead. Only a 400/422 (it rejected
+    // this one input) is about the address.
+    const status = error.response?.status;
+    const providerDown = !(status === 400 || status === 422);
+    if (providerDown) {
+      const detail = error.response?.data?.error || error.response?.data?.message || error.message;
+      channelHealth.markError('verifier', `mails.so: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}${status ? ` (HTTP ${status})` : ''}`);
+    }
+    return { valid: false, status: 'error', providerDown };
   }
 }
 

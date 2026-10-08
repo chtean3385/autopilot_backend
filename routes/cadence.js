@@ -10,7 +10,7 @@ const router = express.Router();
 
 router.get('/summary', async (req, res) => {
   try {
-    const [cfg, byStatus, today, waiting] = await Promise.all([
+    const [cfg, byStatus, today, waiting, waitReasons] = await Promise.all([
       loadConfig(),
       pool.query(`SELECT status, COUNT(*)::int AS n FROM lead_cadence GROUP BY status`),
       pool.query(
@@ -27,12 +27,19 @@ router.get('/summary', async (req, res) => {
         `SELECT COUNT(*)::int AS n FROM hotel_leads hl LEFT JOIN lead_cadence lc ON lc.lead_id = hl.id
          WHERE hl.cadence_managed AND lc.lead_id IS NULL AND hl.status = 'new'`
       ),
+      // Why in-progress leads are waiting (cadenceService.deferTouch); cleared when a touch is sent.
+      pool.query(
+        `SELECT last_wait_reason AS reason, COUNT(*)::int AS n FROM lead_cadence
+         WHERE status IN ('active', 'resting') AND last_wait_reason IS NOT NULL
+         GROUP BY last_wait_reason ORDER BY n DESC`
+      ),
     ]);
     res.json({
       config: cfg,
       byStatus: Object.fromEntries(byStatus.rows.map((r) => [r.status, r.n])),
       today: today.rows[0],
       notStarted: waiting.rows[0].n,
+      waiting: waitReasons.rows,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

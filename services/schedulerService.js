@@ -831,6 +831,8 @@ async function runEmailTask(task) {
       business_category: r.business_category,
       channel: 'email',
       email_source: 'agent',
+      // Not verified yet (mails.so down/out of credit)? Enrolled later, once it is.
+      enroll_sequence_id: task.sequence_id,
     }));
     const insertResult = await LeadService.addLeads(toInsert);
     const verifiedIds = insertResult.inserted.filter(l => l.email_status === 'verified').map(l => l.id);

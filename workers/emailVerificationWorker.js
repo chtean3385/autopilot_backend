@@ -2,15 +2,27 @@ const schedule = require('node-schedule');
 const pool = require('../config/db');
 const { verifyEmail } = require('../services/emailVerifierService');
 const { getSetting } = require('../services/settingsService');
+const SequenceService = require('../services/sequenceService');
 
 // Hourly catch-up pass for leads that never got a verification verdict — typically
 // added before VERIFIER_API_KEY was configured, or when mails.so was unreachable.
-// Capped per run and per lead (MAX_ATTEMPTS) so a bad key can't burn quota forever.
+// Capped per run and per lead (MAX_ATTEMPTS) so a bad key can't burn quota forever. A lead that used
+// up its attempts is retried once a week (RETRY_STUCK_AFTER) rather than never again.
+// mails.so itself down (no credit, bad key, outage) → the pass stops and no attempt is counted: an
+// outage says nothing about the address (before 2026-10-08 it burned all 3 attempts and stranded
+// 79% of email leads — CLAUDE.md, 2026-09-18). Health banner + owner alert: services/cadenceHealthService.js.
+// Every pass also enrolls newly verified leads that were saved with a sequence picked.
 const BATCH_LIMIT = 30;
 const MAX_ATTEMPTS = 3;
+const RETRY_STUCK_AFTER = '7 days';
 const DELAY_BETWEEN_CALLS_MS = 500;
 
 let isRunning = false;
+
+async function enrollPending() {
+  const r = await SequenceService.enrollPendingVerified();
+  if (r.enrolled) console.log(`[VerifyWorker] Enrolled ${r.enrolled} newly verified lead(s) into their picked sequence`);
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -32,15 +44,18 @@ async function runVerificationPass() {
        WHERE channel = 'email'
          AND email IS NOT NULL AND email <> ''
          AND email_status IN ('unknown', 'found')
-         AND COALESCE(email_verify_attempts, 0) < $1
+         AND (COALESCE(email_verify_attempts, 0) < $1 OR last_verify_attempt_at < NOW() - INTERVAL '${RETRY_STUCK_AFTER}')
          AND (last_verify_attempt_at IS NULL OR last_verify_attempt_at < NOW() - INTERVAL '55 minutes')
          ${apiKey ? '' : `AND email ~* '@(gmail|googlemail)\\.com$'`}
-       ORDER BY created_at ASC
+       ORDER BY (email ~* '@(gmail|googlemail)\\.com$') DESC, created_at ASC -- Gmail first: needs no mails.so
        LIMIT $2`,
       [MAX_ATTEMPTS, BATCH_LIMIT]
     );
 
-    if (result.rows.length === 0) return;
+    if (result.rows.length === 0) {
+      await enrollPending();
+      return;
+    }
     console.log(`[VerifyWorker] Re-verifying ${result.rows.length} lead(s)...`);
 
     let verified = 0;
@@ -48,6 +63,10 @@ async function runVerificationPass() {
     for (const lead of result.rows) {
       const verification = await verifyEmail(lead.email);
 
+      if (verification.providerDown) {
+        console.warn('[VerifyWorker] mails.so is not answering (credit/key/outage) — stopping this pass, no attempts counted; retry next hour');
+        break;
+      }
       if (verification.status === 'error') {
         // Verifier unreachable/misconfigured — record the attempt so we don't hammer
         // the API, but keep status 'unknown' (an outage is not a verdict on the address).
@@ -76,6 +95,7 @@ async function runVerificationPass() {
     }
 
     console.log(`[VerifyWorker] Pass complete — ${verified} verified, ${unverifiable} unverifiable`);
+    await enrollPending();
   } catch (err) {
     console.error('[VerifyWorker] Error in verification pass:', err.message);
   } finally {

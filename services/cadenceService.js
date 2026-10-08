@@ -153,17 +153,19 @@ async function saveState(leadId, s) {
   await pool.query(
     `UPDATE lead_cadence SET current_channel=$2, touches_on_channel=$3, total_touches=$4, cycle=$5, status=$6,
        next_touch_at=$7, last_touch_at=$8, last_channel=$9, cycle_start_channel=$10, stop_reason=$11,
-       wa_unusable=$12, updated_at=NOW()
+       wa_unusable=$12, last_wait_reason=NULL, updated_at=NOW()
      WHERE lead_id=$1`,
     [leadId, s.current_channel, s.touches_on_channel, s.total_touches, s.cycle, s.status, s.next_touch_at,
      s.last_touch_at, s.last_channel, s.cycle_start_channel, s.stop_reason || null, Boolean(s.wa_unusable)]
   );
 }
 
+// reason is kept in last_wait_reason so Lead Sources can say why leads are waiting (cleared on a send).
 async function deferTouch(leadId, hours, reason) {
   await pool.query(
-    `UPDATE lead_cadence SET next_touch_at = NOW() + ($2 || ' hours')::interval, updated_at = NOW() WHERE lead_id = $1`,
-    [leadId, String(hours)]
+    `UPDATE lead_cadence SET next_touch_at = NOW() + ($2 || ' hours')::interval, last_wait_reason = $3, updated_at = NOW()
+     WHERE lead_id = $1`,
+    [leadId, String(hours), String(reason).slice(0, 40)]
   );
   return `deferred:${reason}`;
 }

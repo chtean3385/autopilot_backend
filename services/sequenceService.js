@@ -109,6 +109,27 @@ class SequenceService {
     return { success: true, enrolled, skippedNotEligible, skippedUnverified, skippedAlreadyEnrolled, skippedCadenceManaged };
   }
 
+  // Leads saved with a sequence picked (hotel_leads.enroll_sequence_id — Bulk Domain List, Google Places
+  // agent task) are enrolled as soon as their email is verified, whenever that happens: right away,
+  // on a later verifier pass (mails.so was down), or after a manual "verified" override in Edit Lead.
+  // Unverified ones stay pending. Called by workers/emailVerificationWorker.js every pass.
+  static async enrollPendingVerified() {
+    const { rows } = await pool.query(
+      `SELECT id, enroll_sequence_id FROM hotel_leads
+       WHERE enroll_sequence_id IS NOT NULL AND email_status = 'verified'`
+    );
+    const bySequence = new Map();
+    for (const r of rows) bySequence.set(r.enroll_sequence_id, [...(bySequence.get(r.enroll_sequence_id) || []), r.id]);
+    let enrolled = 0;
+    for (const [sequenceId, ids] of bySequence) {
+      const result = await this.enrollLeads(sequenceId, ids);
+      enrolled += result.enrolled || 0;
+      // Done either way: enrolled now, or not eligible (already in a sequence, directory-managed…).
+      await pool.query(`UPDATE hotel_leads SET enroll_sequence_id = NULL WHERE id = ANY($1::int[])`, [ids]);
+    }
+    return { enrolled, checked: rows.length };
+  }
+
   // Zero out sent_today for any sequence whose counter is from a previous day
   static async resetStaleCounters() {
     await pool.query(

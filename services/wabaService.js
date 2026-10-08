@@ -1,6 +1,19 @@
 const axios = require('axios');
 require('dotenv').config();
 const { isDryRun, dryRunResult } = require('../utils/dryRun');
+const channelHealth = require('../utils/channelHealth');
+
+// Meta error codes that mean the whole WhatsApp account can't send (token, permissions, rate/spam
+// limits, policy block, payment, account locked) — vs. one recipient (not on WhatsApp, outside the
+// 24h window) or one template, which say nothing about the channel. No response at all = network.
+const ACCOUNT_ERROR_CODES = new Set([0, 3, 4, 10, 190, 200, 368, 80007, 130429, 131000, 131031, 131042, 131048]);
+function markWhatsappFailure(error) {
+  const err = error.response?.data?.error;
+  const status = error.response?.status;
+  if (!error.response || status >= 500 || status === 401 || ACCOUNT_ERROR_CODES.has(err?.code)) {
+    channelHealth.markError('whatsapp', err ? `${err.message} (code ${err.code})` : error.message);
+  }
+}
 
 // WhatsApp Cloud API base URL (graph.facebook.com — NOT instagram)
 const WABA_API_URL = `https://graph.facebook.com/${process.env.WABA_API_VERSION || 'v18.0'}`;
@@ -51,9 +64,11 @@ class WABAService {
       );
 
       console.log(`[WABA] Message sent. ID: ${response.data.messages[0].id}`);
+      channelHealth.markOk('whatsapp');
       return { success: true, messageId: response.data.messages[0].id, timestamp: new Date() };
     } catch (error) {
       console.error('[WABA] Error sending message:', error.response?.data || error.message);
+      markWhatsappFailure(error);
       return { success: false, error: error.response?.data?.error?.message || error.message };
     }
   }
@@ -313,9 +328,11 @@ class WABAService {
       );
 
       console.log(`[WABA] Message sent. ID: ${response.data.messages[0].id}`);
+      channelHealth.markOk('whatsapp');
       return { success: true, messageId: response.data.messages[0].id, timestamp: new Date() };
     } catch (error) {
       console.error('[WABA] Error sending message:', error.response?.data || error.message);
+      markWhatsappFailure(error);
       return { success: false, error: error.response?.data?.error?.message || error.message };
     }
   }
@@ -335,9 +352,11 @@ class WABAService {
         payload,
         { headers: { Authorization: `Bearer ${process.env.WABA_API_TOKEN}`, 'Content-Type': 'application/json' } }
       );
+      channelHealth.markOk('whatsapp');
       return { success: true, messageId: response.data.messages[0].id };
     } catch (error) {
       console.error('[WABA] sendTextMessage error:', error.response?.data || error.message);
+      markWhatsappFailure(error);
       return { success: false, error: error.response?.data?.error?.message || error.message };
     }
   }

@@ -10,6 +10,7 @@ const PlaybookService = require('../services/playbookService');
 const { logAgentAction, notifyOwner, sendOrQueueReply } = require('../services/replyDeliveryService');
 const { trackedCompletion } = require('../utils/aiUsage');
 const { handleCadenceReply } = require('../services/cadenceReplyService');
+const channelHealth = require('../utils/channelHealth');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const HISTORY_LIMIT = 20;
@@ -261,12 +262,14 @@ async function pollSenderMailbox(sender) {
       lock.release();
     }
     await imapClient.logout();
+    channelHealth.markOk(`imap:${sender.id}`);
 
     if (maxUidSeen > (cfg.lastUid || 0)) {
       await EmailSenderService.update(sender.id, { imap_config: { ...cfg, lastUid: maxUidSeen } });
     }
   } catch (err) {
     console.error(`[ReplyWorker] IMAP error for sender ${sender.id} (${sender.label}):`, err.message);
+    channelHealth.markError(`imap:${sender.id}`, `${sender.label}: ${err.message}`);
     try { await imapClient.close(); } catch { /* already closed */ }
   }
 }

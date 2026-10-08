@@ -3,6 +3,7 @@ const axios = require('axios');
 const nodemailer = require('nodemailer');
 const { isDryRun, dryRunResult } = require('../utils/dryRun');
 const { getSetting, setSetting } = require('./settingsService');
+const channelHealth = require('../utils/channelHealth');
 
 const WARMUP_START_CAP = 10; // day 1 daily cap during warmup
 const WARMUP_STEP = 10;      // added per full week elapsed
@@ -10,6 +11,16 @@ const ROTATION_BATCH_DEFAULT = 10;                   // new leads per sender bef
 const ROTATION_STATE_KEY = 'EMAIL_ROTATION_STATE';
 const COMPANY_LINE = 'Dreams Technology, Gandhinagar · +91 84607 65785';
 const WEBSITE_LINE = 'https://dreamstechnology.in/';
+
+// A rejected recipient (400 "invalid email") is about that one lead; anything else — auth, Brevo's
+// authorised-IP block, credit/quota, provider down, network — means no email can go out.
+// status is Brevo's HTTP status, or the SMTP reply code (550-553 = that mailbox refused it).
+function isChannelFailure({ status, error }) {
+  if (!status) return true;
+  if (status >= 550 && status <= 553) return false;
+  if (status === 400) return /sender|ip address|unauthori[sz]ed|api.?key|credit|quota|account|suspend/i.test(error || '');
+  return status === 401 || status === 402 || status === 403 || status === 429 || status >= 500;
+}
 
 class EmailSenderService {
   static async getAll() {
@@ -305,10 +316,13 @@ class EmailSenderService {
       }
 
       await this.incrementSentCount(sender.id);
+      channelHealth.markOk('email');
       return { success: true, messageId };
     } catch (error) {
       console.error('[EmailSender] send error:', error.response?.data || error.message);
-      return { success: false, error: error.response?.data?.message || error.message, status: error.response?.status || null };
+      const result = { success: false, error: error.response?.data?.message || error.message, status: error.response?.status || error.responseCode || null };
+      if (isChannelFailure(result)) channelHealth.markError('email', `${sender.label || sender.from_email}: ${result.error}`);
+      return result;
     }
   }
 }

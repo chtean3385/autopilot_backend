@@ -2,7 +2,7 @@ const schedule = require('node-schedule');
 const { runCadence, loadConfig } = require('../services/cadenceService');
 const pool = require('../config/db');
 const { ensurePool, syncPending } = require('../services/templatePoolService');
-const { sendDailyHealthAlert, sendWeeklySummary } = require('../services/cadenceHealthService');
+const { sendUrgentAlert, sendDailyHealthAlert, sendWeeklySummary } = require('../services/cadenceHealthService');
 
 // Directory outreach step 3 — every 15 min: start today's quota of new directory leads, then send
 // whatever cadence touches are due (one channel per lead, never both). Does nothing unless
@@ -33,6 +33,11 @@ schedule.scheduleJob('17 * * * *', () => {
 // failures are what hid the 2026-09 email outage for 6 weeks). Weekly Monday 09:30 IST: summary.
 schedule.scheduleJob({ hour: 18, minute: 30, tz: 'Asia/Kolkata' }, () => {
   sendDailyHealthAlert().catch((err) => console.error('[CadenceHealth] daily alert failed:', err.message));
+});
+// Hourly 08:40-22:40 IST: anything actually broken (email/WhatsApp sending, reply checking, mails.so)
+// is WhatsApped right away, not at 18:30 — the same problem at most every 6 hours, never at night.
+schedule.scheduleJob({ hour: new schedule.Range(8, 22), minute: 40, tz: 'Asia/Kolkata' }, () => {
+  sendUrgentAlert().catch((err) => console.error('[Health] urgent alert failed:', err.message));
 });
 schedule.scheduleJob({ dayOfWeek: 1, hour: 9, minute: 30, tz: 'Asia/Kolkata' }, () => {
   sendWeeklySummary().catch((err) => console.error('[CadenceHealth] weekly summary failed:', err.message));

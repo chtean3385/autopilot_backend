@@ -116,7 +116,7 @@ router.post('/run-sequences', async (req, res) => {
 router.get('/scheduler-status', async (req, res) => {
   try {
     const rows = await SchedulerStatusService.getAllStatus();
-    res.json(rows);
+    res.json(rows.filter((r) => !r.job_name.startsWith('health:'))); // channel health rows: utils/channelHealth.js
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

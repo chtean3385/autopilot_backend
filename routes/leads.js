@@ -2,6 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const multer = require('multer');
 const LeadService = require('../services/leadService');
+const SequenceService = require('../services/sequenceService');
 const { parseLeadsFile } = require('../services/importService');
 const { findEmail } = require('../services/enrichmentService');
 const { getOrCreateResearch } = require('../services/leadResearchService');
@@ -273,8 +274,14 @@ router.post('/import/parse', upload.single('file'), async (req, res) => {
 
 // Bulk domain list — owner pastes company domains/websites, agent scrapes each for a
 // contact email via enrichmentService and saves the found ones as channel='email' leads.
+// Optional sequence_id: verified leads are enrolled right away, the rest as soon as they're verified
+// (hotel_leads.enroll_sequence_id → SequenceService.enrollPendingVerified).
 router.post('/bulk-domains', async (req, res) => {
   const { domains } = req.body;
+  const sequenceId = req.body.sequence_id ? Number(req.body.sequence_id) : null;
+  if (sequenceId !== null && !(Number.isInteger(sequenceId) && await SequenceService.getById(sequenceId))) {
+    return res.status(400).json({ error: 'That sequence no longer exists — pick another.' });
+  }
   if (!Array.isArray(domains) || domains.length === 0) {
     return res.status(400).json({ error: 'No domains provided.' });
   }
@@ -305,13 +312,21 @@ router.post('/bulk-domains', async (req, res) => {
     channel: 'email',
     email_source: 'domain_list',
     email_status: 'found',
+    enroll_sequence_id: sequenceId,
   }));
 
   const insertResult = toInsert.length > 0
     ? await LeadService.addLeads(toInsert)
     : { success: true, added: 0, skipped: 0, inserted: [], skippedList: [] };
 
-  res.json({ results, ...insertResult });
+  let enrolled = 0;
+  if (sequenceId && insertResult.inserted?.length) {
+    enrolled = (await SequenceService.enrollPendingVerified()).enrolled;
+  }
+  const waitingForVerification = sequenceId
+    ? (insertResult.inserted || []).filter(l => l.email_status !== 'verified').length
+    : 0;
+  res.json({ results, ...insertResult, enrolled, waitingForVerification });
 });
 
 // Update full lead
@@ -433,7 +448,8 @@ router.post('/bulk-email-status', async (req, res) => {
       'UPDATE hotel_leads SET email_status=$1, updated_at=NOW() WHERE id = ANY($2::int[])',
       [email_status, ids]
     );
-    res.json({ success: true, updated: result.rowCount });
+    const enrolled = email_status === 'verified' ? (await SequenceService.enrollPendingVerified()).enrolled : 0;
+    res.json({ success: true, updated: result.rowCount, enrolled });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -484,6 +500,7 @@ router.post('/verify-emails', async (req, res) => {
       }
       results.push({ id: lead.id, email: lead.email, result: verification.status, email_status: newStatus });
     }
+    counts.enrolled = (await SequenceService.enrollPendingVerified()).enrolled; // ones saved with a sequence picked
     res.json({ success: true, counts, results });
   } catch (err) {
     res.status(500).json({ error: err.message });
