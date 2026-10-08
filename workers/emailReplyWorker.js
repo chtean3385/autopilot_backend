@@ -9,6 +9,7 @@ const PortfolioReplyService = require('../services/portfolioReplyService');
 const PlaybookService = require('../services/playbookService');
 const { logAgentAction, notifyOwner, sendOrQueueReply } = require('../services/replyDeliveryService');
 const { trackedCompletion } = require('../utils/aiUsage');
+const { handleCadenceReply } = require('../services/cadenceReplyService');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const HISTORY_LIMIT = 20;
@@ -172,6 +173,14 @@ async function handleIncomingMessage(sender, { fromAddress, subject, text, messa
      VALUES ($1, $2, $3, 'in', $4, $5, $6, $7)`,
     [lead.id, sender.id, leadSeq?.sequence_id || null, subject, text, messageId, date || new Date()]
   );
+
+  // Directory leads: the cross-channel cadence owns them — stop both channels, alert the owner,
+  // and route the draft through approval (see services/cadenceReplyService.js).
+  if (lead.cadence_managed) {
+    const outcome = await handleCadenceReply({ lead, channel: 'email', text, subject, messageId, sender });
+    console.log(`[ReplyWorker] Directory lead ${lead.id} replied by email → ${outcome}`);
+    return;
+  }
 
   const intent = await classifyIntent({ lead, incomingMessage: text, conversationHistory });
   await logAgentAction(lead.id, 'reply_analyzed', { detail: { intent, subject } });

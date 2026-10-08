@@ -33,10 +33,11 @@ async function runResearchPass() {
     // to get research done well before a step is actually due, not just-in-time.
     const result = await pool.query(
       `SELECT DISTINCT ON (hl.id) hl.id, hl.hotel_name, hl.owner_name, hl.city, hl.business_category, hl.website
-       FROM lead_sequences ls
-       JOIN hotel_leads hl ON hl.id = ls.lead_id
+       FROM hotel_leads hl
        LEFT JOIN lead_research lr ON lr.lead_id = hl.id
-       WHERE ls.status = 'active'
+       WHERE (EXISTS (SELECT 1 FROM lead_sequences ls WHERE ls.lead_id = hl.id AND ls.status = 'active')
+              -- directory leads in the email/WhatsApp cadence (services/cadenceService.js) need it too
+              OR EXISTS (SELECT 1 FROM lead_cadence lc WHERE lc.lead_id = hl.id AND lc.status IN ('active', 'resting')))
          AND hl.website IS NOT NULL AND hl.website <> ''
          AND lr.lead_id IS NULL
          AND COALESCE(hl.research_attempts, 0) < $1

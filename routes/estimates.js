@@ -179,7 +179,7 @@ router.post('/:approvalId/approve', async (req, res) => {
       return res.json({ success: true });
     }
 
-    const sender = await EmailSenderService.getSenderForLead(approval.lead_id);
+    const sender = await EmailSenderService.getSenderForLead(approval.lead_id, { strict: false });
     if (!sender) return res.status(400).json({ success: false, error: 'No active email sender available to send from' });
 
     const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(approval.lead_email)}`;

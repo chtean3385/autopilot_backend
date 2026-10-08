@@ -1,7 +1,7 @@
 const pool = require('../config/db');
 const EmailSenderService = require('./emailSenderService');
 const SuppressionService = require('./suppressionService');
-const WABAService = require('./wabaService');
+const { alertOwner } = require('./ownerAlertService');
 const settingsService = require('./settingsService');
 const { renderEmailBody, escapeHtml } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
@@ -17,13 +17,11 @@ async function logAgentAction(leadId, action, { detail, draftText, score, decisi
 }
 
 async function notifyOwner(sender, lead, subjectLine, bodyText) {
-  let ownerNumber = await settingsService.getSetting('OWNER_WHATSAPP');
-  if (ownerNumber) {
-    ownerNumber = ownerNumber.replace(/\D/g, '');
-    if (ownerNumber.length === 10) ownerNumber = '91' + ownerNumber;
-    const result = await WABAService.sendTextMessage(ownerNumber, `📬 *${subjectLine}*\n\n${bodyText}`);
-    if (!result.success) console.error('[ReplyDelivery] WhatsApp owner notify failed:', result.error);
-  }
+  // Via the approved owner_alert template (ownerAlertService) — free text to the owner's number is
+  // silently dropped by Meta outside a 24h window, which is how these email-channel alerts were
+  // being lost (same bug fixed for the WhatsApp agent on 2026-08-29).
+  const wa = await alertOwner(subjectLine, bodyText).catch((err) => ({ ok: false, error: err.message }));
+  if (wa && wa.ok === false) console.error('[ReplyDelivery] WhatsApp owner notify failed:', wa.error);
 
   const notifyEmail = await settingsService.getSetting('OWNER_NOTIFY_EMAIL');
   if (notifyEmail && sender) {

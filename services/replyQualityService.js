@@ -1,6 +1,7 @@
 const OpenAI = require('openai');
 const pool = require('../config/db');
 const { trackedCompletion } = require('../utils/aiUsage');
+const { SCORING_RUBRIC } = require('../utils/humanTone');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -134,7 +135,9 @@ async function draftReply(context, revisionFeedback) {
   return { text, meta };
 }
 
-async function scoreReply(context, draftText) {
+// decimal=true (directory-lead replies) asks for one-decimal scores so a 4.5 bar is meaningful;
+// everything else keeps the original whole-number rubric unchanged.
+async function scoreReply(context, draftText, { decimal = false } = {}) {
   const { lead, incomingMessage, conversationHistory, channel, extraContext } = context;
   const historyText = buildHistoryText(conversationHistory);
   const userContent = `${buildLeadContext(lead)}${extraContext ? `\n\n${extraContext}` : ''}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nLead's latest message:\n${incomingMessage}\n\nDraft reply to score:\n${draftText}`;
@@ -151,16 +154,19 @@ async function scoreReply(context, draftText) {
           `You are a strict quality reviewer for ${medium} sent by Dreams Technology. ` +
           'Score the draft reply from 1 (bad) to 5 (excellent) based on: relevance to what the lead said, ' +
           'professionalism, accuracy (no fabricated facts), warm but non-pushy tone, and whether it avoids revealing it is AI-generated. ' +
-          'Respond with ONLY a JSON object: {"score": <1-5 integer>, "feedback": "short reason, especially if below 4"}.',
+          (decimal
+            ? `${SCORING_RUBRIC}\nBe strict: 5.0 means you would send it unchanged; anything that needs any edit is below 4.5. ` +
+              'Respond with ONLY a JSON object: {"score": <1.0-5.0, one decimal>, "feedback": "short reason, especially if below 4.5"}.'
+            : 'Respond with ONLY a JSON object: {"score": <1-5 integer>, "feedback": "short reason, especially if below 4"}.'),
       },
       { role: 'user', content: userContent },
     ],
   }, { purpose: 'reply_score', leadId: context.leadId ?? null });
 
   const parsed = JSON.parse(response.choices[0].message.content);
-  const score = Number.parseInt(parsed.score, 10);
+  const raw = decimal ? Math.round(Number.parseFloat(parsed.score) * 10) / 10 : Number.parseInt(parsed.score, 10);
   return {
-    score: Number.isFinite(score) ? Math.max(1, Math.min(5, score)) : 1,
+    score: Number.isFinite(raw) ? Math.max(1, Math.min(5, raw)) : 1,
     feedback: parsed.feedback || '',
   };
 }
@@ -195,23 +201,29 @@ Score the draft from 1 (bad) to 5 (excellent). A 5 reads like a quick personal n
 Respond with ONLY a JSON object: {"score": <1-5 integer>, "feedback": "short reason, especially if below 4"}.`;
 }
 
-async function scoreColdEmail({ leadId, lead, subject, body, stepNumber }) {
+// strict=true (directory leads): one-decimal score against the shared "personal, human, not AI"
+// rubric (utils/humanTone.js) on top of the stage rubric. Sequences keep the original whole-number gate.
+async function scoreColdEmail({ leadId, lead, subject, body, stepNumber, strict = false }) {
   const userContent = `${buildLeadContext(lead)}\n\nSubject: ${subject}\n\nBody:\n${body}`;
+  const system = strict
+    ? `${buildColdEmailScorePrompt(stepNumber).replace(/Respond with ONLY a JSON object:[\s\S]*$/, '')}\n${SCORING_RUBRIC}\n` +
+      'Respond with ONLY a JSON object: {"score": <0.0-5.0, one decimal>, "feedback": "what would make it read more personal and human"}.'
+    : buildColdEmailScorePrompt(stepNumber);
 
   const response = await trackedCompletion(client, {
     model: 'gpt-4o-mini',
     max_tokens: 150,
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: buildColdEmailScorePrompt(stepNumber) },
+      { role: 'system', content: system },
       { role: 'user', content: userContent },
     ],
   }, { purpose: 'cold_email_score', leadId: leadId ?? null });
 
   const parsed = JSON.parse(response.choices[0].message.content);
-  const score = Number.parseInt(parsed.score, 10);
+  const raw = strict ? Math.round(Number.parseFloat(parsed.score) * 10) / 10 : Number.parseInt(parsed.score, 10);
   return {
-    score: Number.isFinite(score) ? Math.max(1, Math.min(5, score)) : 1,
+    score: Number.isFinite(raw) ? Math.max(strict ? 0 : 1, Math.min(5, raw)) : (strict ? 0 : 1),
     feedback: parsed.feedback || '',
   };
 }
@@ -224,7 +236,9 @@ async function logAction(leadId, action, { detail, draftText, score, decision } 
   );
 }
 
-async function draftAndScore(context) {
+// options.threshold / options.decimal: directory-lead replies use a stricter one-decimal bar (4.5).
+// agent_actions.score is an INT column, so the exact decimal score also goes in detail.score_exact.
+async function draftAndScore(context, { threshold = SCORE_THRESHOLD, decimal = false } = {}) {
   const { leadId } = context;
   let revisionFeedback = null;
   let result = null;
@@ -233,12 +247,15 @@ async function draftAndScore(context) {
     const { text, meta } = await draftReply(context, revisionFeedback);
     await logAction(leadId, 'draft_created', { detail: { attempt }, draftText: text });
 
-    const { score, feedback } = await scoreReply(context, text);
-    const passed = score >= SCORE_THRESHOLD;
+    const { score, feedback } = await scoreReply(context, text, { decimal });
+    const passed = score >= threshold;
     const isLastAttempt = attempt === MAX_ATTEMPTS;
     const decision = passed ? 'send' : (isLastAttempt ? 'queue_human' : 'revise');
 
-    await logAction(leadId, 'draft_scored', { detail: { attempt, feedback }, draftText: text, score, decision });
+    await logAction(leadId, 'draft_scored', {
+      detail: { attempt, feedback, ...(decimal ? { score_exact: score, threshold } : {}) },
+      draftText: text, score: Math.round(score), decision,
+    });
 
     result = { text, meta, score, decision: passed ? 'send' : 'queue_human' };
     if (passed) return result;
@@ -246,9 +263,9 @@ async function draftAndScore(context) {
   }
 
   await logAction(leadId, 'draft_queued_human', {
-    detail: { attempts: MAX_ATTEMPTS },
+    detail: { attempts: MAX_ATTEMPTS, ...(decimal ? { score_exact: result.score } : {}) },
     draftText: result.text,
-    score: result.score,
+    score: Math.round(result.score),
     decision: 'queue_human',
   });
 

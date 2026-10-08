@@ -132,6 +132,13 @@ async function pickContactWithGpt(lead, pages, mailtoEmails, telNumbers) {
   return JSON.parse(response.choices[0].message.content);
 }
 
+// Scraped addresses can carry invisible characters copied out of the page's HTML (found live:
+// "talk2us@premnimithaas.com" + U+200B zero-width space), which then fail verification/sending.
+function cleanScrapedEmail(raw) {
+  const email = String(raw || '').replace(/[​-‍⁠﻿\s]/g, '').replace(/^mailto:/i, '').toLowerCase();
+  return /^[^@]+@[^@]+\.[a-z]{2,}$/.test(email) ? email : null;
+}
+
 async function findEmail(lead) {
   if (!lead?.website) {
     return { email: null, ownerName: null, phone: null, source: 'scraped' };
@@ -148,14 +155,14 @@ async function findEmail(lead) {
   try {
     const picked = await pickContactWithGpt(lead, pages, mailtoEmails, telNumbers);
     return {
-      email: picked.email || mailtoEmails[0] || null,
+      email: cleanScrapedEmail(picked.email) || cleanScrapedEmail(mailtoEmails[0]),
       ownerName: picked.ownerName || null,
       phone: picked.phone || telNumbers[0] || null,
       source: 'scraped',
     };
   } catch (error) {
     console.error('[Enrichment] findEmail GPT error:', error.message);
-    return { email: mailtoEmails[0] || null, ownerName: null, phone: telNumbers[0] || null, source: 'scraped' };
+    return { email: cleanScrapedEmail(mailtoEmails[0]), ownerName: null, phone: telNumbers[0] || null, source: 'scraped' };
   }
 }
 

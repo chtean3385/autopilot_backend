@@ -175,7 +175,7 @@ router.post('/:id/send', async (req, res) => {
     const row = parseProposalRow(propResult.rows[0]);
     if (!row.lead_email) return res.status(400).json({ error: 'Lead has no email address on file' });
 
-    const sender = await EmailSenderService.getSenderForLead(row.lead_id);
+    const sender = await EmailSenderService.getSenderForLead(row.lead_id, { strict: false });
     if (!sender) return res.status(400).json({ error: 'No active email sender available to send from' });
 
     const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(row.lead_email)}`;

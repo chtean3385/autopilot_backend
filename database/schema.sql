@@ -480,3 +480,98 @@ CREATE TABLE IF NOT EXISTS google_places_details_cache (
     website TEXT,
     cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Directory outreach step 1 (database/migrate_directory_sources.sql)
+CREATE TABLE IF NOT EXISTS directory_sources (
+    id SERIAL PRIMARY KEY,
+    url TEXT NOT NULL UNIQUE,
+    name VARCHAR(255),
+    niche VARCHAR(100),
+    city VARCHAR(100),
+    status VARCHAR(20) NOT NULL DEFAULT 'suggested',
+    suggested_by VARCHAR(20) NOT NULL DEFAULT 'manual',
+    notes TEXT,
+    robots_ok BOOLEAN,
+    pages_total INT NOT NULL DEFAULT 0,
+    pages_done INT NOT NULL DEFAULT 0,
+    entries_found INT NOT NULL DEFAULT 0,
+    last_crawled_at TIMESTAMP,
+    last_error TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS directory_crawl_pages (
+    id SERIAL PRIMARY KEY,
+    source_id INT NOT NULL REFERENCES directory_sources(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    members_found INT NOT NULL DEFAULT 0,
+    error TEXT,
+    fetched_at TIMESTAMP,
+    UNIQUE (source_id, url)
+);
+CREATE TABLE IF NOT EXISTS directory_entries (
+    id SERIAL PRIMARY KEY,
+    source_id INT NOT NULL REFERENCES directory_sources(id) ON DELETE CASCADE,
+    page_url TEXT,
+    company VARCHAR(255) NOT NULL,
+    contact_person VARCHAR(255),
+    contacts JSON DEFAULT '[]',
+    phone_raw VARCHAR(100),
+    phone_e164 VARCHAR(20),
+    email VARCHAR(255),
+    website VARCHAR(500),
+    address TEXT,
+    category VARCHAR(255),
+    products TEXT,
+    city VARCHAR(100),
+    lead_id INT REFERENCES hotel_leads(id) ON DELETE SET NULL,
+    skip_reason VARCHAR(50),
+    promoted_at TIMESTAMP,
+    imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_directory_entries_source_company ON directory_entries(source_id, LOWER(company));
+CREATE INDEX IF NOT EXISTS idx_directory_entries_lead ON directory_entries(lead_id);
+CREATE INDEX IF NOT EXISTS idx_directory_entries_phone ON directory_entries(phone_e164);
+CREATE INDEX IF NOT EXISTS idx_directory_crawl_pages_status ON directory_crawl_pages(source_id, status);
+CREATE INDEX IF NOT EXISTS idx_directory_sources_status ON directory_sources(status);
+ALTER TABLE directory_crawl_pages ADD COLUMN IF NOT EXISTS depth INT; -- NULL = sitemap page (not expanded); 0..N = link depth in no-sitemap mode
+
+-- Directory outreach step 2 (database/migrate_directory_promotion.sql)
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS cadence_managed BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_leads_whatsapp_number ON hotel_leads(whatsapp_number);
+CREATE INDEX IF NOT EXISTS idx_leads_cadence_managed ON hotel_leads(cadence_managed) WHERE cadence_managed = TRUE;
+ALTER TABLE directory_sources ADD COLUMN IF NOT EXISTS category_filter TEXT;
+
+-- Directory outreach steps 3+5 (database/migrate_directory_cadence.sql)
+CREATE TABLE IF NOT EXISTS lead_cadence (
+    lead_id INT PRIMARY KEY REFERENCES hotel_leads(id) ON DELETE CASCADE,
+    current_channel VARCHAR(10),
+    first_channel VARCHAR(10),
+    cycle_start_channel VARCHAR(10),
+    wa_unusable BOOLEAN NOT NULL DEFAULT FALSE,
+    touches_on_channel INT NOT NULL DEFAULT 0,
+    total_touches INT NOT NULL DEFAULT 0,
+    cycle INT NOT NULL DEFAULT 1,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    next_touch_at TIMESTAMP,
+    last_touch_at TIMESTAMP,
+    last_channel VARCHAR(10),
+    stop_reason VARCHAR(80),
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_lead_cadence_due ON lead_cadence(status, next_touch_at);
+
+-- Directory outreach step 4 (database/migrate_directory_templates.sql)
+ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS auto_generated BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+-- Template groups: one message idea (angle) written as 2-3 variants. A lead never gets two variants
+-- of the same group; sends rotate across variants. quality_score = the AI reviewer's 0-5 score.
+ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS template_group VARCHAR(80);
+ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS variant INT;
+ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS quality_score NUMERIC(2,1);
+ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS quality_note TEXT;
+-- The niche of the directory a lead came from — picks that niche's WhatsApp templates.
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS niche VARCHAR(100);
+ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP;

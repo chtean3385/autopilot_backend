@@ -1,11 +1,13 @@
 const axios = require('axios');
 require('dotenv').config();
+const { isDryRun, dryRunResult } = require('../utils/dryRun');
 
 // WhatsApp Cloud API base URL (graph.facebook.com — NOT instagram)
 const WABA_API_URL = `https://graph.facebook.com/${process.env.WABA_API_VERSION || 'v18.0'}`;
 
 class WABAService {
   static async sendTemplateMessage(recipientPhone, templateName, parameters = [], headerImageUrl = null) {
+    if (isDryRun()) return dryRunResult('whatsapp-template', `"${templateName}" to ${recipientPhone} params=${JSON.stringify(parameters)}`);
     try {
       const components = [];
 
@@ -151,6 +153,7 @@ class WABAService {
 
   // Submit a template to Meta for approval
   static async submitTemplateToMeta(templateData) {
+    if (isDryRun()) return { ...dryRunResult('meta-template-submit', `"${templateData.template_name}"`), data: { id: null, status: 'PENDING' } };
     try {
       const components = [];
 
@@ -232,6 +235,7 @@ class WABAService {
         meta_status: template.status,
         quality_score: template.quality_score,
         meta_id: String(template.id || ''),
+        rejected_reason: template.rejected_reason || null,
       };
     } catch (error) {
       console.error('[WABA] Sync status error:', error.response?.data || error.message);
@@ -241,6 +245,7 @@ class WABAService {
 
   // Delete template from Meta (use for deactivation — cannot be undone on Meta)
   static async deleteFromMeta(templateName) {
+    if (isDryRun()) return { ...dryRunResult('meta-template-delete', `"${templateName}"`), data: {} };
     try {
       const response = await axios.delete(
         `${WABA_API_URL}/${process.env.WABA_BUSINESS_ACCOUNT_ID}/message_templates`,
@@ -258,6 +263,7 @@ class WABAService {
 
   // Send a template with a pre-built components array (used by sendPersonalizedTemplate)
   static async sendTemplateMessageWithComponents(recipientPhone, templateName, components, language = 'en_US') {
+    if (isDryRun()) return dryRunResult('whatsapp-template', `"${templateName}" to ${recipientPhone} components=${JSON.stringify(components)}`);
     try {
       const payload = {
         messaging_product: 'whatsapp',
@@ -293,6 +299,7 @@ class WABAService {
   }
 
   static async sendTextMessage(recipientPhone, text) {
+    if (isDryRun()) return dryRunResult('whatsapp-text', `to ${recipientPhone}: ${String(text).slice(0, 200)}`);
     try {
       const payload = {
         messaging_product: 'whatsapp',

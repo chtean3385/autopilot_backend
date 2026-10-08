@@ -9,6 +9,7 @@ const SequenceService = require('./sequenceService');
 const SchedulerStatusService = require('./schedulerStatusService');
 const { notifyAdmin } = require('./adminNotifyService');
 const { trackedCompletion } = require('../utils/aiUsage');
+const { normalizeMobileNumber } = require('../utils/phone');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -294,60 +295,6 @@ Respond with JSON only, in exactly this shape:
   }
 }
 
-// Normalize raw phone → 12-digit WhatsApp-ready Indian mobile (91XXXXXXXXXX)
-// Returns null for landlines or invalid numbers.
-//
-// Indian landline detection using Google's international_phone_number format:
-//   Mobiles:   "+91 98765 43210"  → digit groups after +91: one group of 10
-//   Landlines: "+91 79 2345 6789" → digit groups after +91: STD (2-3 digits) + local (6-8 digits)
-//
-// We detect landlines by checking if the number after +91 is split into
-// a short STD prefix (2-3 digits) followed by 6-8 digit local number.
-function normalizeMobileNumber(rawPhone) {
-  const str = (rawPhone || '').trim();
-
-  // If Google gave us international format (+91 ...), analyse the spacing
-  const intlMatch = str.match(/^\+91\s+(.+)$/);
-  if (intlMatch) {
-    const afterCode = intlMatch[1].trim();
-    const parts = afterCode.split(/\s+/);
-
-    if (parts.length >= 2) {
-      // First part is STD code (2-4 digits), rest is local number
-      // Mobile numbers from Google come as a single group or 2 groups of 5
-      const firstLen = parts[0].replace(/\D/g, '').length;
-      const restDigits = parts.slice(1).join('').replace(/\D/g, '');
-
-      // Landline pattern: short first group (2-4 digits) + 6-8 digit local
-      if (firstLen <= 4 && restDigits.length >= 6 && restDigits.length <= 8) {
-        console.log(`[Scraper] Rejecting landline (STD format): ${str}`);
-        return null;
-      }
-    }
-  }
-
-  // Strip all non-digits and validate as Indian mobile
-  const digits = str.replace(/\D/g, '');
-
-  if (digits.length === 12 && digits.startsWith('91')) {
-    const mobile = digits.slice(2);
-    if (/^[6-9]\d{9}$/.test(mobile)) return digits;
-    return null;
-  }
-
-  if (digits.length === 10 && /^[6-9]\d{9}$/.test(digits)) {
-    return '91' + digits;
-  }
-
-  // 11 digits with leading 0 (local STD format like 07912345678) — likely landline
-  if (digits.length === 11 && digits.startsWith('0')) {
-    const withoutZero = digits.slice(1);
-    if (/^[6-9]\d{9}$/.test(withoutZero)) return '91' + withoutZero;
-    return null;
-  }
-
-  return null;
-}
 
 // Cache of Google Place Details responses, keyed by place_id — shared by scrapeLeads() and
 // scrapePlacesForWebsites(). Text Search for a given city+businessType tends to return the
@@ -947,7 +894,8 @@ async function sendTask(taskId) {
     const leadsResult = await pool.query(
       `SELECT hl.* FROM hotel_leads hl
        JOIN lead_group_members lgm ON lgm.lead_id = hl.id
-       WHERE lgm.group_id = $1`,
+       WHERE lgm.group_id = $1
+         AND hl.cadence_managed = FALSE`, // directory leads: only the cadence worker contacts them
       [campaign.group_id]
     );
     const leads = leadsResult.rows;
@@ -988,20 +936,54 @@ async function sendTask(taskId) {
 // any this lead has already been sent. GPT chooses among the industry-fitting candidates so a
 // second touch reads differently from the first; falls back to best-fit-first if GPT is down.
 // Returns null when there's no unused fitting template (caller stops chasing rather than repeat).
-async function pickFollowUpTemplate(lead, usedIds) {
+// Never a UTILITY template or the owner-alert template: owner_alert is stored here with no industry,
+// so once Meta approves it, the "industry IS NULL" branch would otherwise make it a cold follow-up.
+// strictIndustry (directory cadence): only templates whose industry matches the lead's category, or
+// tagged 'directory' — the untagged/'all' ones in this account are hotel-specific copy.
+async function pickFollowUpTemplate(lead, usedIds, { strictIndustry = false } = {}) {
+  const { getSetting } = require('./settingsService');
+  const ownerAlertName = (await getSetting('OWNER_ALERT_TEMPLATE')) || 'owner_alert';
+  // Directory templates (template_group set) match the lead's niche exactly, never by regex — niche
+  // names are owner-typed and may contain regex characters.
   const res = await pool.query(
-    `SELECT id, template_name, body_text, industry, header_image_url, parameter_mapping
+    `SELECT id, template_name, body_text, industry, header_image_url, parameter_mapping, template_group
      FROM waba_templates
      WHERE status='approved'
-       AND (industry IS NULL OR LOWER(industry)='all'
-            OR ($1::text IS NOT NULL AND $1::text <> '' AND $1::text ~* industry))
-     ORDER BY (industry IS NOT NULL AND LOWER(industry) <> 'all'
+       AND COALESCE(UPPER(template_category), '') <> 'UTILITY'
+       AND template_name <> $2
+       AND ((NOT $3 AND (industry IS NULL OR LOWER(industry)='all'))
+            OR ($3 AND LOWER(industry)='directory')
+            OR ($3 AND $4::text IS NOT NULL AND LOWER(industry) = LOWER($4::text))
+            OR (template_group IS NULL AND $1::text IS NOT NULL AND $1::text <> '' AND LOWER(industry) NOT IN ('all', 'directory') AND $1::text ~* industry))
+     ORDER BY ($3 AND $4::text IS NOT NULL AND LOWER(industry) = LOWER($4::text)) DESC,
+              (template_group IS NULL AND industry IS NOT NULL AND LOWER(industry) NOT IN ('all', 'directory')
                AND $1::text IS NOT NULL AND $1::text ~* industry) DESC, created_at ASC`,
-    [lead.business_category || null]
+    [lead.business_category || null, ownerAlertName, strictIndustry, lead.niche || null]
   );
-  const candidates = res.rows.filter(t => !usedIds.has(t.id));
+  let candidates = res.rows.filter(t => !usedIds.has(t.id));
+  // Variants of one message idea: once a lead got any variant of a group, the whole group is used up.
+  // Pick among one representative per group, then send the least-used variant (spreads volume).
+  const usedGroups = new Set();
+  if (usedIds.size) {
+    const g = await pool.query(`SELECT DISTINCT template_group FROM waba_templates WHERE id = ANY($1) AND template_group IS NOT NULL`, [[...usedIds]]);
+    g.rows.forEach(r => usedGroups.add(r.template_group));
+  }
+  candidates = candidates.filter(t => !t.template_group || !usedGroups.has(t.template_group));
+  const seenGroups = new Set();
+  candidates = candidates.filter(t => !t.template_group || (!seenGroups.has(t.template_group) && seenGroups.add(t.template_group)));
+  const leastUsedVariant = async (t) => {
+    if (!t?.template_group) return t;
+    const v = await pool.query(
+      `SELECT wt.id, wt.template_name, wt.body_text, wt.industry, wt.header_image_url, wt.parameter_mapping, wt.template_group
+       FROM waba_templates wt
+       WHERE wt.template_group = $1 AND wt.status = 'approved'
+       ORDER BY (SELECT COUNT(*) FROM outreach_logs ol WHERE ol.template_id = wt.id) ASC, wt.id ASC LIMIT 1`,
+      [t.template_group]
+    );
+    return v.rows[0] || t;
+  };
   if (candidates.length === 0) return null;
-  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 1) return leastUsedVariant(candidates[0]);
 
   try {
     const sentRes = await pool.query(
@@ -1027,11 +1009,11 @@ ${candidates.map(t => `id ${t.id}: ${t.body_text}`).join('\n\n')}` },
     }, { purpose: 'followup_template_pick', leadId: lead.id });
     const pickedId = JSON.parse(pick.choices[0].message.content)?.id;
     const picked = candidates.find(t => t.id === pickedId);
-    if (picked) return picked;
+    if (picked) return leastUsedVariant(picked);
   } catch (err) {
     console.error('[FollowUp] template pick failed — using best-fit:', err.message);
   }
-  return candidates[0];
+  return leastUsedVariant(candidates[0]);
 }
 
 // Cold-template follow-ups to leads who have NEVER replied. Runs daily; sends every 2 days,
@@ -1077,6 +1059,7 @@ async function runFollowUps(trigger = 'cron') {
         INNER JOIN outreach_logs ol ON ol.lead_id = hl.id
         WHERE hl.status = 'new'
           AND hl.needs_attention = FALSE
+          AND hl.cadence_managed = FALSE
           AND hl.whatsapp_number IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE
@@ -1201,4 +1184,5 @@ console.log('🤖 Agent scheduler started — checks every minute for tasks, dai
 module.exports = {
   runTask, sendTask, parseInstruction, refineInstruction, runFollowUps,
   runEmailTask, refineEmailInstruction,
+  pickFollowUpTemplate, // reused by services/cadenceService.js (directory cadence)
 };

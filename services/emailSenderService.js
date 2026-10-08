@@ -1,9 +1,13 @@
 const pool = require('../config/db');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
+const { isDryRun, dryRunResult } = require('../utils/dryRun');
+const { getSetting, setSetting } = require('./settingsService');
 
 const WARMUP_START_CAP = 10; // day 1 daily cap during warmup
 const WARMUP_STEP = 10;      // added per full week elapsed
+const ROTATION_BATCH_DEFAULT = 10;                   // new leads per sender before moving to the next
+const ROTATION_STATE_KEY = 'EMAIL_ROTATION_STATE';
 
 class EmailSenderService {
   static async getAll() {
@@ -138,15 +142,20 @@ class EmailSenderService {
     await pool.query('UPDATE email_senders SET sent_today = sent_today + 1 WHERE id = $1', [senderId]);
   }
 
-  // Active sender with the most remaining quota today (effective cap minus already sent)
-  static async pickSenderForRotation() {
+  static hasCapacity(sender) {
+    return this.effectiveDailyCap(sender) - sender.sent_today > 0;
+  }
+
+  // Active sender with the most remaining quota today — for one-off internal mail (owner alerts)
+  // that must not consume a slot in the new-lead rotation below.
+  static async pickAnyActiveSender() {
     await this.resetStaleCounters();
     const result = await pool.query(`SELECT * FROM email_senders WHERE status = 'active'`);
     let best = null;
     let bestRemaining = 0;
     for (const sender of result.rows) {
       const remaining = this.effectiveDailyCap(sender) - sender.sent_today;
-      if (remaining > 0 && remaining > bestRemaining) {
+      if (remaining > bestRemaining) {
         best = sender;
         bestRemaining = remaining;
       }
@@ -154,24 +163,72 @@ class EmailSenderService {
     return best;
   }
 
-  // Sender previously used for this lead, if it's still active — keeps a thread on one mailbox
-  static async getStickySender(leadId) {
-    const result = await pool.query(
+  // Mailbox for a lead's FIRST email. Block rotation: EMAIL_ROTATION_BATCH (default 10) new leads
+  // from sender A, then the next 10 from B, … in id order, wrapping around. A sender that is paused
+  // or out of today's capacity is skipped. Each call takes one slot, so only call it when about to
+  // send. Position is kept in settings key EMAIL_ROTATION_STATE ({ senderId, count }).
+  static async pickSenderForRotation() {
+    await this.resetStaleCounters();
+    const result = await pool.query(`SELECT * FROM email_senders WHERE status = 'active' ORDER BY id`);
+    const eligible = result.rows.filter(s => this.hasCapacity(s));
+    if (eligible.length === 0) return null;
+
+    const batch = Number.parseInt(await getSetting('EMAIL_ROTATION_BATCH'), 10) || ROTATION_BATCH_DEFAULT;
+    let state = {};
+    try { state = JSON.parse(await getSetting(ROTATION_STATE_KEY) || '{}'); } catch { /* reset below */ }
+
+    const current = eligible.find(s => s.id === state.senderId);
+    let pick;
+    let count;
+    if (current && (state.count || 0) < batch) {
+      pick = current;
+      count = (state.count || 0) + 1;
+    } else {
+      pick = eligible.find(s => s.id > (state.senderId ?? 0)) || eligible[0];
+      count = 1;
+    }
+    await setSetting(ROTATION_STATE_KEY, JSON.stringify({ senderId: pick.id, count }));
+    return pick;
+  }
+
+  // Mailbox that last emailed this lead (email_logs covers sequences, cadence and replies;
+  // lead_sequences.sender_id is a fallback for rows that predate sender_id on email_logs)
+  static async getPriorSenderId(leadId) {
+    const logged = await pool.query(
+      `SELECT sender_id FROM email_logs
+       WHERE lead_id = $1 AND direction = 'out' AND sender_id IS NOT NULL AND error IS NULL
+       ORDER BY COALESCE(sent_at, created_at) DESC LIMIT 1`,
+      [leadId]
+    );
+    if (logged.rows[0]) return logged.rows[0].sender_id;
+    const seq = await pool.query(
       `SELECT sender_id FROM lead_sequences
        WHERE lead_id = $1 AND sender_id IS NOT NULL
        ORDER BY updated_at DESC LIMIT 1`,
       [leadId]
     );
-    const senderId = result.rows[0]?.sender_id;
-    if (!senderId) return null;
-    const sender = await this.getById(senderId);
-    return sender && sender.status === 'active' ? sender : null;
+    return seq.rows[0]?.sender_id || null;
   }
 
-  // Sticky sender if the lead has one and it's still active, otherwise rotate
-  static async getSenderForLead(leadId) {
-    const sticky = await this.getStickySender(leadId);
-    if (sticky) return sticky;
+  // Follow-ups always go from the mailbox that sent the first email. If that mailbox is paused or
+  // out of today's capacity, returns null and the caller waits — it never switches mailbox mid-thread.
+  // Only if the mailbox was deleted does the lead go back into rotation.
+  // { strict: false } (human-triggered proposals/estimates, replies to a lead who wrote back) keeps
+  // the old behaviour: prior mailbox if active regardless of cap, else any active sender.
+  static async getSenderForLead(leadId, { strict = true } = {}) {
+    await this.resetStaleCounters();
+    const priorId = await this.getPriorSenderId(leadId);
+    const prior = priorId ? await this.getById(priorId) : null;
+
+    if (!strict) {
+      if (prior && prior.status === 'active') return prior;
+      return this.pickAnyActiveSender();
+    }
+
+    if (prior) {
+      if (prior.status !== 'active' || !this.hasCapacity(prior)) return null;
+      return prior;
+    }
     return this.pickSenderForRotation();
   }
 
@@ -181,6 +238,10 @@ class EmailSenderService {
   // - inReplyTo/references → RFC 5322 threading headers so replies/follow-ups land in the
   //   recipient's existing conversation (built by utils/emailThreading.js)
   static async send(sender, { to, subject, html, text, unsubscribeUrl, inReplyTo, references }) {
+    if (isDryRun()) {
+      const r = dryRunResult('email', `from ${sender.from_email} to ${to} — "${subject}" — ${String(text || '').slice(0, 200)}`);
+      return { success: true, messageId: `<${r.messageId}@dryrun.local>`, dryRun: true };
+    }
     try {
       let messageId;
 

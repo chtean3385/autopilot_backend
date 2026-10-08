@@ -67,12 +67,14 @@ class SequenceService {
   // Only email-channel leads with a *verified* address are enrolled (mandatory verification
   // guardrail — see leadService.addLeads, which is where email_status gets set); leads already
   // mid-sequence (active/paused/waiting_estimate, in any sequence) are skipped to avoid double-enrolling.
-  static async enrollLeads(sequenceId, leadIds) {
+  // cadence_managed (directory) leads are skipped unless the cadence worker itself enrolls them
+  // (allowCadenceManaged) — a manual "Enroll in Sequence" must not start a second engine on them.
+  static async enrollLeads(sequenceId, leadIds, { allowCadenceManaged = false } = {}) {
     const sequence = await this.getById(sequenceId);
     if (!sequence) return { success: false, error: 'Sequence not found' };
 
     const leadsResult = await pool.query(
-      `SELECT id, email, channel, email_status FROM hotel_leads WHERE id = ANY($1::int[])`,
+      `SELECT id, email, channel, email_status, cadence_managed FROM hotel_leads WHERE id = ANY($1::int[])`,
       [leadIds]
     );
     const leadsById = new Map(leadsResult.rows.map(l => [l.id, l]));
@@ -88,10 +90,12 @@ class SequenceService {
     let skippedNotEligible = 0;
     let skippedUnverified = 0;
     let skippedAlreadyEnrolled = 0;
+    let skippedCadenceManaged = 0;
 
     for (const id of leadIds) {
       const lead = leadsById.get(id);
       if (!lead || lead.channel !== 'email' || !lead.email) { skippedNotEligible++; continue; }
+      if (lead.cadence_managed && !allowCadenceManaged) { skippedCadenceManaged++; continue; }
       if (alreadyEnrolled.has(id)) { skippedAlreadyEnrolled++; continue; }
       if (lead.email_status !== 'verified') { skippedUnverified++; continue; }
       await pool.query(
@@ -102,7 +106,7 @@ class SequenceService {
       enrolled++;
     }
 
-    return { success: true, enrolled, skippedNotEligible, skippedUnverified, skippedAlreadyEnrolled };
+    return { success: true, enrolled, skippedNotEligible, skippedUnverified, skippedAlreadyEnrolled, skippedCadenceManaged };
   }
 
   // Zero out sent_today for any sequence whose counter is from a previous day

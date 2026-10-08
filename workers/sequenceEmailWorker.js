@@ -199,7 +199,9 @@ Hard rules:
 Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between lines/paragraphs. Start the body with "Hi <first name>," if the owner's name is known, otherwise "Hi,". Do NOT add a sign-off, signature, P.S. or unsubscribe line — those are appended automatically.`;
 }
 
-async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails = [], feedback = null) {
+// guidance (optional): extra writing rules appended to the system prompt (directory cadence passes
+// the shared human-tone rules + the lead's trade). Sequences don't pass it.
+async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails = [], feedback = null, guidance = null) {
   const leadContext = `Business: ${lead.hotel_name}\nOwner: ${lead.owner_name || 'Unknown'}\nCity: ${lead.city || 'Unknown'}${lead.business_category ? `\nCategory: ${lead.business_category}` : ''}${lead.website ? `\nWebsite: ${lead.website}` : ''}`;
 
   const response = await trackedCompletion(client, {
@@ -207,7 +209,7 @@ async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, r
     max_tokens: 400,
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead) },
+      { role: 'system', content: buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead) + (guidance ? `\n\n${guidance}` : '') },
       { role: 'user', content: leadContext },
     ],
   }, { purpose: 'sequence_email_compose', leadId: lead.lead_id ?? lead.id ?? null });
@@ -237,6 +239,97 @@ async function killSequence(leadSequenceId, leadId, reason) {
     `INSERT INTO agent_actions (lead_id, action, detail, decision) VALUES ($1, 'sequence_stopped', $2, $3)`,
     [leadId, JSON.stringify({ reason }), reason]
   );
+}
+
+// Compose → spam-lint + quality-score loop → sign → render → send. Shared by processRow below
+// (sequences) and the directory cadence (services/cadenceService.js), so both channels of cold
+// email go through exactly one writing/quality/compliance path. `lead` needs hotel_name/owner_name/
+// city/business_category/website; leadId is passed explicitly because a sequence row's own `id` is
+// the lead_sequences id, not the lead's. Throws if composing fails (caller decides when to retry);
+// a failed SEND is returned (sendResult.success === false), not thrown.
+// quality (optional, directory cadence): { minScore, strict, attempts, holdIfBelow, guidance } —
+// a stricter one-decimal gate with extra writing guidance; holdIfBelow=true means a draft that never
+// reaches minScore is NOT sent (returns { held: true }) instead of the sequence default "send the
+// last attempt anyway". Sequences call without it and behave exactly as before.
+async function composeAndSendColdEmail({ leadId, lead, leadEmail, stepNumber, sender, research, priorEmails = [], logDetail = {}, quality = null }) {
+  const minScore = quality?.minScore ?? ReplyQualityService.COLD_EMAIL_SCORE_THRESHOLD;
+  const maxAttempts = quality?.attempts ?? COMPOSE_MAX_ATTEMPTS;
+  const [portfolioItems, playbookContext] = await Promise.all([
+    fetchPortfolioItems(),
+    PlaybookService.getPlaybookContext(),
+  ]);
+  const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(leadEmail)}`;
+
+  // Combined spam-lint + quality-score gate: up to COMPOSE_MAX_ATTEMPTS drafts, feeding both
+  // the spam-trigger words and the quality reviewer's feedback back in as one revision note.
+  // Whatever the last attempt scores, it's sent — this is a lint/gate on WHAT gets written,
+  // never a hold on WHETHER the sequence fires (queuing 50 cold emails/tick to a human
+  // approval queue would just stall the channel). Every attempt is logged to agent_actions
+  // for visibility (AnalyticsView's activity feed already renders any action generically).
+  let composed;
+  let finalQualityScore = null;
+  let feedback = null;
+  let spamResult, qualityResult;
+  let passed = false;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    composed = await composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, quality?.guidance);
+    spamResult = checkSpamContent(composed.subject, composed.body);
+    qualityResult = await ReplyQualityService.scoreColdEmail({
+      leadId, lead, subject: composed.subject, body: composed.body, stepNumber, strict: Boolean(quality?.strict),
+    });
+
+    passed = spamResult.clean && qualityResult.score >= minScore;
+    const isLastAttempt = attempt === maxAttempts;
+
+    await pool.query(
+      `INSERT INTO agent_actions (lead_id, action, detail, draft_text, score, decision) VALUES ($1, 'cold_email_scored', $2, $3, $4, $5)`,
+      [
+        leadId,
+        JSON.stringify({ attempt, stepNumber, spamFlagged: spamResult.flagged, feedback: qualityResult.feedback, subject: composed.subject, score_exact: qualityResult.score, minScore, ...logDetail }),
+        composed.body,
+        Math.round(qualityResult.score), // agent_actions.score is INT; exact score is in detail
+        passed ? 'send' : (isLastAttempt ? (quality?.holdIfBelow ? 'held_low_quality' : 'send_low_quality') : 'revise'),
+      ]
+    );
+
+    finalQualityScore = qualityResult.score;
+    if (passed || isLastAttempt) break;
+
+    const feedbackParts = [];
+    if (!spamResult.clean) feedbackParts.push(`Avoid these spam-trigger phrases: ${spamResult.flagged.join(', ')}.`);
+    if (qualityResult.score < minScore) feedbackParts.push(qualityResult.feedback);
+    feedback = feedbackParts.join(' ');
+    console.log(`[SequenceEmail] Lead ${leadId} draft attempt ${attempt} scored ${qualityResult.score}/5 (spam-clean: ${spamResult.clean}) — recomposing`);
+  }
+  if (!passed && quality?.holdIfBelow) {
+    return { held: true, finalQualityScore, feedback: qualityResult?.feedback || '', composed };
+  }
+
+  // Follow-ups (step > 0) thread onto the conversation so far; a step-0 cold email has no
+  // logged messages yet, so getThreadHeaders returns nulls and it starts a fresh thread.
+  // No open-tracking pixel on sequence emails (removed 2026-10-07): a hidden 1x1 image is a
+  // classic bulk-mail signal for Gmail/Outlook filters, and opens are inflated by Apple Mail
+  // privacy/scanners anyway — replies are the metric that matters. Click tracking stays (the
+  // prompt asks for no links, so it rarely fires). Brevo's own open events still flow in via webhook.
+  const trackingToken = generateTrackingToken();
+  const tracking = { trackUrl: (url) => buildClickUrl(trackingToken, url) };
+  const { inReplyTo, references } = await getThreadHeaders(leadId);
+
+  // A real person's sign-off + an easy way to say no — a "stop" reply is still a reply (the
+  // reply worker classifies it not_interested and ends the sequence), and it's far better for
+  // sender reputation than a spam-button click. No visible unsubscribe link: this line is the
+  // opt-out, backed by the List-Unsubscribe headers EmailSenderService.send() sets.
+  const signature = (await getSetting('EMAIL_SIGNATURE')) || DEFAULT_SIGNATURE;
+  const fullBody = `${composed.body}\n\n${signature.replace(/\\n/g, '\n')}\n\n` +
+    `P.S. Not relevant? Just reply "stop" or "not interested" and I won't write again.`;
+
+  const { html, text } = renderEmailBody(fullBody, unsubscribeUrl, tracking, { visibleFooter: false });
+  const sendResult = await EmailSenderService.send(sender, {
+    to: leadEmail, subject: composed.subject, html, text,
+    unsubscribeUrl, inReplyTo, references,
+  });
+
+  return { sendResult, composed, html, trackingToken, finalQualityScore };
 }
 
 async function processRow(row, sequenceCapTracker) {
@@ -333,60 +426,26 @@ async function processRow(row, sequenceCapTracker) {
     return 'capacity_skip';
   }
 
+  // First email: next sender in the 10-per-mailbox rotation. Follow-ups: the same mailbox as the
+  // first email — if it's paused or full today the lead waits rather than switching mailbox.
   const sender = await EmailSenderService.getSenderForLead(leadId);
   if (!sender) {
-    console.log(`[SequenceEmail] No sender capacity available — skipping lead ${leadId} for now`);
+    console.log(`[SequenceEmail] No sender capacity for lead ${leadId} (its mailbox is full/paused, or all senders are) — retrying in 1h`);
+    // Push it back so waiting follow-ups don't fill every tick's LIMIT batch and starve leads
+    // whose mailbox still has room.
+    await pool.query(
+      `UPDATE lead_sequences SET next_run_at = NOW() + INTERVAL '1 hour', updated_at = NOW() WHERE id = $1`,
+      [leadSequenceId]
+    );
     return 'no_sender';
   }
 
-  const [portfolioItems, playbookContext, priorEmails] = await Promise.all([
-    fetchPortfolioItems(),
-    PlaybookService.getPlaybookContext(),
-    fetchPriorSentEmails(leadId),
-  ]);
-  const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(row.lead_email)}`;
-
-  let composed;
-  let finalQualityScore = null;
+  let sent;
   try {
-    // Combined spam-lint + quality-score gate: up to COMPOSE_MAX_ATTEMPTS drafts, feeding both
-    // the spam-trigger words and the quality reviewer's feedback back in as one revision note.
-    // Whatever the last attempt scores, it's sent — this is a lint/gate on WHAT gets written,
-    // never a hold on WHETHER the sequence fires (queuing 50 cold emails/tick to a human
-    // approval queue would just stall the channel). Every attempt is logged to agent_actions
-    // for visibility (AnalyticsView's activity feed already renders any action generically).
-    let feedback = null;
-    let spamResult, qualityResult;
-    for (let attempt = 1; attempt <= COMPOSE_MAX_ATTEMPTS; attempt++) {
-      composed = await composeEmail(row, row.current_step, portfolioItems, playbookContext, research, priorEmails, feedback);
-      spamResult = checkSpamContent(composed.subject, composed.body);
-      qualityResult = await ReplyQualityService.scoreColdEmail({
-        leadId, lead: row, subject: composed.subject, body: composed.body, stepNumber: row.current_step,
-      });
-
-      const passed = spamResult.clean && qualityResult.score >= ReplyQualityService.COLD_EMAIL_SCORE_THRESHOLD;
-      const isLastAttempt = attempt === COMPOSE_MAX_ATTEMPTS;
-
-      await pool.query(
-        `INSERT INTO agent_actions (lead_id, action, detail, draft_text, score, decision) VALUES ($1, 'cold_email_scored', $2, $3, $4, $5)`,
-        [
-          leadId,
-          JSON.stringify({ attempt, stepNumber: row.current_step, spamFlagged: spamResult.flagged, feedback: qualityResult.feedback, subject: composed.subject }),
-          composed.body,
-          qualityResult.score,
-          passed ? 'send' : (isLastAttempt ? 'send_low_quality' : 'revise'),
-        ]
-      );
-
-      finalQualityScore = qualityResult.score;
-      if (passed || isLastAttempt) break;
-
-      const feedbackParts = [];
-      if (!spamResult.clean) feedbackParts.push(`Avoid these spam-trigger phrases: ${spamResult.flagged.join(', ')}.`);
-      if (qualityResult.score < ReplyQualityService.COLD_EMAIL_SCORE_THRESHOLD) feedbackParts.push(qualityResult.feedback);
-      feedback = feedbackParts.join(' ');
-      console.log(`[SequenceEmail] Lead ${leadId} draft attempt ${attempt} scored ${qualityResult.score}/5 (spam-clean: ${spamResult.clean}) — recomposing`);
-    }
+    sent = await composeAndSendColdEmail({
+      leadId, lead: row, leadEmail: row.lead_email, stepNumber: row.current_step, sender, research,
+      priorEmails: await fetchPriorSentEmails(leadId),
+    });
   } catch (err) {
     console.error(`[SequenceEmail] Compose failed for lead ${leadId}:`, err.message);
     await pool.query(
@@ -395,30 +454,7 @@ async function processRow(row, sequenceCapTracker) {
     );
     return 'deferred';
   }
-
-  // Follow-ups (step > 0) thread onto the conversation so far; a step-0 cold email has no
-  // logged messages yet, so getThreadHeaders returns nulls and it starts a fresh thread.
-  // No open-tracking pixel on sequence emails (removed 2026-10-07): a hidden 1x1 image is a
-  // classic bulk-mail signal for Gmail/Outlook filters, and opens are inflated by Apple Mail
-  // privacy/scanners anyway — replies are the metric that matters. Click tracking stays (the
-  // prompt asks for no links, so it rarely fires). Brevo's own open events still flow in via webhook.
-  const trackingToken = generateTrackingToken();
-  const tracking = { trackUrl: (url) => buildClickUrl(trackingToken, url) };
-  const { inReplyTo, references } = await getThreadHeaders(leadId);
-
-  // A real person's sign-off + an easy way to say no — a "stop" reply is still a reply (the
-  // reply worker classifies it not_interested and ends the sequence), and it's far better for
-  // sender reputation than a spam-button click. No visible unsubscribe link: this line is the
-  // opt-out, backed by the List-Unsubscribe headers EmailSenderService.send() sets.
-  const signature = (await getSetting('EMAIL_SIGNATURE')) || DEFAULT_SIGNATURE;
-  const fullBody = `${composed.body}\n\n${signature.replace(/\\n/g, '\n')}\n\n` +
-    `P.S. Not relevant? Just reply "stop" or "not interested" and I won't write again.`;
-
-  const { html, text } = renderEmailBody(fullBody, unsubscribeUrl, tracking, { visibleFooter: false });
-  const sendResult = await EmailSenderService.send(sender, {
-    to: row.lead_email, subject: composed.subject, html, text,
-    unsubscribeUrl, inReplyTo, references,
-  });
+  const { sendResult, composed, html, trackingToken, finalQualityScore } = sent;
 
   if (!sendResult.success) {
     console.error(`[SequenceEmail] Send failed for lead ${leadId}:`, sendResult.error);
@@ -656,4 +692,4 @@ console.log('📧 Sequence email worker started - checks every 15 minutes');
 
 // composeEmail + the pure prompt-assembly helpers are exported for test/preview use — all
 // side-effect-free (no send, no DB write).
-module.exports = { runSequenceWorker, runSequenceForLead, composeEmail, selectAngleForStep, stripHtmlToText, buildPriorEmailsText };
+module.exports = { runSequenceWorker, runSequenceForLead, composeEmail, composeAndSendColdEmail, selectAngleForStep, stripHtmlToText, buildPriorEmailsText };

@@ -45,11 +45,12 @@ router.post('/whatsapp', async (req, res) => {
 
           await pool.query(
             `UPDATE waba_templates
-             SET status = $1,
+             SET status = $1::varchar,
                  meta_template_id = COALESCE(meta_template_id, $2),
+                 rejection_reason = CASE WHEN $1::varchar = 'rejected' THEN $4 ELSE NULL END,
                  updated_at = NOW()
              WHERE template_name = $3`,
-            [newStatus, String(message_template_id || ''), message_template_name]
+            [newStatus, String(message_template_id || ''), message_template_name, reason || null]
           );
         }
 
@@ -172,6 +173,8 @@ router.post('/whatsapp', async (req, res) => {
                 'You have been unsubscribed. We will not contact you again. Thank you.'
               ).catch(() => {});
               agentService.logAgentAction(leadId, 'whatsapp_opted_out', { detail: { message: msgText }, decision: 'opted_out' }).catch(() => {});
+              // Directory leads: also stop the cross-channel cadence (email included) for good.
+              require('../services/cadenceReplyService').stopCadence(leadId, 'stopped', 'opted_out').catch(() => {});
               console.log(`[Webhook] Lead ${leadId} → opted_out`);
               continue;
             }
@@ -203,6 +206,19 @@ router.post('/whatsapp', async (req, res) => {
 
             // AI agent auto-replies to qualify the lead
             const leadRow = await pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId]);
+            // Directory leads: the cross-channel cadence owns them — stop both channels, alert the
+            // owner, route the draft through approval (services/cadenceReplyService.js). On any AI
+            // failure it sends nothing and alerts the owner, so no OPENAI_API_KEY check needed here.
+            if (leadRow.rows[0]?.cadence_managed) {
+              require('../services/cadenceReplyService')
+                .handleCadenceReply({ lead: leadRow.rows[0], channel: 'whatsapp', text: msgText })
+                .then((outcome) => console.log(`[Webhook] Directory lead ${leadId} replied on WhatsApp → ${outcome}`))
+                .catch((e) => {
+                  console.error('[CadenceReply] failed:', e.message);
+                  agentService.logAgentAction(leadId, 'cadence_reply_failed', { detail: { error: e.message }, decision: 'error' }).catch(() => {});
+                });
+              continue;
+            }
             if (leadRow.rows[0]) {
               if (!process.env.OPENAI_API_KEY) {
                 console.error('[Agent] ❌ OPENAI_API_KEY not set — agent cannot reply. Add it to Render env vars.');

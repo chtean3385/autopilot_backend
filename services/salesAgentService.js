@@ -289,26 +289,30 @@ function detectHandoffReason(message) {
 // the agent's own configured funnel intents for stage/knowledge selection); this rubric never
 // depends on per-agent configuration. The AI still replies on HANDOFF — the customer is never
 // left waiting — but the lead also surfaces for a human and the owner is pinged.
-const REPLY_GATES = ['HANDOFF', 'NOT_INTERESTED', 'UNSURE', 'ROUTINE'];
-async function classifyReplyIntent({ lead, message, conversationHistory }) {
+const REPLY_GATES = ['HANDOFF', 'NOT_INTERESTED', 'UNSURE', 'ROUTINE', 'AUTO_REPLY'];
+// channel 'email' (directory cadence replies, cadenceReplyService.js) reuses the same rubric for
+// email and adds AUTO_REPLY (out-of-office responders aren't a real reply). WhatsApp unchanged.
+async function classifyReplyIntent({ lead, message, conversationHistory, channel = 'whatsapp' }) {
   const history = (conversationHistory || []).slice(-10)
     .map(t => `${t.direction === 'in' ? 'Lead' : 'Us'}: ${t.body}`).join('\n');
+  const isEmail = channel === 'email';
   try {
     const res = await trackedCompletion(client, {
       model: 'gpt-4o-mini', max_tokens: 60, response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content:
-`Classify a B2B lead's latest WhatsApp reply. Return only JSON: {"gate":"ONE VALUE","reason":"3-6 words"}.
+`Classify a B2B lead's latest ${isEmail ? 'email' : 'WhatsApp'} reply. Return only JSON: {"gate":"ONE VALUE","reason":"3-6 words"}.
 - HANDOFF: shows buying interest, asks about price/quote/cost, asks to be called, wants a demo/meeting, asks for help or support, raises a problem or complaint, or asks something only a salesperson should answer. When unsure between HANDOFF and ROUTINE, pick HANDOFF.
 - NOT_INTERESTED: a clear no — "not interested", "stop", "don't message me".
 - UNSURE: unclear, gibberish, a wrong number, or a language you cannot read.
-- ROUTINE: a simple question answerable from product knowledge, a mild objection, "who is this", "not right now", small talk.` },
+- ROUTINE: a simple question answerable from product knowledge, a mild objection, "who is this", "not right now", small talk.${isEmail ? '\n- AUTO_REPLY: an automated out-of-office / vacation / "we received your email" responder, not written by a person.' : ''}` },
         { role: 'user', content: `Conversation so far:\n${history || '(none)'}\n\nLead's latest reply:\n${message}` },
       ],
     }, { purpose: 'sales_agent_reply_gate', leadId: lead.id });
     const parsed = json(res.choices[0].message.content, {});
+    const allowed = isEmail ? REPLY_GATES : REPLY_GATES.filter(g => g !== 'AUTO_REPLY');
     return {
-      gate: REPLY_GATES.includes(parsed.gate) ? parsed.gate : 'UNSURE',
+      gate: allowed.includes(parsed.gate) ? parsed.gate : 'UNSURE',
       reason: String(parsed.reason || '').slice(0, 60),
     };
   } catch (err) {
@@ -458,4 +462,8 @@ async function handleReply(lead, incomingText) {
   return { ...result, meta, intent, gate, stage: stage?.stage_key || null };
 }
 
-module.exports = { handleReply, logAgentAction };
+module.exports = {
+  handleReply, logAgentAction,
+  // Reused by cadenceReplyService.js (directory leads) — same gate, same never-repeat check.
+  classifyReplyIntent, tooSimilarToPrior, detectHandoffReason, getConversationHistory,
+};

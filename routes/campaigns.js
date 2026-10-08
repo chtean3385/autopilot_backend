@@ -49,12 +49,14 @@ router.get('/', async (req, res) => {
           JOIN hotel_leads hl ON hl.id = lgm.lead_id
           WHERE lgm.group_id = c.group_id
             AND (c.target_lead_status = 'all' OR hl.status = COALESCE(c.target_lead_status, 'new'))
+            AND hl.cadence_managed = FALSE
             AND hl.id NOT IN (SELECT lead_id FROM outreach_logs WHERE campaign_id = c.id)
         )
         WHEN c.target_type = 'city' AND c.target_city IS NOT NULL THEN (
           SELECT COUNT(*) FROM hotel_leads hl
           WHERE LOWER(hl.city) = LOWER(c.target_city)
             AND (c.target_lead_status = 'all' OR hl.status = COALESCE(c.target_lead_status, 'new'))
+            AND hl.cadence_managed = FALSE
             AND hl.id NOT IN (SELECT lead_id FROM outreach_logs WHERE campaign_id = c.id)
         )
         ELSE c.total_leads
@@ -126,6 +128,7 @@ router.post('/:id/launch', async (req, res) => {
         JOIN lead_group_members m ON hl.id = m.lead_id
         WHERE m.group_id = $1
           AND ($2 = 'all' OR hl.status = $2)
+          AND hl.cadence_managed = FALSE
           AND hl.id NOT IN (SELECT lead_id FROM outreach_logs WHERE campaign_id = $3)
       `, [campaign.group_id, targetLeadStatus, campaignId]);
     } else {
@@ -133,6 +136,7 @@ router.post('/:id/launch', async (req, res) => {
         SELECT * FROM hotel_leads
         WHERE LOWER(city) = LOWER($1)
           AND ($2 = 'all' OR status = $2)
+          AND cadence_managed = FALSE
           AND id NOT IN (SELECT lead_id FROM outreach_logs WHERE campaign_id = $3)
       `, [campaign.target_city, targetLeadStatus, campaignId]);
     }
