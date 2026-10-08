@@ -24,10 +24,18 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 //      safety net; an idea whose versions all get rejected is replaced next run, with Meta's reasons
 //      fed back into the writer.
 // Meta, not this code, decides approval. No AI available → nothing is written or submitted.
+//
+// Size limits (owner, 2026-10-08 — near-identical versions were heading for Meta's 250-template cap):
+//   - per niche at most WA_TEMPLATE_MIN_POOL ideas × WA_TEMPLATE_VARIANTS versions are live (default
+//     2 × 1 = 2 different messages). The writer still drafts 2 versions per idea; only the best is kept.
+//   - a template sent WA_TEMPLATE_RETIRE_AFTER (50) times is retired: deleted on Meta, kept here with
+//     status 'retired' (old messages still show its text), and the next run writes a fresh idea.
+//   - a niche over its limit (e.g. from before these rules) is trimmed to its best ideas the same way.
 
 const GENERIC_NICHE = 'directory';
 const FOOTER = 'Reply STOP to opt out';
-const DEFAULTS = { groups: 5, variants: 2, minScore: 4.5, maxSubmitPerDay: 15, hindiIdeas: 1, hinglishIdeas: 2 };
+const DEFAULTS = { groups: 2, variants: 1, minScore: 4.5, maxSubmitPerDay: 15, hindiIdeas: 1, hinglishIdeas: 2, retireAfter: 50 };
+const LIVE_STATUSES = ['approved', 'pending_approval', 'draft'];
 
 // Owner's brief (2026-10-08): Indian owners, so plain words anyone understands, say who we are and why
 // we are writing, and mix in Hinglish and Hindi. The language lives in the group name (_en_/_hing_/_hi_);
@@ -52,7 +60,8 @@ async function cfg() {
   const autoRaw = await settingsService.getSetting('WA_TEMPLATE_AUTO_SUBMIT');
   return {
     groups: Math.min(Math.round(await n('WA_TEMPLATE_MIN_POOL', DEFAULTS.groups)), 12),
-    variants: Math.min(Math.max(Math.round(await n('WA_TEMPLATE_VARIANTS', DEFAULTS.variants)), 2), 3), // owner: 2 per idea
+    variants: Math.min(Math.max(Math.round(await n('WA_TEMPLATE_VARIANTS', DEFAULTS.variants)), 1), 3), // owner: 1 per idea, 2 per niche
+    retireAfter: Math.round(await n('WA_TEMPLATE_RETIRE_AFTER', DEFAULTS.retireAfter)),
     minScore: Math.min(await n('WA_TEMPLATE_MIN_SCORE', DEFAULTS.minScore), 5),
     maxSubmitPerDay: Math.round(await n('WA_TEMPLATE_MAX_SUBMIT_PER_DAY', DEFAULTS.maxSubmitPerDay)),
     hindiIdeas: await count0('WA_TEMPLATE_HINDI_IDEAS', DEFAULTS.hindiIdeas),
@@ -235,8 +244,9 @@ async function scoreAndPolish(niche, body, minScore, notes) {
   return { body: text, score, note };
 }
 
-// Score every version; an idea is kept when >= 2 versions pass. Returns {kept:[{idea, versions:[{body,score,note}]}], best, feedback}.
-async function scoreIdeas(niche, ideas, minScore) {
+// Score every version; an idea is kept when >= minVersions pass, best-scoring versions first.
+// Returns {kept:[{idea, versions:[{body,score,note}]}], best, feedback}.
+async function scoreIdeas(niche, ideas, minScore, minVersions = 2) {
   const kept = [];
   const notes = [];
   let best = null;
@@ -249,7 +259,7 @@ async function scoreIdeas(niche, ideas, minScore) {
       if (best === null || v.score > best) best = v.score;
       if (v.score >= minScore) passing.push(v);
     }
-    if (passing.length >= 2) kept.push({ idea: idea.idea, versions: passing });
+    if (passing.length >= minVersions) kept.push({ idea: idea.idea, versions: passing.sort((a, b) => b.score - a.score) });
   }
   return { kept, best, feedback: notes.filter(Boolean).slice(0, 4).join(' | ') };
 }
@@ -371,12 +381,12 @@ const WORD_OVERLAP_MAX = 0.75;
 // Layer 2 (GPT): the owner's rule is "not even a similar meaning". An idea that makes the same point as a
 // live idea (in any language) or as another new idea is dropped; a version that is not about its own idea
 // is dropped (the "tender" idea once came back with a "product catalogue" version).
-async function dropDuplicates(niche, ideas, known) {
+async function dropDuplicates(niche, ideas, known, minVersions = 2) {
   const fresh = [];
   for (const idea of ideas) {
     const versions = (Array.isArray(idea.versions) ? idea.versions : [])
       .filter((v) => !known.some((k) => wordOverlap(v, k.body) >= WORD_OVERLAP_MAX));
-    if (versions.length >= 2) fresh.push({ idea: idea.idea, versions });
+    if (versions.length >= minVersions) fresh.push({ idea: idea.idea, versions });
   }
   if (!fresh.length) return { ideas: [], dropped: ideas.length };
 
@@ -413,9 +423,75 @@ async function dropDuplicates(niche, ideas, known) {
     if (!v || v.same_as) return;
     const off = new Set((Array.isArray(v.off_topic) ? v.off_topic : []).map((l) => String(l).toLowerCase()));
     const versions = f.versions.filter((_, j) => !off.has(String.fromCharCode(97 + j)));
-    if (versions.length >= 2) kept.push({ idea: f.idea, versions });
+    if (versions.length >= minVersions) kept.push({ idea: f.idea, versions });
   });
   return { ideas: kept, dropped: ideas.length - kept.length };
+}
+
+// Retire one template: delete it on Meta if it was ever submitted (frees a slot under Meta's 250 cap),
+// and keep the row as status 'retired' so outreach_logs.template_id — and the Inbox text — survive.
+// A failed Meta delete leaves the row untouched (retried next run) unless Meta says it's already gone.
+async function retireTemplate(t, reason) {
+  if (t.status !== 'draft') {
+    const del = await WABAService.deleteFromMeta(t.template_name);
+    if (!del.success && !/does not exist|not found|no template/i.test(del.error || '')) {
+      return { template: t.template_name, retired: false, error: del.error };
+    }
+  }
+  await pool.query(
+    `UPDATE waba_templates SET status = 'retired', quality_note = $2, updated_at = NOW() WHERE id = $1`,
+    [t.id, String(reason).slice(0, 250)]
+  );
+  return { template: t.template_name, retired: true, reason };
+}
+
+// Sends per template (every outreach_logs row that used it).
+async function sendCounts(ids) {
+  if (!ids.length) return new Map();
+  const r = await pool.query(
+    `SELECT template_id, COUNT(*)::int AS n FROM outreach_logs WHERE template_id = ANY($1) GROUP BY template_id`, [ids]
+  );
+  return new Map(r.rows.map((x) => [x.template_id, x.n]));
+}
+
+// Retire auto templates that reached the send limit. templateId → check just that one (after a send).
+async function retireUsedUp({ templateId = null, c = null } = {}) {
+  const conf = c || (await cfg());
+  const { rows } = await pool.query(
+    `SELECT t.* FROM waba_templates t
+     WHERE t.auto_generated AND t.template_group IS NOT NULL AND t.status = 'approved'
+       AND ($1::int IS NULL OR t.id = $1)
+       AND (SELECT COUNT(*) FROM outreach_logs o WHERE o.template_id = t.id) >= $2`,
+    [templateId, conf.retireAfter]
+  );
+  const out = [];
+  for (const t of rows) out.push(await retireTemplate(t, `Retired after ${conf.retireAfter} sends — a fresh message replaces it`));
+  return out;
+}
+
+// Keep a niche within groups × variants live templates: the best ideas stay (approved first, then
+// fewest sends, then highest score, then oldest), and within an idea the best versions; the rest retire.
+async function trimNiche(niche, c) {
+  const { rows } = await pool.query(
+    `SELECT * FROM waba_templates WHERE LOWER(industry) = $1 AND auto_generated AND template_group IS NOT NULL AND status = ANY($2)`,
+    [niche, LIVE_STATUSES]
+  );
+  if (rows.length <= c.groups * c.variants) return [];
+  const sends = await sendCounts(rows.map((r) => r.id));
+  const rank = (t) => [t.status === 'approved' ? 0 : t.status === 'pending_approval' ? 1 : 2, sends.get(t.id) || 0, -Number(t.quality_score || 0), t.id];
+  const cmp = (a, b) => { const x = rank(a); const y = rank(b); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; };
+  const byGroup = new Map();
+  for (const t of [...rows].sort(cmp)) {
+    if (!byGroup.has(t.template_group)) byGroup.set(t.template_group, []);
+    byGroup.get(t.template_group).push(t);
+  }
+  const keep = new Set();
+  [...byGroup.values()].slice(0, c.groups).forEach((versions) => versions.slice(0, c.variants).forEach((t) => keep.add(t.id)));
+  const out = [];
+  for (const t of rows) {
+    if (!keep.has(t.id)) out.push(await retireTemplate(t, `Retired: over the limit of ${c.groups * c.variants} live templates for ${niche}`));
+  }
+  return out;
 }
 
 async function ensureNiche(niche, c) {
@@ -442,10 +518,11 @@ async function ensureNiche(niche, c) {
     let feedback = null;
     let need = missing[lang];
     for (let round = 1; round <= 2 && need > 0; round++) {
-      const ideas = await writeIdeas(niche, need, c.variants, avoid, rejections, feedback, lang);
-      const distinct = await dropDuplicates(niche, ideas, known);
+      // Draft at least 2 versions so there is a choice; keep only the best c.variants of them.
+      const ideas = await writeIdeas(niche, need, Math.max(c.variants, 2), avoid, rejections, feedback, lang);
+      const distinct = await dropDuplicates(niche, ideas, known, c.variants);
       result.duplicates += distinct.dropped;
-      const scored = await scoreIdeas(niche, distinct.ideas, c.minScore);
+      const scored = await scoreIdeas(niche, distinct.ideas, c.minScore, c.variants);
       result.dropped += ideas.length - scored.kept.length;
       if (scored.best !== null && (result.bestScore === null || scored.best > result.bestScore)) result.bestScore = scored.best;
       if (scored.feedback) result.feedback = scored.feedback;
@@ -496,9 +573,12 @@ async function ensurePool() {
 async function runEnsurePool() {
   const c = await cfg();
   const niches = await activeNiches();
+  // Retire first, so the top-up below replaces what was retired in the same run.
+  const retired = await retireUsedUp({ c }).catch((err) => [{ error: err.message }]);
   const perNiche = [];
   for (const niche of niches) {
     try {
+      retired.push(...(await trimNiche(niche, c)));
       perNiche.push(await ensureNiche(niche, c));
     } catch (err) {
       perNiche.push({ niche, error: err.message });
@@ -506,7 +586,8 @@ async function runEnsurePool() {
   }
   const submitted = c.autoSubmit ? await submitDrafts() : [];
   const synced = await syncPending().catch((err) => ({ error: err.message }));
-  const summary = { config: c, niches: perNiche, submitted, synced };
+  const summary = { config: c, niches: perNiche, retired, submitted, synced };
+  if (retired.length) console.log(`[TemplatePool] retired: ${JSON.stringify(retired)}`);
   if (perNiche.some((n) => n.wrote?.length) || submitted.length) console.log(`[TemplatePool] ${JSON.stringify(summary)}`);
   const wrote = perNiche.reduce((n, x) => n + (x.wrote?.length || 0), 0);
   const scores = perNiche.map((x) => x.bestScore).filter((x) => x !== null && x !== undefined);
@@ -527,4 +608,7 @@ async function runEnsurePool() {
 
 const isRunning = () => !!running;
 
-module.exports = { ensurePool, ensureNiche, poolStatus, lastRun, isRunning, submitDrafts, syncPending, validateBody, activeNiches, wordOverlap, GENERIC_NICHE };
+module.exports = {
+  ensurePool, ensureNiche, poolStatus, lastRun, isRunning, submitDrafts, syncPending, validateBody, activeNiches, wordOverlap,
+  retireUsedUp, trimNiche, retireTemplate, GENERIC_NICHE,
+};

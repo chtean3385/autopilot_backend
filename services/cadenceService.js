@@ -335,6 +335,9 @@ async function sendWhatsappTouch(lead, row, template) {
   }
   await LeadService.logOutreach(lead.id, null, template.id, res.messageId);
   await logAction(lead.id, 'cadence_whatsapp_sent', { template: template.template_name, cycle: row.cycle }, 'send', template.body_text);
+  // Reached WA_TEMPLATE_RETIRE_AFTER sends → retired now (deleted on Meta), replaced on the next pool run.
+  await require('./templatePoolService').retireUsedUp({ templateId: template.id })
+    .catch((err) => console.error('[Cadence] template retire check failed:', err.message));
   return { sent: true };
 }
 

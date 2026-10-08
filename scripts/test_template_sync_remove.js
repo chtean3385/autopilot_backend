@@ -1,5 +1,6 @@
-// Test: Templates → "Sync with Meta" removes submitted templates that Meta no longer has, keeps drafts,
-// keeps history rows (template_id cleared), and changes nothing if Meta's list is empty or unreadable.
+// Test: Templates → "Sync with Meta" retires submitted templates that Meta no longer has (row kept, so
+// outreach history keeps its template link and the Inbox keeps the text), keeps drafts, leaves already
+// retired templates alone, and changes nothing if Meta's list is empty or unreadable.
 // Test DB only; Meta's list is stubbed. Run: node scripts/test_template_sync_remove.js
 const path = require('path');
 const B = path.join(__dirname, '..') + '/';
@@ -25,6 +26,7 @@ const check = (ok, label, extra = '') => { if (!ok) failures++; console.log(`${o
   const metaDeleted = await mk('metadeleted', 'approved');
   const draft = await mk('draft', 'draft');
   const prefix = await mk('prefix', 'pending_approval'); // Meta only has "<name>_x" — partial match must not count
+  const oldRetired = await mk('oldretired', 'retired'); // retired by us but still listed on Meta → stays retired
   const lead = (await pool.query(`INSERT INTO hotel_leads (hotel_name, owner_name, whatsapp_number, city) VALUES ($1, 'Test', $2, 'X') RETURNING id`, [tag, `9196${String(Date.now()).slice(-8)}`])).rows[0].id;
   await pool.query(`INSERT INTO outreach_logs (lead_id, template_id, message_type) VALUES ($1, $2, 'template')`, [lead, gone]);
 
@@ -59,18 +61,20 @@ const check = (ok, label, extra = '') => { if (!ok) failures++; console.log(`${o
     [`${tag}_kept`, { name: `${tag}_kept`, status: 'APPROVED', id: '777' }],
     [`${tag}_metadeleted`, { name: `${tag}_metadeleted`, status: 'DELETED', id: '8' }],
     [`${tag}_prefix_x`, { name: `${tag}_prefix_x`, status: 'APPROVED', id: '9' }],
+    [`${tag}_oldretired`, { name: `${tag}_oldretired`, status: 'APPROVED', id: '10' }],
   ]);
   const r2 = await sync();
   server.close();
   const k = await exists(kept);
   check(k?.status === 'approved' && k?.meta_template_id === '777', 'template still on Meta → status updated', JSON.stringify(k));
-  check(!(await exists(gone)), 'submitted template missing on Meta → removed');
-  check(!(await exists(metaDeleted)), 'template Meta marks DELETED → removed');
-  check(!(await exists(prefix)), 'only a similarly named template on Meta → still treated as missing, removed');
+  check((await exists(gone))?.status === 'retired', 'submitted template missing on Meta → retired, row kept');
+  check((await exists(metaDeleted))?.status === 'retired', 'template Meta marks DELETED → retired');
+  check((await exists(prefix))?.status === 'retired', 'only a similarly named template on Meta → still treated as missing, retired');
+  check((await exists(oldRetired))?.status === 'retired', 'a template we retired stays retired even if Meta still lists it');
   check(!!(await exists(draft)), 'draft (never submitted) → kept');
   const log = (await pool.query(`SELECT template_id FROM outreach_logs WHERE lead_id = $1`, [lead])).rows[0];
-  check(log && log.template_id === null, 'outreach history kept, template link cleared');
-  check(r2.body.removed?.length === 3, 'response lists removed templates', JSON.stringify(r2.body.removed));
+  check(log && log.template_id === gone, 'outreach history keeps its template link (Inbox still shows the text)');
+  check(r2.body.removed?.length === 3, 'response lists the retired templates', JSON.stringify(r2.body.removed));
 
   await pool.query(`DELETE FROM outreach_logs WHERE lead_id = $1`, [lead]);
   await pool.query(`DELETE FROM hotel_leads WHERE id = $1`, [lead]);

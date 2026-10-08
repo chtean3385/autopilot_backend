@@ -74,9 +74,11 @@ const groupsOf = async (niche) => (await pool.query(
   const src = (await pool.query(
     `INSERT INTO directory_sources (url, name, niche, city, status) VALUES ($1, 'Tpl test dir', 'Engineering', 'Gandhinagar', 'paused') RETURNING id`,
     [`https://tpl-test-${Date.now()}.example/`])).rows[0];
-  for (const [k, v] of Object.entries({ WA_TEMPLATE_MIN_POOL: 2, WA_TEMPLATE_MAX_SUBMIT_PER_DAY: 100 })) await setSetting(k, v);
+  // This suite covers the multi-version mode (2 versions per idea), so it pins WA_TEMPLATE_VARIANTS=2;
+  // the 1-version default, the per-niche cap and retiring are covered by test_template_limits.js.
+  for (const [k, v] of Object.entries({ WA_TEMPLATE_MIN_POOL: 2, WA_TEMPLATE_VARIANTS: 2, WA_TEMPLATE_MAX_SUBMIT_PER_DAY: 100, WA_TEMPLATE_RETIRE_AFTER: 100000 })) await setSetting(k, v);
   // defaults: auto on, 4.5, 2 versions per idea, 1 Hindi + 2 Hinglish ideas (pool of 2 → 1 Hindi, 1 Hinglish)
-  await pool.query(`DELETE FROM settings WHERE key IN ('WA_TEMPLATE_AUTO_SUBMIT','WA_TEMPLATE_MIN_SCORE','WA_TEMPLATE_VARIANTS','WA_TEMPLATE_HINDI_IDEAS','WA_TEMPLATE_HINGLISH_IDEAS')`);
+  await pool.query(`DELETE FROM settings WHERE key IN ('WA_TEMPLATE_AUTO_SUBMIT','WA_TEMPLATE_MIN_SCORE','WA_TEMPLATE_HINDI_IDEAS','WA_TEMPLATE_HINGLISH_IDEAS')`);
   const submittedLangs = [];
   const origSubmit = WABAService.submitTemplateToMeta;
   WABAService.submitTemplateToMeta = async (t) => { submittedLangs.push({ name: t.template_name, language: t.language }); return origSubmit.call(WABAService, t); };
@@ -87,7 +89,7 @@ const groupsOf = async (niche) => (await pool.query(
   const eng = await groupsOf('engineering');
   const gen = await groupsOf('directory');
   check(eng.length === 2 && gen.length === 2, 'each niche (engineering + generic) has 2 live message ideas', `${eng.length}/${gen.length}`);
-  check([...eng, ...gen].every((g) => g.n === 2), 'every idea has exactly 2 versions (default)');
+  check([...eng, ...gen].every((g) => g.n === 2), 'every idea has exactly 2 versions (WA_TEMPLATE_VARIANTS=2)');
   check([...eng, ...gen].every((g) => g.min_score >= 4.5 && !g.lowq), 'no version below 4.5 was kept');
   check(r1.niches.some((n) => n.dropped >= 1), 'an idea with only one good version was dropped and rewritten');
   check(r1.submitted.length === 8 && r1.submitted.every((s) => s.success), 'all passing versions submitted to Meta automatically (dry-run)', String(r1.submitted.length));

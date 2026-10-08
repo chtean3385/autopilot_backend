@@ -148,9 +148,10 @@ router.post('/:id/sync-status', async (req, res) => {
 });
 
 // Sync every template with Meta in one pass (Meta's full list, exact name match). A template we submitted
-// that Meta no longer has (deleted in WhatsApp Manager) is removed here too (owner, 2026-10-08); its old
-// campaign/outreach/task rows keep their history with template_id cleared. Drafts were never on Meta and
-// are left alone. If Meta's list can't be fetched, nothing is changed or removed.
+// that Meta no longer has (deleted in WhatsApp Manager) is marked 'retired' here — never deleted: deleting
+// the row cleared outreach_logs.template_id and the Inbox lost the text of every message sent with it
+// ("[Message sent]", 2026-10-08). Retired templates are never sent. Drafts were never on Meta and are left
+// alone. If Meta's list can't be fetched, nothing is changed.
 router.post('/sync-all', async (req, res) => {
   try {
     const onMeta = await WABAService.listAllMetaTemplates();
@@ -159,6 +160,8 @@ router.post('/sync-all', async (req, res) => {
     const gone = [];
 
     for (const t of templates) {
+      // Retired by us (used up / over the per-niche limit): stays retired even if Meta still lists it.
+      if (t.status === 'retired') continue;
       const m = onMeta.get(t.template_name);
       if (m && !['DELETED', 'PENDING_DELETION'].includes(m.status)) {
         const status = WABAService.localStatus(m.status);
@@ -180,28 +183,19 @@ router.post('/sync-all', async (req, res) => {
     const submitted = templates.filter((t) => t.status !== 'draft').length;
     if (gone.length && onMeta.size === 0) {
       return res.json({ success: true, synced: results.length, results, removed: [],
-        warning: `Meta returned no templates at all, so ${gone.length} local template(s) were NOT removed. Check the WABA account settings.` });
+        warning: `Meta returned no templates at all, so ${gone.length} local template(s) were NOT retired. Check the WABA account settings.` });
     }
 
+    // Not on Meta any more → retired, row kept (message history keeps its text). Never sent again.
     const removed = [];
     for (const t of gone) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        for (const table of ['campaigns', 'outreach_logs', 'agent_tasks']) {
-          await client.query(`UPDATE ${table} SET template_id = NULL WHERE template_id = $1`, [t.id]);
-        }
-        await client.query('DELETE FROM waba_templates WHERE id = $1', [t.id]);
-        await client.query('COMMIT');
-        removed.push(t.template_name);
-      } catch (err) {
-        await client.query('ROLLBACK');
-        results.push({ id: t.id, name: t.template_name, error: `not on Meta, but could not remove: ${err.message}` });
-      } finally {
-        client.release();
-      }
+      await pool.query(
+        `UPDATE waba_templates SET status = 'retired', quality_note = 'Not on Meta any more (deleted in WhatsApp Manager)', updated_at = NOW() WHERE id = $1`,
+        [t.id]
+      );
+      removed.push(t.template_name);
     }
-    if (removed.length) console.log(`[Templates] sync-all removed ${removed.length} template(s) no longer on Meta: ${removed.join(', ')}`);
+    if (removed.length) console.log(`[Templates] sync-all retired ${removed.length} template(s) no longer on Meta: ${removed.join(', ')}`);
 
     res.json({ success: true, synced: results.length, results, removed, submitted });
   } catch (err) {
