@@ -171,6 +171,20 @@ const lead = async (name) => (await pool.query('SELECT * FROM hotel_leads WHERE 
   );
   check(order.rows[0]?.hotel_name === biz[0].name, 'cadence intake starts the hot lead first');
 
+  // --- contact rule: a business needs a phone, an email or a website to be saved ------------
+  const srcObj = { url: dirUrl, city: 'Ahmedabad' };
+  check(Crawler.toEntry({ company: 'Name Only Traders', phones: [], emails: [], website: null }, srcObj) === null, 'name-only business is not saved');
+  check(Crawler.toEntry({ company: 'Site Only Traders', website: 'https://siteonly.example.in' }, srcObj)?.website === 'https://siteonly.example.in', 'website-only business is saved');
+  check(Crawler.toEntry({ company: 'Landline Traders', phones: ['022 2647 0000'] }, srcObj)?.phone_raw === '022 2647 0000', 'phone-only business is saved');
+
+  // --- re-crawl: a finished source starts over, already-found businesses are kept -----------
+  const before = (await pool.query('SELECT status FROM directory_sources WHERE id = $1', [src.id])).rows[0].status;
+  const rc = await Crawler.recrawlSource(src.id);
+  check(before === 'done' && rc.status === 'approved' && rc.pages_total === 0, 're-crawl resets a finished source', `${before} → ${rc.status}`);
+  const again = await Crawler.crawlSource(src.id, { maxPages: 50 });
+  const entriesAfter = (await pool.query('SELECT COUNT(*)::int AS n FROM directory_entries WHERE source_id = $1', [src.id])).rows[0].n;
+  check(again.queued >= 5 && again.newEntries === 0 && entriesAfter === 3, 're-crawl rediscovers pages, no duplicate businesses', `queued=${again.queued} new=${again.newEntries} total=${entriesAfter}`);
+
   // cleanup: pause the source so the worker never touches it
   await pool.query(`UPDATE directory_sources SET status = 'paused' WHERE id = $1`, [src.id]);
   await pool.query(`DELETE FROM settings WHERE key = 'DIRECTORY_CRAWL_DELAY_MS'`);

@@ -427,6 +427,10 @@ function toEntry(member, source) {
     || contacts.find((c) => c.name);
 
   const email = (Array.isArray(member.emails) ? member.emails : []).map(cleanEmail).find(Boolean) || null;
+  const website = cleanWebsite(member.website, source.url);
+  // Owner's rule: a business is saved only with at least one way to reach it — a phone number,
+  // an email or a website (the website can still yield an email later). Name-only rows are dropped.
+  if (!phoneRaw && !email && !website) return null;
 
   return {
     company,
@@ -435,7 +439,7 @@ function toEntry(member, source) {
     phone_raw: phoneRaw ? phoneRaw.slice(0, 100) : null,
     phone_e164: phoneE164,
     email,
-    website: cleanWebsite(member.website, source.url),
+    website,
     address: member.address ? String(member.address).trim() : null,
     category: member.category ? String(member.category).trim().slice(0, 255) : null,
     products: member.products ? String(member.products).trim() : null,
@@ -651,7 +655,24 @@ async function setStatus(id, status) {
   return result.rows[0];
 }
 
+// Start a source over: drop its page queue and re-run discovery on the next crawl (sitemap first).
+// For a directory that was crawled before a crawler fix (e.g. one that only showed a JS cookie page),
+// or that has new members since. Businesses already found stay — saveEntry merges by company name,
+// so a re-crawl fills gaps and never duplicates — and promoted leads are untouched.
+async function recrawlSource(id) {
+  const { rows } = await pool.query('SELECT * FROM directory_sources WHERE id=$1', [id]);
+  if (!rows[0]) return null;
+  if (isBlockedDomain(rows[0].url)) throw new Error('Blocked domain — its terms forbid scraping');
+  await pool.query('DELETE FROM directory_crawl_pages WHERE source_id=$1', [id]);
+  const result = await pool.query(
+    `UPDATE directory_sources SET status='approved', pages_total=0, pages_done=0, last_error=NULL, updated_at=NOW()
+     WHERE id=$1 RETURNING *`,
+    [id]
+  );
+  return result.rows[0];
+}
+
 module.exports = {
-  crawlSource, discoverPages, extractMembers, extractMembersByRules, extractMembersByJsonLd, toEntry, suggestSources, addSource, setStatus,
+  crawlSource, discoverPages, recrawlSource, extractMembers, extractMembersByRules, extractMembersByJsonLd, toEntry, suggestSources, addSource, setStatus,
   isDisallowed, isBlockedDomain, BLOCKED_DOMAINS,
 };

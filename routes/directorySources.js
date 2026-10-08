@@ -60,6 +60,17 @@ async function statusRoute(req, res, status) {
   }
 }
 
+// "Re-crawl": clear the page queue and rediscover pages on the next crawl (entries/leads are kept).
+router.post('/:id/recrawl', async (req, res) => {
+  try {
+    const source = await Directory.recrawlSource(req.params.id);
+    if (!source) return res.status(404).json({ success: false, error: 'Source not found' });
+    res.json({ success: true, source });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
 // Manual "Crawl now" — runs one batch synchronously (max_pages, default the per-tick setting).
 router.post('/:id/crawl', async (req, res) => {
   try {
