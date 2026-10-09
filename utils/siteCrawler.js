@@ -95,6 +95,26 @@ async function fetchPage(url) {
   }
 }
 
+// Form-encoded POST returning parsed JSON (or null) — for directory sites whose member list is
+// loaded by the page's own XHR call rather than present in the HTML. Same browser headers + retry.
+async function postFormJson(url, fields) {
+  const headers = { ...BROWSER_HEADERS, Accept: 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest' };
+  const cookie = hostCookies.get(hostOfUrl(url));
+  if (cookie) headers.Cookie = cookie;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const { data } = await axios.post(url, new URLSearchParams(fields).toString(), {
+        timeout: REQUEST_TIMEOUT_MS, headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      });
+      if (typeof data === 'string') { try { return JSON.parse(data); } catch { return null; } }
+      return data && typeof data === 'object' ? data : null;
+    } catch (error) {
+      if (attempt >= MAX_FETCH_RETRIES || !isRetryableError(error)) return null;
+      await sleep(RETRY_DELAY_MS);
+    }
+  }
+}
+
 // Same fetch as fetchPage, but also returns response headers/status — for callers that need
 // header-based signals (e.g. hosting/CDN fingerprinting) beyond just the HTML body. A separate
 // function rather than changing fetchPage's return shape, since fetchPage's `string | null`
@@ -303,6 +323,7 @@ module.exports = {
   normalizeUrl,
   fetchPage,
   fetchPageWithMeta,
+  postFormJson,
   fetchRobotsTxt,
   loadClean,
   cleanText,

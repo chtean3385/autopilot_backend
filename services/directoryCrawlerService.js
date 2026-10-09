@@ -1,7 +1,7 @@
 const OpenAI = require('openai');
 const pool = require('../config/db');
 const {
-  normalizeUrl, fetchPage, fetchRobotsTxt, loadClean, cleanText, extractMailtoTel, discoverSitemapUrls,
+  normalizeUrl, fetchPage, postFormJson, fetchRobotsTxt, loadClean, cleanText, extractMailtoTel, discoverSitemapUrls,
 } = require('../utils/siteCrawler');
 const { trackedCompletion, isAiAvailable } = require('../utils/aiUsage');
 const { normalizeMobileNumber } = require('../utils/phone');
@@ -407,6 +407,58 @@ async function extractMembersWithGpt(html, pageUrl, source) {
   return Array.isArray(parsed.members) ? parsed.members : [];
 }
 
+// ---------------------------------------------------------------------------------------------
+// "Indian Business Pages" (ibphub.com) association sites, e.g. vatvaassociation.org: the /directory
+// page is an empty shell (a {{result_link}} template) that the browser fills from
+// POST /xhr/get-clients.php — 15 members per page, A→Z, with an empty keyword = the whole list. The
+// HTML has no member links at all, so link-following finds nothing. Instead, when the shell is seen,
+// page 1 of that JSON feed is queued as .../xhr/get-clients.php?page=1; each feed page queues the
+// next until one comes back short. Same queue, pacing and block handling as ordinary pages.
+// ---------------------------------------------------------------------------------------------
+const IBP_FEED_PATH = '/xhr/get-clients.php';
+const IBP_PAGE_SIZE = 15;
+
+const isIbpShell = (html) => /id=["']client_html["']/.test(html) && /leading-client\.js/.test(html);
+const isIbpFeedUrl = (url) => { try { return new URL(url).pathname === IBP_FEED_PATH; } catch { return false; } };
+const ibpFeedUrl = (pageUrl, n) => `${new URL(pageUrl).origin}${IBP_FEED_PATH}?page=${n}`;
+
+async function queueIbpFeedPage(source, url, maxPages) {
+  // Same DIRECTORY_MAX_PAGES cap as link-following — also stops a feed that never comes back short.
+  if ((await queuedCount(source.id)) >= maxPages) return 0;
+  const r = await pool.query(
+    `INSERT INTO directory_crawl_pages (source_id, url, depth) VALUES ($1, $2, NULL) ON CONFLICT DO NOTHING RETURNING id`,
+    [source.id, url]
+  );
+  if (!r.rows[0]) return null;
+  await pool.query(`UPDATE directory_sources SET pages_total = $2, updated_at = NOW() WHERE id = $1`, [source.id, await queuedCount(source.id)]);
+  return { id: r.rows[0].id, url, depth: null };
+}
+
+const nonEmpty = (...vals) => vals.map((v) => (v == null ? '' : String(v).trim())).filter(Boolean);
+
+function ibpMembers(rows) {
+  return rows.map((r) => ({
+    company: cleanText(String(r.sCompanyName || '')),
+    // People and numbers are separate lists on the site — not paired here, so none is mis-attributed.
+    contacts: nonEmpty(r.sPerson1, r.sPerson2, r.sPerson3).map((name) => ({ name, phone: null })),
+    phones: nonEmpty(r.sMobile, r.sMobile2, r.sMobile3, r.sPhone1, r.sPhone2, r.sPhone3),
+    emails: nonEmpty(r.sEmail, r.sEmail2, r.sEmail3),
+    website: nonEmpty(r.sWebsite, r.sWebsite2)[0] || null,
+    address: nonEmpty(r.sAddress, r.sCityName, r.sStateName, r.sPincode).join(', ') || null,
+    category: nonEmpty(r.sSubCategoryStr, r.sCategoryStr)[0] || null,
+    products: nonEmpty(r.sProductStr, r.sBusinessDescription)[0] || null,
+    page_url: r.result_link || null,
+  }));
+}
+
+// One feed page → { members, next } (next = the following feed page's URL, or null at the end).
+async function fetchIbpFeedPage(url) {
+  const n = parseInt(new URL(url).searchParams.get('page'), 10) || 1;
+  const json = await postFormJson(url.split('?')[0], { page: String(n), keyword: '' });
+  if (!json || !Array.isArray(json.data)) throw new Error('member feed did not return JSON');
+  return { members: ibpMembers(json.data), next: json.data.length >= IBP_PAGE_SIZE ? ibpFeedUrl(url, n + 1) : null };
+}
+
 // JSON-LD, then rules (both free); GPT only for pages neither recognises. Returns { members, via }.
 async function extractMembers(html, pageUrl, source) {
   const byJsonLd = extractMembersByJsonLd(html, pageUrl);
@@ -542,6 +594,14 @@ async function crawlSource(sourceId, { maxPages } = {}) {
   const blockFails = await intSetting('DIRECTORY_BLOCK_FAILS', DEFAULT_BLOCK_FAILS);
   let failStreak = [];
   let okPages = 0;
+  // A feed page's successor joins this batch (up to the page limit) instead of waiting a whole turn
+  // per 15 members; the for…of below picks up rows pushed while it runs.
+  const queueFeed = (row) => {
+    if (!row) return;
+    stats.linksQueued++;
+    if (pending.rows.length < limit) pending.rows.push(row);
+    if (currentCrawl) currentCrawl.planned = pending.rows.length;
+  };
   currentCrawl = {
     sourceId: source.id, name: source.name || hostOf(source.url), url: source.url,
     startedAt: new Date().toISOString(), planned: pending.rows.length, done: 0, ok: 0, failed: 0, currentUrl: null,
@@ -557,17 +617,33 @@ async function crawlSource(sourceId, { maxPages } = {}) {
       currentCrawl.currentUrl = page.url;
       currentCrawl.done = stats.pages;
       try {
-        const html = await fetchPage(page.url);
-        if (!html) throw new Error('fetch failed or non-HTML');
-        // Follow links before extracting, so a page parked as needs_ai still leads to its members.
-        stats.linksQueued += await expandLinks(html, page, source, robots, expandOpts);
-        const { members, via } = await extractMembers(html, page.url, source);
+        let members;
+        let via;
+        if (isIbpFeedUrl(page.url)) {
+          const feed = await fetchIbpFeedPage(page.url);
+          if (feed.next) queueFeed(await queueIbpFeedPage(source, feed.next, expandOpts.maxPages));
+          ({ members } = feed);
+          via = 'ibp_feed';
+        } else {
+          const html = await fetchPage(page.url);
+          if (!html) throw new Error('fetch failed or non-HTML');
+          if (isIbpShell(html)) {
+            // Members aren't in this HTML — read the JSON feed the page itself loads (see above).
+            queueFeed(await queueIbpFeedPage(source, ibpFeedUrl(page.url, 1), expandOpts.maxPages));
+            members = [];
+            via = 'ibp_shell';
+          } else {
+            // Follow links before extracting, so a page parked as needs_ai still leads to its members.
+            stats.linksQueued += await expandLinks(html, page, source, robots, expandOpts);
+            ({ members, via } = await extractMembers(html, page.url, source));
+          }
+        }
         stats[via] = (stats[via] || 0) + 1;
         let saved = 0;
         for (const m of members) {
           const entry = toEntry(m, source);
           if (!entry) continue;
-          if (await saveEntry(source.id, page.url, entry)) stats.newEntries++;
+          if (await saveEntry(source.id, m.page_url || page.url, entry)) stats.newEntries++;
           saved++;
         }
         stats.members += saved;
@@ -738,5 +814,5 @@ async function recrawlSource(id) {
 
 module.exports = {
   crawlSource, discoverPages, recrawlSource, getCurrentCrawl, extractMembers, extractMembersByRules, extractMembersByJsonLd, toEntry, suggestSources, addSource, setStatus,
-  isDisallowed, isBlockedDomain, BLOCKED_DOMAINS,
+  isDisallowed, isBlockedDomain, BLOCKED_DOMAINS, isIbpShell, fetchIbpFeedPage,
 };
