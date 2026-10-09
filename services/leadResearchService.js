@@ -658,4 +658,16 @@ async function getCachedResearch(leadId) {
   return result.rows[0] || null;
 }
 
-module.exports = { researchCompany, getOrCreateResearch, saveResearch, getCachedResearch, RESEARCH_MAX_ATTEMPTS };
+// Directory leads often have no website saved but email on their own domain (info@company.com) —
+// that domain is their website. Free-mail domains say nothing about the business.
+const FREE_MAIL_RE = /^(gmail|googlemail|yahoo|ymail|rocketmail|rediffmail|hotmail|outlook|live|msn|icloud|me|aol|zoho|zohomail|protonmail|proton|mail|gmx|yandex|in|sify|vsnl|bsnl)\.[a-z.]+$/i;
+const FREE_MAIL_SQL = "'^(gmail|googlemail|yahoo|ymail|rocketmail|rediffmail|hotmail|outlook|live|msn|icloud|me|aol|zoho|zohomail|protonmail|proton|mail|gmx|yandex|in|sify|vsnl|bsnl)\\.'";
+
+function researchSiteFor(lead) {
+  if (lead.website && String(lead.website).trim()) return String(lead.website).trim();
+  const domain = String(lead.email || '').split('@')[1]?.trim().toLowerCase();
+  if (!domain || !domain.includes('.') || FREE_MAIL_RE.test(domain)) return null;
+  return `https://${domain}`;
+}
+
+module.exports = { researchCompany, getOrCreateResearch, saveResearch, getCachedResearch, researchSiteFor, FREE_MAIL_SQL, RESEARCH_MAX_ATTEMPTS };

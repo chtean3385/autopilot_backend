@@ -9,7 +9,7 @@ const PlaybookService = require('../services/playbookService');
 const ReplyQualityService = require('../services/replyQualityService');
 const SchedulerStatusService = require('../services/schedulerStatusService');
 const { notifyAdmin } = require('../services/adminNotifyService');
-const { getCachedResearch, RESEARCH_MAX_ATTEMPTS } = require('../services/leadResearchService');
+const { getCachedResearch, researchSiteFor, RESEARCH_MAX_ATTEMPTS } = require('../services/leadResearchService');
 const { trackedCompletion } = require('../utils/aiUsage');
 const { renderEmailBody } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
@@ -404,13 +404,20 @@ async function processRow(row, sequenceCapTracker) {
 
   // Research gate: a lead with a website must have completed research before ANY email goes out
   // — workers/researchWorker.js front-loads that crawl on its own 5-min cron, well ahead of send
-  // time, so this just reads whatever's cached rather than triggering a crawl inline. A lead with
-  // no website at all composes from the CRM-only industry fallback in buildSystemPrompt. A lead
+  // time, so this just reads whatever's cached rather than triggering a crawl inline. A lead
   // whose research permanently failed after RESEARCH_MAX_ATTEMPTS is NOT emailed (changed
   // 2026-10-07): those produced the generic emails that got opened and ignored, and every ignored
-  // cold email costs sender reputation for the good ones.
-  const research = row.website ? await getCachedResearch(leadId) : null;
-  if (row.website && !research) {
+  // cold email costs sender reputation for the good ones. Since 2026-10-09 (owner: "we can't just
+  // send random email") the same holds for a lead with nothing to research — no website and a
+  // free-mail address; with no website but a company-domain email, that domain is researched.
+  const site = researchSiteFor({ website: row.website, email: row.lead_email });
+  if (!site) {
+    console.log(`[SequenceEmail] Lead ${leadId} has no website or company domain to research — not sending a generic email, stopping sequence`);
+    await killSequence(leadSequenceId, leadId, 'no_research_possible');
+    return 'stopped';
+  }
+  const research = await getCachedResearch(leadId);
+  if (!research) {
     if ((row.research_attempts || 0) < RESEARCH_MAX_ATTEMPTS) {
       console.log(`[SequenceEmail] Lead ${leadId} has a website but research isn't ready yet — waiting for researchWorker`);
       return 'awaiting_research';

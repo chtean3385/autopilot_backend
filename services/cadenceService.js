@@ -4,7 +4,7 @@ const EmailSenderService = require('./emailSenderService');
 const SuppressionService = require('./suppressionService');
 const WABAService = require('./wabaService');
 const LeadService = require('./leadService');
-const { getCachedResearch, RESEARCH_MAX_ATTEMPTS } = require('./leadResearchService');
+const { getCachedResearch, researchSiteFor, RESEARCH_MAX_ATTEMPTS } = require('./leadResearchService');
 const { isWithinSendWindow } = require('../utils/sendWindow');
 const { stopCadence } = require('./cadenceReplyService');
 const { WRITING_RULES } = require('../utils/humanTone');
@@ -111,6 +111,11 @@ async function emailUsable(lead) {
   if (!lead.email || lead.email_status !== 'verified') return false; // unverified = never sent
   const domain = String(lead.email).split('@')[1]?.toLowerCase();
   if (domain && (await getOwnDomains()).includes(domain)) return false;
+  // Owner's rule: no cold email without research on the lead. No site to research (no website, free-mail
+  // address) or research permanently failed → email is not an option; WhatsApp only. Research still
+  // pending → usable, the touch waits for it (sendEmailTouch).
+  if (!researchSiteFor(lead)) return false;
+  if (!(await getCachedResearch(lead.id)) && (lead.research_attempts || 0) >= RESEARCH_MAX_ATTEMPTS) return false;
   return true;
 }
 
@@ -242,13 +247,10 @@ async function priorMessagesForComposer(leadId) {
 }
 
 async function sendEmailTouch(lead, row, isFinalTouch) {
-  // Same research gate as sequences: a lead with a website waits for researchWorker (extended to
-  // cadence leads); one whose research permanently failed is written from industry context only.
-  let research = null;
-  if (lead.website) {
-    research = await getCachedResearch(lead.id);
-    if (!research && (lead.research_attempts || 0) < RESEARCH_MAX_ATTEMPTS) return { wait: 'awaiting_research', hours: 2 };
-  }
+  // Never a generic email: wait for researchWorker (website, or the email's company domain). emailUsable()
+  // already rules out leads that can't be researched; this guards a lead whose research is still running.
+  const research = await getCachedResearch(lead.id);
+  if (!research) return { wait: 'awaiting_research', hours: 2 };
   // Same mailbox as this lead's first email; waits if that mailbox is paused or full today.
   const sender = await EmailSenderService.getSenderForLead(lead.id);
   if (!sender) return { wait: 'no_sender_capacity', hours: 3 };

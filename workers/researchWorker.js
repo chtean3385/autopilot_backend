@@ -1,7 +1,7 @@
 const schedule = require('node-schedule');
 const pool = require('../config/db');
 const { track } = require('../utils/jobTracker');
-const { getOrCreateResearch, RESEARCH_MAX_ATTEMPTS } = require('../services/leadResearchService');
+const { getOrCreateResearch, researchSiteFor, FREE_MAIL_SQL, RESEARCH_MAX_ATTEMPTS } = require('../services/leadResearchService');
 const { isAiAvailable } = require('../utils/aiUsage');
 
 // Front-loads website research for sequence-enrolled leads, decoupled from send time.
@@ -33,13 +33,15 @@ async function runResearchPass() {
     // under the attempt cap, and past the retry backoff. Not scoped to next_run_at — the point is
     // to get research done well before a step is actually due, not just-in-time.
     const result = await pool.query(
-      `SELECT DISTINCT ON (hl.id) hl.id, hl.hotel_name, hl.owner_name, hl.city, hl.business_category, hl.website
+      `SELECT DISTINCT ON (hl.id) hl.id, hl.hotel_name, hl.owner_name, hl.city, hl.business_category, hl.website, hl.email
        FROM hotel_leads hl
        LEFT JOIN lead_research lr ON lr.lead_id = hl.id
        WHERE (EXISTS (SELECT 1 FROM lead_sequences ls WHERE ls.lead_id = hl.id AND ls.status = 'active')
               -- directory leads in the email/WhatsApp cadence (services/cadenceService.js) need it too
               OR EXISTS (SELECT 1 FROM lead_cadence lc WHERE lc.lead_id = hl.id AND lc.status IN ('active', 'resting')))
-         AND hl.website IS NOT NULL AND hl.website <> ''
+         -- a website, or (none saved) email on the company's own domain → research that domain
+         AND ((hl.website IS NOT NULL AND hl.website <> '')
+              OR (hl.email LIKE '%@%.%' AND split_part(LOWER(hl.email), '@', 2) !~ ${FREE_MAIL_SQL}))
          AND lr.lead_id IS NULL
          AND COALESCE(hl.research_attempts, 0) < $1
          AND (hl.last_research_attempt_at IS NULL OR hl.last_research_attempt_at < NOW() - INTERVAL '${RETRY_BACKOFF_MINUTES} minutes')
@@ -65,8 +67,15 @@ async function runResearchPass() {
         [lead.id]
       );
       try {
-        const { research } = await getOrCreateResearch(lead);
-        if (research) stats.researched++; else stats.failed++;
+        const site = researchSiteFor(lead);
+        const { research } = await getOrCreateResearch({ ...lead, website: site });
+        if (research) {
+          stats.researched++;
+          // The email's domain turned out to be a real site → save it as the lead's website.
+          if (!lead.website && site) {
+            await pool.query(`UPDATE hotel_leads SET website = $2 WHERE id = $1 AND COALESCE(website, '') = ''`, [lead.id, site]);
+          }
+        } else stats.failed++;
       } catch (err) {
         console.error(`[ResearchWorker] Research failed for lead ${lead.id}:`, err.message);
         stats.failed++;

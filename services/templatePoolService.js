@@ -42,7 +42,7 @@ const LIVE_STATUSES = ['approved', 'pending_approval', 'draft'];
 // Meta gets 'hi' for Devanagari text, 'en_US' for everything else (Hinglish is written in English letters).
 const LANGS = {
   en: 'very simple Indian English. Short, everyday words a shop or factory owner uses. No formal phrases like "would you be open to", "how do you manage", "keep track of", "streamline".',
-  hing: 'Hinglish: Hindi written in English letters, mixed with common English words, the way people type on WhatsApp (e.g. "aapke paas customer ka enquiry WhatsApp pe aata hai?"). Simple and friendly.',
+  hing: 'Hinglish: Hindi written in English letters, mixed with common English words, the way people type on WhatsApp (e.g. "kya aapke business ki website ya app bani hai?"). Simple and friendly.',
   hi: 'simple spoken Hindi in Devanagari script (common English words like website, email, WhatsApp, order may stay in English). Not formal or bookish Hindi.',
 };
 // Groups are named <niche>_<lang>_<idea>_<stamp>; older groups have no language part and count as English.
@@ -105,9 +105,17 @@ async function poolStatus(niche = null) {
 }
 
 // Template-only writing rules (the shared WRITING_RULES are English email/reply rules).
-const TEMPLATE_RULES = `Write like Chetan, founder of Dreams Technology, a small web team in Gandhinagar, typing a short WhatsApp message himself.
-- The FIRST sentence after the greeting says who he is and why he is writing, in plain words, e.g. "Chetan here from Dreams Technology, Gandhinagar. We make websites and business email for <trade> businesses." The reader must never wonder "who is this, why is he messaging me".
-- Then ONE real, everyday situation from their trade, said simply. Then ONE easy question they can answer in a word or two.
+// What we sell — the whole IT range, not one product. Templates kept drifting into "WhatsApp enquiries
+// get lost" (reads like a CRM pitch) when the brief only named website/email/enquiry tracking.
+const OUR_SERVICES =
+  'Dreams Technology (Gandhinagar) is a full IT services team for businesses: websites, landing pages, mobile apps, ' +
+  'online booking/ordering, billing and stock software, staff attendance/HR and payroll (HRMS), customer follow-up software (CRM), ' +
+  'custom software and business email. One team for all IT work.';
+
+const TEMPLATE_RULES = `Write like Chetan, founder of Dreams Technology, an IT services team in Gandhinagar, typing a short WhatsApp message himself.
+- The FIRST sentence after the greeting says who he is and what we do, in plain words, naming 2-3 of our services that suit the trade, e.g. "Chetan here from Dreams Technology, Gandhinagar. We build websites, mobile apps and business software." The reader must understand in one read: an IT company, and why it is messaging them. Never make it sound like we sell only one product.
+- Then at most ONE short line linking it to their trade (a common thing in their work that one of our services helps with). It must not be a long problem story, and not always about WhatsApp or enquiries.
+- Then ONE easy question they can answer in a word or two (e.g. whether they have a website/app yet, or have any IT work planned).
 - Simple words only. Short sentences. If a 10th-pass shop owner would need to read it twice, it is too hard.
 - No sales words or jargon: "solution", "leverage", "streamline", "boost", "CRM", "digital transformation", "next level", "seamless".
 - No AI tells: no "I hope this message finds you well", "I wanted to reach out", "I came across", no em dashes (—), no exclamation marks, no emojis, no lists, no flattery.
@@ -126,17 +134,18 @@ async function writeIdeas(niche, count, variants, avoidBodies, rejectionNotes, f
         role: 'system',
         content:
           `You write WhatsApp opening messages from Dreams Technology (Gandhinagar) to owners of ${trade} businesses in Gujarat, ` +
-          'found in industry association directories. What we can help with: a proper website, a business email (name@company.com), ' +
-          'and a simple way to track every enquiry/customer. Do not list all three — pick what fits the idea.\n\n' +
+          `found in business directories.\n${OUR_SERVICES}\n` +
+          'Name 2-3 services that fit each idea (never the whole list, never just one product).\n\n' +
           `${TEMPLATE_RULES}\n\nLanguage: ${LANGS[lang]}\n\n` +
           'Format rules (Meta template):\n' +
-          `- 35-70 words. Start with ${greeting} ({{1}} = first name). {{1}} appears exactly once; no other variables.\n` +
+          `- 25-55 words: short and simple. Start with ${greeting} ({{1}} = first name). {{1}} appears exactly once; no other variables.\n` +
           '- No links, prices, discounts, "free", or ALL CAPS.\n\n' +
           'This is a template: the same text goes to every owner in the trade, only {{1}} changes. So be specific to the TRADE, ' +
-          'not to one company: first list 4-6 concrete everyday situations owners in this trade really deal with (who asks them ' +
-          'for what, where enquiries come from, what gets lost or delayed), then build each idea on one of them, in the words they use.\n' +
-          'Each idea must make a DIFFERENT point from every other idea and from the ones already in use (not the same problem in new words; ' +
-          '"messages get lost in WhatsApp" counts as one idea, however it is phrased).\n\n' +
+          'not to one company: first list 4-6 things in this trade where one of our services helps (customers looking them up online, ' +
+          'booking/ordering, billing and stock, staff and attendance, follow-ups, showing their work), then build each idea on one of them.\n' +
+          'Each idea must lead with a DIFFERENT service angle from every other idea and from the ones already in use (website, app, ' +
+          'landing page for ads, billing/stock, staff/HR, follow-up software, "one team for all IT work"...). At most one idea may be about ' +
+          'WhatsApp or enquiries.\n\n' +
           `Write ${count} DIFFERENT message ideas. For each idea write ${variants} versions that say the same thing in genuinely different words ` +
           '(different opening line and question wording), each one strong on its own and about exactly that idea.\n' +
           'Reply JSON only: {"situations":["..."],"ideas":[{"idea":"2-4 word snake_case name","versions":["...","..."]}]}',
@@ -166,8 +175,10 @@ const TEMPLATE_REVIEW_CONTEXT =
   'a real, everyday situation that people in THIS trade recognise, in words they would use? A message that would fit any trade ' +
   'equally well is still generic and must score low.\n' +
   'It may be in simple English, Hinglish (Hindi in English letters) or Hindi; judge all three the same way, never deduct for the language itself.\n' +
+  'Dreams Technology is a full IT services company (websites, landing pages, mobile apps, billing/HR/CRM software, custom software). ' +
   'Our readers are Indian small-business owners, many not comfortable with formal English. Score 4.0 or lower if: it does not say ' +
-  'early on who is writing (Chetan / Dreams Technology) and why; it uses formal or hard words ("would you be open to", "manage", ' +
+  'early on who is writing (Chetan / Dreams Technology) and that we are an IT/software team; it reads like we sell only one product ' +
+  '(e.g. only a CRM or only WhatsApp enquiry tracking); it is long-winded (over ~55 words); it uses formal or hard words ("would you be open to", "manage", ' +
   '"keep track of", "streamline", bookish Hindi); or the question is not easy to answer in a word or two.\n' +
   'Also check Meta approval risk: high risk = misleading or vague claims, pressure, prices/offers, "free", links, ALL CAPS, ' +
   'threats, asking for sensitive info, or text that reads like spam/promotion more than a conversation opener.';
@@ -218,7 +229,7 @@ async function polishVersion(niche, body, note) {
         content:
           `You edit a WhatsApp template from Dreams Technology (Gandhinagar) to owners of ${trade} in Gujarat.\n${TEMPLATE_RULES}\n\n` +
           'Keep the same idea and the same language (English, Hinglish or Hindi) and the same greeting. ' +
-          'Fix exactly what the reviewer said. Keep 35-70 words, ' +
+          'Fix exactly what the reviewer said. Keep 25-55 words, ' +
           '{{1}} exactly once, no other variables, no links, prices, "free" or ALL CAPS, end with one easy question.\n' +
           'Reply JSON only: {"text": "..."}',
       },
@@ -611,4 +622,5 @@ const isRunning = () => !!running;
 module.exports = {
   ensurePool, ensureNiche, poolStatus, lastRun, isRunning, submitDrafts, syncPending, validateBody, activeNiches, wordOverlap,
   retireUsedUp, trimNiche, retireTemplate, GENERIC_NICHE,
+  _test: { writeIdeas, scoreVersion },
 };

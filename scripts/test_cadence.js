@@ -82,13 +82,21 @@ function testStateMachine() {
 }
 
 // ------------------------------------------------------------------------------------------- B
+// Cold email needs research on the lead (owner's rule, 2026-10-09) — give email test leads a research row.
+async function addResearch(lead) {
+  await pool.query(
+    `INSERT INTO lead_research (lead_id, summary, pain_points, email_angles) VALUES ($1, 'Test fabrication shop.', '["slow quotes"]', '["quote follow-ups"]')
+     ON CONFLICT (lead_id) DO NOTHING`, [lead.id]);
+  return lead;
+}
+
 async function makeLead(name, { email = null, emailStatus = 'unknown', wa = '' } = {}) {
   const r = await pool.query(
     `INSERT INTO hotel_leads (hotel_name, owner_name, email, whatsapp_number, city, channel, cadence_managed, status, email_status, business_category)
      VALUES ($1, 'Test Person', $2, $3, 'Gandhinagar', $4, TRUE, 'new', $5, 'Fabrication (All Type)') RETURNING *`,
     [`${name} ${Date.now()}`, email || '', wa, email ? 'email' : 'whatsapp', emailStatus]
   );
-  return r.rows[0];
+  return email ? addResearch(r.rows[0]) : r.rows[0];
 }
 
 async function testCadenceEndToEnd() {
@@ -179,6 +187,7 @@ async function testSequenceRegression() {
      VALUES ($1, 'Seq Owner', $2, '', 'Ahmedabad', 'email', 'new', 'verified') RETURNING *`,
     [`SeqRegression ${sfx}`, `seq.${sfx}@example.com`]
   )).rows[0];
+  await addResearch(lead);
   const seq = (await pool.query(
     `INSERT INTO sequences (name, initial_gaps, daily_send_limit) VALUES ('Regression seq', '[3,5]', 50) RETURNING id`)).rows[0];
   // Pad lead_sequences ids so a sequence-row id can't accidentally equal the lead id.
@@ -209,6 +218,7 @@ async function testEmailQualityGate() {
     `INSERT INTO hotel_leads (hotel_name, owner_name, email, whatsapp_number, city, channel, cadence_managed, status, email_status, niche, business_category)
      VALUES ($1, 'Maulik Patel', $2, '', 'Gandhinagar', 'email', TRUE, 'new', 'verified', 'engineering', 'Fastener') RETURNING *`,
     [`Gate test ${sfx}`, `gate.${sfx}@example.com`])).rows[0];
+  await addResearch(lead);
   const sentCount = async () => (await pool.query(`SELECT COUNT(*)::int n FROM email_logs WHERE lead_id = $1 AND direction = 'out'`, [lead.id])).rows[0].n;
 
   coldScore = 4.2;
