@@ -1,5 +1,6 @@
 const schedule = require('node-schedule');
 const pool = require('../config/db');
+const { track } = require('../utils/jobTracker');
 const { verifyEmail } = require('../services/emailVerifierService');
 const { getSetting } = require('../services/settingsService');
 const SequenceService = require('../services/sequenceService');
@@ -54,7 +55,7 @@ async function runVerificationPass() {
 
     if (result.rows.length === 0) {
       await enrollPending();
-      return;
+      return { checked: 0 };
     }
     console.log(`[VerifyWorker] Re-verifying ${result.rows.length} lead(s)...`);
 
@@ -96,14 +97,16 @@ async function runVerificationPass() {
 
     console.log(`[VerifyWorker] Pass complete — ${verified} verified, ${unverifiable} unverifiable`);
     await enrollPending();
+    return { checked: result.rows.length, verified, unverifiable };
   } catch (err) {
     console.error('[VerifyWorker] Error in verification pass:', err.message);
+    return { error: err.message };
   } finally {
     isRunning = false;
   }
 }
 
-schedule.scheduleJob('5 * * * *', runVerificationPass);
+schedule.scheduleJob('5 * * * *', () => track('email_verification', runVerificationPass).catch(() => {}));
 
 console.log('✅ Email verification worker started - re-checks unverified leads hourly');
 

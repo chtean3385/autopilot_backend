@@ -1,6 +1,7 @@
 const schedule = require('node-schedule');
 const OpenAI = require('openai');
 const pool = require('../config/db');
+const { track } = require('../utils/jobTracker');
 const EmailSenderService = require('../services/emailSenderService');
 const SuppressionService = require('../services/suppressionService');
 const SequenceService = require('../services/sequenceService');
@@ -685,7 +686,7 @@ async function runSequenceForLead(leadId) {
   }
 }
 
-schedule.scheduleJob('*/15 * * * *', () => runSequenceWorker('cron'));
+schedule.scheduleJob('*/15 * * * *', () => track('email_sequences', () => runSequenceWorker('cron'), { record: false }).catch(() => {}));
 
 console.log('📧 Sequence email worker started - checks every 15 minutes');
 

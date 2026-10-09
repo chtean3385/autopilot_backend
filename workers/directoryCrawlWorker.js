@@ -1,5 +1,6 @@
 const schedule = require('node-schedule');
 const pool = require('../config/db');
+const { track } = require('../utils/jobTracker');
 const { crawlSource } = require('../services/directoryCrawlerService');
 const { promoteEntries, backfillWebsiteEmails } = require('../services/directoryPromotionService');
 const { refreshScores } = require('../services/leadScoreService');
@@ -37,7 +38,7 @@ async function runDirectoryCrawlTick() {
   }
 }
 
-schedule.scheduleJob('*/10 * * * *', () => { runDirectoryCrawlTick(); });
+schedule.scheduleJob('*/10 * * * *', () => { track('directory_crawl', runDirectoryCrawlTick); });
 console.log('📚 Directory crawl worker started - crawls approved directory sources every 10 minutes');
 
 module.exports = { runDirectoryCrawlTick };

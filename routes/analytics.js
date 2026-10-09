@@ -2,6 +2,7 @@ const express = require('express');
 const pool = require('../config/db');
 const WABAService = require('../services/wabaService');
 const { getSetting } = require('../services/settingsService');
+const { getPipeline } = require('../services/pipelineService');
 const router = express.Router();
 
 // Overview stats + per-campaign breakdown
@@ -62,6 +63,16 @@ router.get('/', async (req, res) => {
       campaigns: campaignsRes.rows,
       trends: trendsRes.rows,
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Live Pipeline: every background job's queue, next run, running-now flag and last result
+// (services/pipelineService.js). Polled every few seconds by the Analytics and Live Feed pages.
+router.get('/pipeline', async (req, res) => {
+  try {
+    res.json(await getPipeline());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

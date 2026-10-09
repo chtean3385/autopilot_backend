@@ -7,6 +7,7 @@ const LeadService = require('./leadService');
 const { findEmail } = require('./enrichmentService');
 const SequenceService = require('./sequenceService');
 const SchedulerStatusService = require('./schedulerStatusService');
+const { track } = require('../utils/jobTracker');
 const { notifyAdmin } = require('./adminNotifyService');
 const { trackedCompletion } = require('../utils/aiUsage');
 const { normalizeMobileNumber } = require('../utils/phone');
@@ -1155,19 +1156,23 @@ schedule.scheduleJob('* * * * *', async () => {
   if (running) return;
   running = true;
   try {
-    const result = await pool.query(
-      `SELECT * FROM agent_tasks WHERE status IN ('pending', 'scheduled_send') AND run_at <= NOW() ORDER BY run_at ASC LIMIT 1`
-    );
-    if (result.rows.length > 0) {
-      const task = result.rows[0];
-      if (task.status === 'scheduled_send') {
-        await sendTask(task.id);
-      } else if (task.channel === 'email') {
-        await runEmailTask(task);
-      } else {
-        await runTask(task);
+    await track('agent_tasks', async () => {
+      const result = await pool.query(
+        `SELECT * FROM agent_tasks WHERE status IN ('pending', 'scheduled_send') AND run_at <= NOW() ORDER BY run_at ASC LIMIT 1`
+      );
+      if (result.rows.length > 0) {
+        const task = result.rows[0];
+        if (task.status === 'scheduled_send') {
+          await sendTask(task.id);
+        } else if (task.channel === 'email') {
+          await runEmailTask(task);
+        } else {
+          await runTask(task);
+        }
+        return { task: task.id, kind: task.status === 'scheduled_send' ? 'send' : task.channel || 'whatsapp' };
       }
-    }
+      return { task: null };
+    });
   } catch (err) {
     console.error('[Scheduler] Cron error:', err.message);
   } finally {
@@ -1178,7 +1183,7 @@ schedule.scheduleJob('* * * * *', async () => {
 // Daily at 12:00 PM IST — follow up with non-responding leads
 // (explicit tz because Render/most hosts run the container clock in UTC)
 schedule.scheduleJob({ rule: '0 12 * * *', tz: 'Asia/Kolkata' }, async () => {
-  await runFollowUps('cron');
+  await track('whatsapp_followups', () => runFollowUps('cron'), { record: false }).catch(() => {});
 });
 
 console.log('🤖 Agent scheduler started — checks every minute for tasks, daily follow-ups at noon IST');

@@ -2,10 +2,12 @@ const schedule = require('node-schedule');
 const pool = require('../config/db');
 const WABAService = require('../services/wabaService');
 const LeadService = require('../services/leadService');
+const { track } = require('../utils/jobTracker');
 
 // Run campaign sends every 5 minutes
-schedule.scheduleJob('*/5 * * * *', async () => {
+async function runCampaignTick() {
   console.log('[WORKER] Checking for scheduled campaigns...');
+  const stats = { campaign: null, sent: 0, failed: 0 };
 
   const query = `
     SELECT c.* FROM campaigns c
@@ -20,6 +22,7 @@ schedule.scheduleJob('*/5 * * * *', async () => {
     if (result.rows.length > 0) {
       const campaign = result.rows[0];
       console.log(`[WORKER] Processing campaign: ${campaign.campaign_name}`);
+      stats.campaign = campaign.campaign_name;
 
       // Get pending leads for this campaign (not yet contacted)
       const leadsQuery = `
@@ -42,8 +45,10 @@ schedule.scheduleJob('*/5 * * * *', async () => {
         if (sendResult.success) {
           await LeadService.logOutreach(lead.id, campaign.id, campaign.template_id, sendResult.messageId);
           console.log(`[WORKER] ✅ Message sent to ${lead.whatsapp_number}`);
+          stats.sent++;
         } else {
           console.log(`[WORKER] ❌ Failed to send to ${lead.whatsapp_number}`);
+          stats.failed++;
         }
 
         // Small delay to avoid rate limits
@@ -52,7 +57,11 @@ schedule.scheduleJob('*/5 * * * *', async () => {
     }
   } catch (error) {
     console.error('[WORKER] Error in campaign worker:', error);
+    stats.error = error.message;
   }
-});
+  return stats;
+}
+
+schedule.scheduleJob('*/5 * * * *', () => track('campaigns', runCampaignTick).catch(() => {}));
 
 console.log('🚀 Campaign worker started - checks every 5 minutes');

@@ -1,5 +1,6 @@
 const schedule = require('node-schedule');
 const pool = require('../config/db');
+const { track } = require('../utils/jobTracker');
 const { getOrCreateResearch, RESEARCH_MAX_ATTEMPTS } = require('../services/leadResearchService');
 const { isAiAvailable } = require('../utils/aiUsage');
 
@@ -93,7 +94,7 @@ async function runResearchPass() {
   return stats;
 }
 
-schedule.scheduleJob('*/5 * * * *', runResearchPass);
+schedule.scheduleJob('*/5 * * * *', () => track('research', runResearchPass).catch(() => {}));
 
 console.log('🔬 Research worker started - researches sequence-enrolled leads every 5 minutes');
 

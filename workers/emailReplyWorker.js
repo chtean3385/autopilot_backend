@@ -11,6 +11,7 @@ const { logAgentAction, notifyOwner, sendOrQueueReply } = require('../services/r
 const { trackedCompletion } = require('../utils/aiUsage');
 const { handleCadenceReply } = require('../services/cadenceReplyService');
 const channelHealth = require('../utils/channelHealth');
+const { track } = require('../utils/jobTracker');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const HISTORY_LIMIT = 20;
@@ -301,6 +302,6 @@ async function runReplyWorker() {
   }
 }
 
-schedule.scheduleJob('*/3 * * * *', runReplyWorker);
+schedule.scheduleJob('*/3 * * * *', () => track('email_replies', runReplyWorker).catch(() => {}));
 
 console.log('📥 Email reply worker started - checks every 3 minutes');

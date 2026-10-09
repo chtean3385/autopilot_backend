@@ -1,6 +1,7 @@
 const schedule = require('node-schedule');
 const { runCadence, loadConfig } = require('../services/cadenceService');
 const pool = require('../config/db');
+const { track } = require('../utils/jobTracker');
 const { ensurePool, syncPending } = require('../services/templatePoolService');
 const { sendUrgentAlert, sendDailyHealthAlert, sendWeeklySummary } = require('../services/cadenceHealthService');
 
@@ -9,7 +10,7 @@ const { sendUrgentAlert, sendDailyHealthAlert, sendWeeklySummary } = require('..
 // CADENCE_ENABLED=true, and only inside the IST send window (utils/sendWindow.js). Catch-up safe:
 // it queries "next_touch_at <= NOW()", so missed ticks just send on the next one.
 schedule.scheduleJob('*/15 * * * *', () => {
-  runCadence('cron').catch((err) => console.error('[Cadence] tick failed:', err.message));
+  track('cadence', () => runCadence('cron')).catch((err) => console.error('[Cadence] tick failed:', err.message));
 });
 // Daily 10:05 IST: write, score and submit WhatsApp templates for every directory niche. Runs as soon
 // as any directory exists (not only once the cadence is on) so approved templates are ready by the
@@ -21,13 +22,13 @@ async function hasDirectories() {
 }
 schedule.scheduleJob({ hour: 10, minute: 5, tz: 'Asia/Kolkata' }, async () => {
   try {
-    if (await hasDirectories()) await ensurePool();
+    if (await hasDirectories()) await track('template_pool', () => ensurePool());
   } catch (err) {
     console.error('[TemplatePool] daily run failed:', err.message);
   }
 });
 schedule.scheduleJob('17 * * * *', () => {
-  syncPending().catch((err) => console.error('[TemplatePool] hourly sync failed:', err.message));
+  track('template_sync', () => syncPending()).catch((err) => console.error('[TemplatePool] hourly sync failed:', err.message));
 });
 // Daily 18:30 IST: WhatsApp the owner if anything in the directory pipeline looks broken (silent
 // failures are what hid the 2026-09 email outage for 6 weeks). Weekly Monday 09:30 IST: summary.

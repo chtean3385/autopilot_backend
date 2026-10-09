@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../config/db');
+const { getActivityStream } = require('../services/pipelineService');
 const router = express.Router();
 
 // GET /api/agent-activity — cross-lead, cross-channel feed of everything the agent has done,
@@ -32,6 +33,16 @@ router.get('/', async (req, res) => {
       params
     );
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/agent-activity/stream — agent decisions + every WhatsApp/email send and reply, newest
+// first, in one list (services/pipelineService.js getActivityStream). ?since=ISO for new rows only.
+router.get('/stream', async (req, res) => {
+  try {
+    res.json(await getActivityStream({ limit: req.query.limit, since: req.query.since || null }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
