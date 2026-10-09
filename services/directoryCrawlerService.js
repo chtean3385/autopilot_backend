@@ -42,6 +42,18 @@ const MAX_PAGE_TEXT = 6000;
 const DEFAULT_DELAY_MS = 3000;
 const DEFAULT_MAX_PAGES = 500;
 const DEFAULT_PAGES_PER_TICK = 30;
+// Pacing, so sites don't rate-block us (idbf.in blocked the VPS and then a laptop for crawling fast):
+// each site rests DIRECTORY_SOURCE_REST_MIN between turns; DIRECTORY_BLOCK_FAILS failed pages in a row
+// = the site is refusing us → stop, put those pages back in the queue, and leave the site alone for
+// DIRECTORY_BLOCK_COOLDOWN_HOURS (doubling per block in a row, max 48 h).
+const DEFAULT_REST_MIN = 20;
+const DEFAULT_BLOCK_FAILS = 5;
+const DEFAULT_BLOCK_COOLDOWN_HOURS = 6;
+const MAX_BLOCK_COOLDOWN_HOURS = 48;
+
+// The batch being crawled right now (one at a time per process) — shown live in Lead Sources.
+let currentCrawl = null;
+const getCurrentCrawl = () => currentCrawl;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -496,6 +508,10 @@ async function crawlSource(sourceId, { maxPages } = {}) {
       [source.id, 'Blocked domain — its terms forbid scraping']);
     return { skipped: true, reason: 'blocked domain' };
   }
+  // Cooling down after the site refused us — even "Crawl now" waits, or the block only gets longer.
+  if (source.block_count > 0 && source.cooldown_until && new Date(source.cooldown_until) > new Date()) {
+    return { skipped: true, reason: 'site is cooling down after it stopped answering', cooldownUntil: source.cooldown_until };
+  }
 
   const stats = { pages: 0, members: 0, newEntries: 0, failedPages: 0, linksQueued: 0 };
   let robots;
@@ -523,49 +539,97 @@ async function crawlSource(sourceId, { maxPages } = {}) {
     [source.id, limit, isAiAvailable()]
   );
 
-  for (const page of pending.rows) {
-    if (stats.pages > 0) await sleep(delay);
-    // Pause/reject takes effect mid-batch, not only on the next tick.
-    const current = await pool.query('SELECT status FROM directory_sources WHERE id=$1', [source.id]);
-    if (!['approved', 'crawling'].includes(current.rows[0]?.status)) { stats.stoppedByStatus = current.rows[0]?.status; break; }
-    stats.pages++;
-    try {
-      const html = await fetchPage(page.url);
-      if (!html) throw new Error('fetch failed or non-HTML');
-      // Follow links before extracting, so a page parked as needs_ai still leads to its members.
-      stats.linksQueued += await expandLinks(html, page, source, robots, expandOpts);
-      const { members, via } = await extractMembers(html, page.url, source);
-      stats[via] = (stats[via] || 0) + 1;
-      let saved = 0;
-      for (const m of members) {
-        const entry = toEntry(m, source);
-        if (!entry) continue;
-        if (await saveEntry(source.id, page.url, entry)) stats.newEntries++;
-        saved++;
-      }
-      stats.members += saved;
-      await pool.query(
-        `UPDATE directory_crawl_pages SET status='done', members_found=$2, fetched_at=NOW(), error=NULL WHERE id=$1`,
-        [page.id, saved]
-      );
-    } catch (err) {
-      // GPT fallback unavailable (out of credit/budget, or no key) is an outage, not this page's
-      // fault — park it as needs_ai and keep going with pages the rules can handle. ByteString =
-      // a malformed key (e.g. a masked "sk-…•••" value pasted into settings).
-      if (!isAiAvailable() || err.status === 401 || /api key|apikey|credential|ByteString/i.test(err.message)) {
-        stats.needsAi = (stats.needsAi || 0) + 1;
+  const blockFails = await intSetting('DIRECTORY_BLOCK_FAILS', DEFAULT_BLOCK_FAILS);
+  let failStreak = [];
+  let okPages = 0;
+  currentCrawl = {
+    sourceId: source.id, name: source.name || hostOf(source.url), url: source.url,
+    startedAt: new Date().toISOString(), planned: pending.rows.length, done: 0, ok: 0, failed: 0, currentUrl: null,
+  };
+  try {
+    for (const page of pending.rows) {
+      // ±25% jitter: a fixed beat is easy for a site to spot as a bot.
+      if (stats.pages > 0) await sleep(delay * (0.75 + Math.random() * 0.5));
+      // Pause/reject takes effect mid-batch, not only on the next tick.
+      const current = await pool.query('SELECT status FROM directory_sources WHERE id=$1', [source.id]);
+      if (!['approved', 'crawling'].includes(current.rows[0]?.status)) { stats.stoppedByStatus = current.rows[0]?.status; break; }
+      stats.pages++;
+      currentCrawl.currentUrl = page.url;
+      currentCrawl.done = stats.pages;
+      try {
+        const html = await fetchPage(page.url);
+        if (!html) throw new Error('fetch failed or non-HTML');
+        // Follow links before extracting, so a page parked as needs_ai still leads to its members.
+        stats.linksQueued += await expandLinks(html, page, source, robots, expandOpts);
+        const { members, via } = await extractMembers(html, page.url, source);
+        stats[via] = (stats[via] || 0) + 1;
+        let saved = 0;
+        for (const m of members) {
+          const entry = toEntry(m, source);
+          if (!entry) continue;
+          if (await saveEntry(source.id, page.url, entry)) stats.newEntries++;
+          saved++;
+        }
+        stats.members += saved;
         await pool.query(
-          `UPDATE directory_crawl_pages SET status='needs_ai', error=$2, fetched_at=NOW() WHERE id=$1`,
-          [page.id, String(err.message).slice(0, 300)]
+          `UPDATE directory_crawl_pages SET status='done', members_found=$2, fetched_at=NOW(), error=NULL WHERE id=$1`,
+          [page.id, saved]
         );
-        continue;
+        okPages++;
+        currentCrawl.ok = okPages;
+        failStreak = [];
+      } catch (err) {
+        // GPT fallback unavailable (out of credit/budget, or no key) is an outage, not this page's
+        // fault — park it as needs_ai and keep going with pages the rules can handle. ByteString =
+        // a malformed key (e.g. a masked "sk-…•••" value pasted into settings).
+        if (!isAiAvailable() || err.status === 401 || /api key|apikey|credential|ByteString/i.test(err.message)) {
+          stats.needsAi = (stats.needsAi || 0) + 1;
+          await pool.query(
+            `UPDATE directory_crawl_pages SET status='needs_ai', error=$2, fetched_at=NOW() WHERE id=$1`,
+            [page.id, String(err.message).slice(0, 300)]
+          );
+          continue;
+        }
+        stats.failedPages++;
+        currentCrawl.failed = stats.failedPages;
+        await pool.query(
+          `UPDATE directory_crawl_pages SET status='failed', error=$2, fetched_at=NOW() WHERE id=$1`,
+          [page.id, String(err.message).slice(0, 500)]
+        );
+        failStreak.push(page.id);
+        if (failStreak.length >= blockFails) {
+          stats.blockedBySite = true;
+          // Not these pages' fault — back in the queue for after the cool-down. After 3 blocks in a row
+          // they stay failed, so a site with genuinely dead pages can't loop forever.
+          if (source.block_count < 3) {
+            await pool.query(`UPDATE directory_crawl_pages SET status='pending', error=NULL WHERE id = ANY($1)`, [failStreak]);
+            stats.failedPages -= failStreak.length;
+          }
+          break;
+        }
       }
-      stats.failedPages++;
-      await pool.query(
-        `UPDATE directory_crawl_pages SET status='failed', error=$2, fetched_at=NOW() WHERE id=$1`,
-        [page.id, String(err.message).slice(0, 500)]
-      );
     }
+  } finally {
+    currentCrawl = null;
+  }
+
+  if (stats.blockedBySite) {
+    const hours = Math.min(MAX_BLOCK_COOLDOWN_HOURS,
+      (await intSetting('DIRECTORY_BLOCK_COOLDOWN_HOURS', DEFAULT_BLOCK_COOLDOWN_HOURS)) * 2 ** source.block_count);
+    await pool.query(
+      `UPDATE directory_sources SET cooldown_until = NOW() + make_interval(hours => $2), block_count = block_count + 1,
+         last_error = $3, updated_at = NOW() WHERE id = $1`,
+      [source.id, hours, `Site stopped answering (${blockFails} pages failed in a row) — resting ${hours} h so it doesn't block us for longer`]
+    );
+    stats.cooldownHours = hours;
+  } else {
+    // Every site rests between turns, however many directories are queued.
+    const restMin = await intSetting('DIRECTORY_SOURCE_REST_MIN', DEFAULT_REST_MIN, { allowZero: true });
+    await pool.query(
+      `UPDATE directory_sources SET cooldown_until = NOW() + make_interval(mins => $2),
+         block_count = CASE WHEN $3 THEN 0 ELSE block_count END, updated_at = NOW() WHERE id = $1`,
+      [source.id, restMin, okPages > 0]
+    );
   }
 
   const left = await pool.query(
@@ -673,6 +737,6 @@ async function recrawlSource(id) {
 }
 
 module.exports = {
-  crawlSource, discoverPages, recrawlSource, extractMembers, extractMembersByRules, extractMembersByJsonLd, toEntry, suggestSources, addSource, setStatus,
+  crawlSource, discoverPages, recrawlSource, getCurrentCrawl, extractMembers, extractMembersByRules, extractMembersByJsonLd, toEntry, suggestSources, addSource, setStatus,
   isDisallowed, isBlockedDomain, BLOCKED_DOMAINS,
 };

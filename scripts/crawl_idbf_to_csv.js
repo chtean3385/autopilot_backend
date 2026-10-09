@@ -6,6 +6,10 @@
 // Touches no database and sends nothing: it only reads public pages and writes files.
 //
 //   node scripts/crawl_idbf_to_csv.js [https://gandhinagar.idbf.in] [--delay 8000] [--workers 1] [--categories]
+//        [--batch 100] [--batch-pause 300]
+//
+// Batches: every --batch businesses are also written as their own CSV
+// (exports/idbf/<host>/batch-NNN.csv, importable straight away), then the crawl rests --batch-pause seconds.
 //
 // idbf blocks ANY IP that fetches too fast (HTTP 500 on every page once the cookie is sent) —
 // it blocked this laptop after ~330 pages at 2/sec on 2026-10-09, same as the VPS. Hence the slow
@@ -39,8 +43,11 @@ const CITY = HOST.split('.')[0].replace(/^\w/, (c) => c.toUpperCase());
 const DELAY_MS = Number(flag('delay', 8000));
 const WORKERS = Number(flag('workers', 1));
 const WITH_CATEGORIES = args.includes('--categories'); // category pages added 0 businesses for Gandhinagar
-const STOP_AFTER_FAILS = 8; // this many failures in a row = we are blocked; stop instead of hammering
+const STOP_AFTER_FAILS = 5; // this many failures in a row = we are blocked; stop instead of hammering
+const BATCH_SIZE = Number(flag('batch', 100));
+const BATCH_PAUSE_MS = Number(flag('batch-pause', 300)) * 1000;
 const OUT_DIR = path.resolve(flag('out', path.join(__dirname, '..', '..', 'exports', 'idbf')));
+const BATCH_DIR = path.join(OUT_DIR, HOST);
 const PROGRESS = path.join(OUT_DIR, `${HOST}.progress.jsonl`);
 const CSV_OUT = path.join(OUT_DIR, `${HOST}.csv`);
 
@@ -53,7 +60,8 @@ const HEADERS = {
 const BUSINESS_PATH = /^\/\d+\/[^/]+\/?$/;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 404 = gone, don't retry. 5xx/network = retry with backoff (3 tries).
+// 404 = gone, don't retry. 5xx/network = one retry after 10s (a block also answers 500, so more
+// retries would only add load on a site that is already refusing us).
 async function get(url) {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -62,8 +70,8 @@ async function get(url) {
     } catch (e) {
       const status = e.response?.status;
       if (status && status < 500) return null;
-      if (attempt >= 3) throw new Error(status ? `HTTP ${status}` : e.code || e.message);
-      await sleep(2000 * attempt);
+      if (attempt >= 2) throw new Error(status ? `HTTP ${status}` : e.code || e.message);
+      await sleep(10000);
     }
   }
 }
@@ -75,7 +83,7 @@ async function runPool(items, fn) {
     while (next < items.length && !blocked) {
       const item = items[next++];
       await fn(item);
-      await sleep(DELAY_MS);
+      if (!blocked) await sleep(DELAY_MS * (0.75 + Math.random() * 0.5)); // 8s → 6-10s
     }
   }));
 }
@@ -107,7 +115,7 @@ const csvCell = (v) => {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-function writeCsv(records) {
+function writeCsv(records, outFile = CSV_OUT) {
   const cols = ['Business Name', 'Contact Person', 'WhatsApp Number', 'Email', 'Website', 'City', 'Category', 'Address', 'All Phones', 'Profile URL'];
   const seen = new Set();
   const rows = [];
@@ -124,13 +132,21 @@ function writeCsv(records) {
     }
   }
   // BOM so Excel opens Gujarati/₹ characters correctly; the importer ignores it.
-  fs.writeFileSync(CSV_OUT, '﻿' + [cols, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n'), 'utf8');
+  fs.writeFileSync(outFile,'﻿' + [cols, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n'), 'utf8');
   return rows;
 }
 
 (async () => {
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-  console.log(`Crawling ${BASE} → ${CSV_OUT}  (workers=${WORKERS}, delay=${DELAY_MS}ms)`);
+  fs.mkdirSync(BATCH_DIR, { recursive: true });
+  console.log(`Crawling ${BASE} → ${CSV_OUT}  (workers=${WORKERS}, ~${DELAY_MS / 1000}s per page, batches of ${BATCH_SIZE} + ${BATCH_PAUSE_MS / 60000} min rest)`);
+
+  // One request first: if this IP is already blocked, stop before touching anything else.
+  try {
+    await get(`${BASE}/`);
+  } catch (err) {
+    console.log(`The site refuses this connection (${err.message}) — it is blocking this IP. Not crawling; try again in a few hours.`);
+    process.exit(2);
+  }
 
   const robots = await fetchRobotsTxt(BASE);
   const sitemap = (await discoverSitemapUrls(BASE, robots.sitemaps, { maxUrls: 500000 })) || [];
@@ -164,6 +180,16 @@ function writeCsv(records) {
   const log = fs.createWriteStream(PROGRESS, { flags: 'a' });
   const source = { url: BASE, city: CITY };
   let n = 0, ok = 0, failed = 0, failStreak = 0;
+  let batchNo = fs.readdirSync(BATCH_DIR).filter((x) => /^batch-\d+\.csv$/.test(x)).length;
+  let batch = [];
+  const flushBatch = () => {
+    if (!batch.length) return;
+    batchNo++;
+    const file = path.join(BATCH_DIR, `batch-${String(batchNo).padStart(3, '0')}.csv`);
+    const rows = writeCsv(batch, file);
+    console.log(`  ✔ ${path.basename(file)} — ${rows.length} businesses, ${rows.filter((r) => r[2]).length} with mobile`);
+    batch = [];
+  };
   const started = Date.now();
   await runPool(todo, async (url) => {
     let rec;
@@ -193,20 +219,29 @@ ${STOP_AFTER_FAILS} pages failed in a row (${err.message}) — the site is block
     }
     log.write(JSON.stringify(rec) + '\n');
     progress.set(url, rec);
-    if (++n % 50 === 0 || n === todo.length) {
+    if (rec.status === 'ok') batch.push(rec);
+    if (batch.length >= BATCH_SIZE && !blocked) {
+      flushBatch();
+      writeCsv([...progress.values()]); // keep the all-in-one CSV current too
+      console.log(`  resting ${Math.round(BATCH_PAUSE_MS / 60000)} min before the next batch…`);
+      await sleep(BATCH_PAUSE_MS);
+    }
+    if (++n % 25 === 0 || n === todo.length) {
       const rate = n / ((Date.now() - started) / 1000);
       const eta = Math.round((todo.length - n) / rate / 60);
       console.log(`  ${n}/${todo.length} pages  ok=${ok} failed=${failed}  ~${eta} min left`);
     }
   });
   await new Promise((r) => log.end(r));
+  flushBatch();
 
   const rows = writeCsv([...progress.values()]);
   const withMobile = rows.filter((r) => r[2]).length;
   const withEmail = rows.filter((r) => r[3]).length;
   const withSite = rows.filter((r) => r[4]).length;
   const stillFailed = [...progress.values()].filter((r) => r.status === 'failed').length;
-  console.log(`\nDone. ${rows.length} businesses → ${CSV_OUT}`);
+  console.log(`\n${blocked ? 'Stopped (site is blocking)' : 'Done'}. ${rows.length} businesses in total → ${CSV_OUT}`);
+  console.log(`  batch CSVs (import these one by one): ${BATCH_DIR}`);
   console.log(`  with mobile (WhatsApp-able): ${withMobile}   with email: ${withEmail}   with website: ${withSite}`);
   if (stillFailed) console.log(`  ${stillFailed} pages failed — rerun the same command to retry just those.`);
 })().catch((e) => { console.error('Crawl aborted:', e); process.exit(1); });

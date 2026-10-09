@@ -2,6 +2,7 @@ const express = require('express');
 const pool = require('../config/db');
 const Directory = require('../services/directoryCrawlerService');
 const Promotion = require('../services/directoryPromotionService');
+const { getQueue } = require('../services/directoryQueueService');
 const router = express.Router();
 
 // Directory outreach (_docs/directory-outreach-plan.md) — owner-approved public directories and
@@ -21,6 +22,16 @@ router.get('/', async (req, res) => {
        ORDER BY s.created_at DESC`
     );
     res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Live crawl queue: crawling now (page x/y), order + estimated time per directory, latest pages read
+// (services/directoryQueueService.js). Polled every few seconds by Lead Sources.
+router.get('/queue', async (req, res) => {
+  try {
+    res.json(await getQueue());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -24,6 +24,7 @@ async function runDirectoryCrawlTick() {
     const { rows } = await pool.query(
       `SELECT id FROM directory_sources
        WHERE status IN ('approved', 'crawling')
+         AND (cooldown_until IS NULL OR cooldown_until <= NOW()) -- resting / cooling down after a block
        ORDER BY last_crawled_at ASC NULLS FIRST, id ASC
        LIMIT 1`
     );

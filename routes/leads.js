@@ -237,8 +237,10 @@ router.get('/', async (req, res) => {
          WHERE ls.lead_id = hl.id ORDER BY ls.created_at DESC LIMIT 1) AS sequence_name,
         (SELECT ls.status FROM lead_sequences ls
          WHERE ls.lead_id = hl.id ORDER BY ls.created_at DESC LIMIT 1) AS sequence_status,
-        EXISTS(SELECT 1 FROM outreach_logs WHERE lead_id = hl.id) AS message_sent
+        EXISTS(SELECT 1 FROM outreach_logs WHERE lead_id = hl.id) AS message_sent,
+        lc.status AS cadence_status, lc.current_channel AS cadence_channel, lc.next_touch_at AS cadence_next_at
       FROM hotel_leads hl
+      LEFT JOIN lead_cadence lc ON lc.lead_id = hl.id
       ${where}
       ORDER BY hl.lead_score DESC, hl.created_at DESC
       LIMIT ${limitP} OFFSET ${offsetP}

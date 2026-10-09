@@ -542,6 +542,9 @@ ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS cadence_managed BOOLEAN NOT NUL
 CREATE INDEX IF NOT EXISTS idx_leads_whatsapp_number ON hotel_leads(whatsapp_number);
 CREATE INDEX IF NOT EXISTS idx_leads_cadence_managed ON hotel_leads(cadence_managed) WHERE cadence_managed = TRUE;
 ALTER TABLE directory_sources ADD COLUMN IF NOT EXISTS category_filter TEXT;
+-- Directory crawl pacing (database/migrate_directory_crawl_pacing.sql): per-site rest + block cool-down.
+ALTER TABLE directory_sources ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMP;
+ALTER TABLE directory_sources ADD COLUMN IF NOT EXISTS block_count INT NOT NULL DEFAULT 0;
 
 -- Directory outreach steps 3+5 (database/migrate_directory_cadence.sql)
 CREATE TABLE IF NOT EXISTS lead_cadence (
