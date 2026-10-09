@@ -42,8 +42,7 @@ async function runVerificationPass() {
 
     const result = await pool.query(
       `SELECT id, email FROM hotel_leads
-       WHERE channel = 'email'
-         AND email IS NOT NULL AND email <> ''
+       WHERE email IS NOT NULL AND email <> '' -- any lead with an email, whatever its channel/source
          AND email_status IN ('unknown', 'found')
          AND (COALESCE(email_verify_attempts, 0) < $1 OR last_verify_attempt_at < NOW() - INTERVAL '${RETRY_STUCK_AFTER}')
          AND (last_verify_attempt_at IS NULL OR last_verify_attempt_at < NOW() - INTERVAL '55 minutes')
