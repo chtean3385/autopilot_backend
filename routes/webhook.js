@@ -84,6 +84,9 @@ router.post('/whatsapp', async (req, res) => {
               console.log(`[Webhook] Send failed ${msgId}: ${errMsg}`);
               const leadId = upd.rows[0]?.lead_id;
               if (leadId) {
+                // Cadence leads: undo the touch and retry later with a different template.
+                await require('../services/cadenceService').handleWhatsappSendFailed(leadId, errMsg)
+                  .catch((e) => console.error('[Webhook] cadence retry scheduling failed:', e.message));
                 // In-system flag: a Live Feed row, at most one per ~10 min so a bulk failure
                 // (billing block failing hundreds of sends) surfaces without burying the feed.
                 const feedThrottle = await pool.query(

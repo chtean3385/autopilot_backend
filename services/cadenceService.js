@@ -134,9 +134,10 @@ async function istDayStart() {
 }
 
 async function waSentToday() {
+  // Failed sends (Meta's async 'failed' status) don't count — they get retried and shouldn't eat the quota.
   const r = await pool.query(
     `SELECT COUNT(*)::int AS n FROM outreach_logs ol JOIN hotel_leads hl ON hl.id = ol.lead_id
-     WHERE hl.cadence_managed AND ol.message_type = 'template' AND ol.sent_at >= $1`,
+     WHERE hl.cadence_managed AND ol.message_type = 'template' AND ol.sent_at >= $1 AND ol.error_message IS NULL`,
     [await istDayStart()]
   );
   return r.rows[0].n;
@@ -448,4 +449,48 @@ async function runCadence(trigger = 'cron') {
   return stats;
 }
 
-module.exports = { runCadence, planAfterTouch, enrollNewLeads, loadConfig, firstName, DEFAULTS };
+// Meta reports a template as 'failed' asynchronously (webhook), after the cadence already counted the
+// touch. Undo that touch and retry in RETRY_HOURS — the failed template is in outreach_logs, so
+// usedTemplateIds() makes the retry pick a different one. After WA_MAX_FAILED failed sends the lead's
+// WhatsApp is marked unusable and the cadence moves it to email.
+const WA_RETRY_HOURS = 24; // Meta's per-user marketing cap (131049) needs time, an immediate retry fails again
+const WA_MAX_FAILED = 3;
+
+async function handleWhatsappSendFailed(leadId, errMsg) {
+  const row = (await pool.query(
+    `SELECT lc.* FROM lead_cadence lc JOIN hotel_leads hl ON hl.id = lc.lead_id
+     WHERE lc.lead_id = $1 AND hl.cadence_managed AND lc.status = 'active' AND lc.last_channel = 'whatsapp'`,
+    [leadId]
+  )).rows[0];
+  if (!row) return 'skipped';
+
+  const failed = (await pool.query(
+    `SELECT COUNT(*)::int AS n FROM outreach_logs WHERE lead_id = $1 AND message_type = 'template' AND error_message IS NOT NULL`,
+    [leadId]
+  )).rows[0].n;
+  if (failed >= WA_MAX_FAILED) {
+    await pool.query(
+      `UPDATE lead_cadence SET wa_unusable = TRUE, current_channel = 'email', next_touch_at = NOW(),
+         last_wait_reason = 'wa_failed_too_often', updated_at = NOW() WHERE lead_id = $1`,
+      [leadId]
+    );
+    await logAction(leadId, 'cadence_whatsapp_given_up', { failed, error: errMsg }, 'error');
+    return 'given_up';
+  }
+
+  // Touch never reached the lead → roll the counters back so the retry is the same touch, not the next one.
+  // If planAfterTouch had already switched to email after this touch, that switch is undone too.
+  const switched = row.current_channel !== 'whatsapp';
+  await pool.query(
+    `UPDATE lead_cadence SET current_channel = 'whatsapp',
+       touches_on_channel = $2, total_touches = GREATEST(total_touches - 1, 0),
+       next_touch_at = NOW() + ($3 || ' hours')::interval,
+       last_wait_reason = 'wa_failed_retry', updated_at = NOW()
+     WHERE lead_id = $1`,
+    [leadId, switched ? Math.max((await num('CADENCE_WA_TOUCHES', DEFAULTS.waTouches)) - 1, 0) : Math.max(row.touches_on_channel - 1, 0), String(WA_RETRY_HOURS)]
+  );
+  await logAction(leadId, 'cadence_whatsapp_retry_scheduled', { failed, retryInHours: WA_RETRY_HOURS, error: errMsg }, 'retry');
+  return 'retry_scheduled';
+}
+
+module.exports = { runCadence, planAfterTouch, enrollNewLeads, loadConfig, firstName, DEFAULTS, handleWhatsappSendFailed };
