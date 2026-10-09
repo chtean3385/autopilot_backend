@@ -16,6 +16,7 @@ const SETTINGS_DEFS = [
   { key: 'OWNER_NOTIFY_EMAIL',       category: 'Email',           description: 'Email address notified on pending approvals (estimates, low-score replies)' },
   { key: 'UNSUBSCRIBE_SECRET',       category: 'Email',           description: 'Secret used to sign unsubscribe link tokens', sensitive: true },
   { key: 'OWNER_WEBSITE_URL',        category: 'Portfolio',       description: 'Your business website — scraped and cached for context in portfolio auto-replies' },
+  { key: 'WEBSITE_LEAD_KEY',         category: 'App',             description: 'Secret key our website form sends (X-Lead-Key header) to POST /api/public/website-lead. Empty = website lead intake off', sensitive: true },
   { key: 'OPENAI_MONTHLY_BUDGET_USD', category: 'AI',              description: 'Hard monthly cap on OpenAI spend in USD (default 10). Once reached, all AI calls pause until the 1st of next month.' },
   { key: 'EMAIL_SIGNATURE',         category: 'Email',           description: 'Fallback email sign-off, used only for a sender with no own Signature (Settings → Email Senders); use \\n for line breaks. Empty = "<sender From name>\\nDreams Technology, Gandhinagar · +91 84607 65785\\nhttps://dreamstechnology.in/"' },
   { key: 'OWN_EMAIL_DOMAINS',        category: 'Email',           description: 'Comma-separated domains that are ours — leads on these are never cold-emailed (default dreamstechnology.in,dreams-technology.com)' },

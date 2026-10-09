@@ -608,6 +608,9 @@ async function initDB() {
     -- Auto-enroll once verified + cadence wait reason (migrate_auto_enroll_and_wait_reason.sql)
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS enroll_sequence_id INT REFERENCES sequences(id) ON DELETE SET NULL;
     ALTER TABLE lead_cadence ADD COLUMN IF NOT EXISTS last_wait_reason VARCHAR(40);
+    -- Website contact-form leads (migrate_website_form.sql)
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS website_form JSONB;
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS website_form_at TIMESTAMP;
   `);
   console.log('✅ Database tables ready');
 }
@@ -631,6 +634,7 @@ app.use('/t', require('./routes/tracking'));
 app.set('trust proxy', 'loopback');
 app.use('/api', require('./services/authService').requireAuth);
 app.use('/api/auth', require('./routes/auth'));
+app.use('/api/public', require('./routes/websiteLeads')); // website form intake — own X-Lead-Key check
 app.use('/api/leads', require('./routes/leads'));
 app.use('/api/campaigns', require('./routes/campaigns'));
 app.use('/api/templates', require('./routes/templates'));

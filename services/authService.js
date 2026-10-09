@@ -174,7 +174,8 @@ async function disableTwoFactor(code) {
 // ── middleware ───────────────────────────────────────────────────────────────
 // Paths under /api that stay public: the login screen's two calls, and template header images (Meta
 // downloads them when a template is submitted and when it is sent, without any login).
-const PUBLIC_API = [/^\/auth\/login\/?$/, /^\/auth\/mode\/?$/, /^\/templates\/media\/[^/]+\/?$/];
+// Also the website contact-form intake (routes/websiteLeads.js checks its own X-Lead-Key).
+const PUBLIC_API = [/^\/auth\/login\/?$/, /^\/auth\/mode\/?$/, /^\/templates\/media\/[^/]+\/?$/, /^\/public\/website-lead\/?$/];
 
 // Express middleware for app.use('/api', requireAuth). req.path is relative to /api here.
 async function requireAuth(req, res, next) {

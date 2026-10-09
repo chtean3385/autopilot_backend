@@ -590,3 +590,7 @@ ALTER TABLE email_senders ADD COLUMN IF NOT EXISTS signature TEXT;
 -- Auto-enroll + "why is this lead waiting" (database/migrate_auto_enroll_and_wait_reason.sql)
 ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS enroll_sequence_id INT REFERENCES sequences(id) ON DELETE SET NULL;
 ALTER TABLE lead_cadence ADD COLUMN IF NOT EXISTS last_wait_reason VARCHAR(40);
+
+-- Website contact-form leads (database/migrate_website_form.sql)
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS website_form JSONB;
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS website_form_at TIMESTAMP;
