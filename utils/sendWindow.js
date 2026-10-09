@@ -9,7 +9,7 @@ const { getSetting } = require('../services/settingsService');
 
 const DEFAULT_START_HOUR = 9;
 const DEFAULT_END_HOUR = 18;
-const DEFAULT_DAYS = [1, 2, 3, 4, 5]; // JS Date#getDay(): 0=Sun..6=Sat — Mon-Fri by default
+const DEFAULT_DAYS = [1, 2, 3, 4, 5, 6]; // JS Date#getDay(): 0=Sun..6=Sat — Mon-Sat by default (owner, 2026-10-09: Sunday rest)
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
 function nowInIst() {
@@ -32,7 +32,7 @@ function parseDays(raw) {
 }
 
 // Reads SEND_WINDOW_START_HOUR / SEND_WINDOW_END_HOUR / SEND_WINDOW_DAYS (settingsService,
-// same DB-or-env pattern as every other setting; defaults to 9am-6pm IST, Mon-Fri when unset).
+// same DB-or-env pattern as every other setting; defaults to 9am-6pm IST, Mon-Sat when unset).
 async function isWithinSendWindow() {
   const [startRaw, endRaw, daysRaw] = await Promise.all([
     getSetting('SEND_WINDOW_START_HOUR'),

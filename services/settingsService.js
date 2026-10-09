@@ -22,7 +22,7 @@ const SETTINGS_DEFS = [
   { key: 'EMAIL_ROTATION_BATCH',     category: 'Email',           description: 'New leads sent from one sender before rotating to the next active sender (default 10). Follow-ups always stay on the mailbox that sent the first email, and wait if it is full' },
   { key: 'SEND_WINDOW_START_HOUR',   category: 'Email',           description: 'Cold/follow-up sequence sends start hour, 24h IST (default 9). All leads are India-based, so IST is the one recipient timezone in this system.' },
   { key: 'SEND_WINDOW_END_HOUR',     category: 'Email',           description: 'Cold/follow-up sequence sends end hour, 24h IST (default 18)' },
-  { key: 'SEND_WINDOW_DAYS',         category: 'Email',           description: 'Days sequence sends are allowed, comma-separated 0-6 (0=Sun..6=Sat), default 1,2,3,4,5 (Mon-Fri)' },
+  { key: 'SEND_WINDOW_DAYS',         category: 'Email',           description: 'Days sequence sends are allowed, comma-separated 0-6 (0=Sun..6=Sat), default 1,2,3,4,5,6 (Mon-Sat)' },
   { key: 'DIRECTORY_CRAWL_DELAY_MS', category: 'Directory Outreach', description: 'Pause between page fetches when crawling a directory, in ms (default 3000) — keep it polite' },
   { key: 'DIRECTORY_MAX_PAGES',      category: 'Directory Outreach', description: 'Max pages queued per directory source (default 500)' },
   { key: 'DIRECTORY_PAGES_PER_TICK', category: 'Directory Outreach', description: 'Pages crawled per 10-minute worker tick (default 30)' },
