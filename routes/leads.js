@@ -195,7 +195,16 @@ router.get('/', async (req, res) => {
   if (city) conditions.push(`hl.city ILIKE ${addParam(`%${city}%`)}`);
   if (status) conditions.push(`hl.status = ${addParam(status)}`);
   if (emailStatus) conditions.push(`hl.email_status = ${addParam(emailStatus)}`);
-  if (channel) conditions.push(`hl.channel = ${addParam(channel)}`);
+  // The "Website" tab filters on source, not channel: channel stays whatsapp/email because it drives
+  // how the lead is messaged and how replies are routed.
+  // Website-form leads usually give both a mobile and an email, so they also show on both channel tabs.
+  if (channel === 'website') {
+    conditions.push(`hl.source = 'website'`);
+  } else if (channel) {
+    const p = addParam(channel);
+    conditions.push(`(hl.channel = ${p} OR (hl.source = 'website' AND (
+      (${p} = 'email' AND COALESCE(hl.email, '') <> '') OR (${p} = 'whatsapp' AND COALESCE(hl.whatsapp_number, '') <> ''))))`);
+  }
   if (tier) conditions.push(`hl.lead_tier = ${addParam(tier)}`);
   if (q) {
     const p = addParam(`%${q}%`);
