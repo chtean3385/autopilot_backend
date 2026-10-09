@@ -14,7 +14,7 @@ const { trackedCompletion } = require('../utils/aiUsage');
 const { renderEmailBody } = require('../utils/emailRender');
 const { getBackendUrl } = require('../utils/backendUrlConfig');
 const { checkSpamContent } = require('../utils/spamCheck');
-const { generateTrackingToken, buildClickUrl } = require('../utils/emailTracking');
+const { generateTrackingToken, buildClickUrl, buildPixelUrl } = require('../utils/emailTracking');
 const { getThreadHeaders } = require('../utils/emailThreading');
 const { isWithinSendWindow } = require('../utils/sendWindow');
 const { getSetting } = require('../services/settingsService');
@@ -311,8 +311,14 @@ async function composeAndSendColdEmail({ leadId, lead, leadEmail, stepNumber, se
   // classic bulk-mail signal for Gmail/Outlook filters, and opens are inflated by Apple Mail
   // privacy/scanners anyway — replies are the metric that matters. Click tracking stays (the
   // prompt asks for no links, so it rarely fires). Brevo's own open events still flow in via webhook.
+  // Back as a switch (2026-10-09): SMTP senders have no Brevo open events, so the owner wants the
+  // pixel to see open rates — EMAIL_OPEN_TRACKING (default on) turns it off again if inboxing drops.
   const trackingToken = generateTrackingToken();
-  const tracking = { trackUrl: (url) => buildClickUrl(trackingToken, url) };
+  const openTracking = String((await getSetting('EMAIL_OPEN_TRACKING')) ?? '').trim().toLowerCase() !== 'false';
+  const tracking = {
+    trackUrl: (url) => buildClickUrl(trackingToken, url),
+    ...(openTracking ? { pixelUrl: buildPixelUrl(trackingToken) } : {}),
+  };
   const { inReplyTo, references } = await getThreadHeaders(leadId);
 
   // A real person's sign-off + an easy way to say no — a "stop" reply is still a reply (the

@@ -59,7 +59,7 @@ function renderEmailBody(body, unsubscribeUrl, tracking = {}, { visibleFooter = 
     .join('\n');
   const html = visibleFooter
     ? `${htmlBody}\n${unsubscribeFooterHtml(unsubscribeUrl, tracking.pixelUrl)}`
-    : htmlBody;
+    : `${htmlBody}${tracking.pixelUrl ? `\n<img src="${tracking.pixelUrl}" width="1" height="1" alt="" style="display:none">` : ''}`;
   return { html, text };
 }
 
