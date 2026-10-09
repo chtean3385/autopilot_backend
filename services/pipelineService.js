@@ -37,7 +37,7 @@ const n = (v) => Number(v) || 0;
 const one = async (sql, params) => (await pool.query(sql, params)).rows[0] || {};
 
 // "Today" = IST calendar day. Timestamps are stored as UTC wall-clock (TIMESTAMP without tz).
-const IST_TODAY = `(date_trunc('day', NOW() AT TIME ZONE 'UTC' AT TIME ZONE '${IST}') AT TIME ZONE '${IST}' AT TIME ZONE 'UTC')`;
+const IST_TODAY = `(date_trunc('day', NOW() AT TIME ZONE '${IST}') AT TIME ZONE '${IST}' AT TIME ZONE 'UTC')`;
 
 async function getPipeline() {
   const [
@@ -77,7 +77,7 @@ async function getPipeline() {
              (SELECT COUNT(*)::int FROM outreach_logs r WHERE r.response_received_at >= ${IST_TODAY}) AS replies
       FROM outreach_logs WHERE sent_at >= ${IST_TODAY}`),
     pool.query(`SELECT id, label, from_email, status, daily_cap, sent_today, last_reset_date,
-                       (last_reset_date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE '${IST}')::date) AS reset_today
+                       (last_reset_date = (NOW() AT TIME ZONE '${IST}')::date) AS reset_today
                 FROM email_senders ORDER BY id`),
     one(`
       SELECT COUNT(*)::int AS waiting FROM hotel_leads hl
