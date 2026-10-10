@@ -106,7 +106,49 @@ const GENERIC_SUBJECT_EXAMPLES = [
   'Transform Your Business Management',
 ];
 
-function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead) {
+// Directory cadence emails (humanTone) — the generic stage notes below told the writer to say "what we
+// do, framed as THEIR outcome (more customers, fewer missed inquiries)" and end on "Worth a 10-minute
+// call?", which the strict human-tone scorer marks down as vague/salesy every time: drafts sat at 2-3.5
+// against the 4.5 bar and nothing went out for two days (2026-10-08 → 10-10). These notes ask for the
+// one concrete thing we'd set up instead, so a first draft can actually reach 5.
+const HUMAN_TONE_BANNED = ['we help businesses', 'businesses like yours', 'capture inquiries', 'capture enquiries',
+  'convert', 'more customers', 'more sales', 'grow your', 'modern tools', 'quick chat', '10-minute call',
+  'worth a call', 'discuss', 'something you\'re dealing with', 'something you\'re facing', 'touch base'];
+
+function humanToneStageNote(stepNumber) {
+  const banned = `\nNever use these phrases (they read as sales copy): ${HUMAN_TONE_BANNED.map(p => `"${p}"`).join(', ')}.`;
+  if (stepNumber === 0) {
+    return `This is the FIRST email. After "Hi <first name>," write exactly 3 short lines, 30-55 words in total:\n` +
+      `1. One question about a real, everyday moment in THEIR trade, naming their business or one of their actual ` +
+      `products from the research (e.g. "When a plant asks Jet Fibre for a quote on a spiral tank, does it usually ` +
+      `come in by phone, email or WhatsApp?"). Do NOT start with "I".\n` +
+      `2. One plain sentence on the ONE concrete thing Chetan's team would set up for exactly that moment, in the ` +
+      `owner's own words, and what it saves them (e.g. "We set up simple things like a quote request page that ` +
+      `drops each enquiry straight into your WhatsApp, so none sit unanswered over a busy week."). A concrete ` +
+      `thing tied to the same product/moment as line 1, never a vague promise.\n` +
+      `3. One short, low-pressure yes/no question that names their business and that same moment (e.g. "Would ` +
+      `something like that help with tank quotes at Jet Fibre?").\n` +
+      `Only lines 1 and 3 are questions.${banned}`;
+  }
+  if (stepNumber === 1) {
+    return `This is FOLLOW-UP 1. After "Hi <first name>," write 2 short sentences, 20-40 words in total:\n` +
+      `1. ONE new, concrete idea for one of their actual products from the research, different from the earlier ` +
+      `email, stated plainly (e.g. "A small page showing your spiral tank sizes with a WhatsApp button next to each ` +
+      `one tends to get buyers asking for a quote straight away."). Do NOT start with "I". Never invent a story, ` +
+      `client, result or statistic ("I heard of a company that...", "they say it made a huge difference").\n` +
+      `2. One short yes/no question naming their business, e.g. "Would that be useful at Jet Fibre?"\n` +
+      `That last sentence is the ONLY question in the email. Do NOT say "following up", "circling back" or ` +
+      `"checking in". Never offer a website redesign or mention SEO.${banned}`;
+  }
+  return `This is the LAST email. At most 2 sentences, e.g. "Haven't heard back, so I'll assume the timing isn't ` +
+    `right. Should I close your file, or is it worth reconnecting in a few months?" Adapt it to their business. No pitch.${banned}`;
+}
+
+const HUMAN_TONE_SUBJECT_RULE = `\nThe subject names the everyday moment from line 1 in plain words, like a ` +
+  `colleague's note (e.g. "spiral tank quotes at jet fibre", "dye catalogue requests"). Never use the words ` +
+  `lead, leads, capture, management, tools, solution, growth or marketing in the subject.`;
+
+function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead, { humanTone = false } = {}) {
   const portfolioText = portfolioItems.length
     // URLs deliberately left out (2026-10-07) — the hard rules forbid links in sequence emails.
     ? `\n\nSome of our recent work you can mention in plain words if it fits naturally (never as a link):\n` +
@@ -136,7 +178,7 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
       (painPoints.length ? `Pain points observed: ${painPoints.join('; ')}\n` : '') +
       (products.length ? `Products/services they offer: ${products.join('; ')}\n` : '') +
       (markets.length ? `Markets they serve: ${markets.join('; ')}\n` : '') +
-      (recommendedServices.length ? `Relevant Dreams Technology services to weave in: ${recommendedServices.join('; ')}\n` : '') +
+      (recommendedServices.length && !humanTone ? `Relevant Dreams Technology services to weave in: ${recommendedServices.join('; ')}\n` : '') +
       (angleForStep ? `The specific angle to lead with in THIS email: ${angleForStep}\n` : '') +
       (otherAngles.length ? `Other angles reserved for other emails in this sequence — do NOT use these here: ${otherAngles.join('; ')}\n` : '') +
       `Every claim you make about their business must trace back to something in this research — never invent details beyond it.`
@@ -159,13 +201,13 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
     `this lead — their industry, their business name, or the angle/pain point above — never a ` +
     `generic template. Never write a subject resembling any of these (too generic, could be sent ` +
     `to any business): ${GENERIC_SUBJECT_EXAMPLES.map(s => `"${s}"`).join(', ')}. It must also differ ` +
-    `from every subject already sent, listed below if any.`;
+    `from every subject already sent, listed below if any.` + (humanTone ? HUMAN_TONE_SUBJECT_RULE : '');
 
   // Reworked 2026-10-07 after ~6k sends got a 27% open but 0.3% reply rate: the old "warm intro
   // sentence first" structure reliably produced "I hope this message finds you well…" openers and
   // 80-120 word mini-pitches that people opened and ignored. Now: open on a question about THEIR
   // business, one outcome line, one yes/no ask — under 60 words. MAX_SEQUENCE_EMAILS caps it at 3.
-  const stageNote = stepNumber === 0
+  const stageNote = humanTone ? humanToneStageNote(stepNumber) : stepNumber === 0
     ? `This is the FIRST email. Exactly 3 short lines:\n` +
       `1. A specific question about how THEIR business handles something, grounded in the research/industry ` +
       `detail below (e.g. "When a contractor asks Kirit Pumps for a quote on a bitumen pump, how does your team ` +
@@ -201,7 +243,7 @@ Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is
 
 // guidance (optional): extra writing rules appended to the system prompt (directory cadence passes
 // the shared human-tone rules + the lead's trade). Sequences don't pass it.
-async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails = [], feedback = null, guidance = null) {
+async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails = [], feedback = null, guidance = null, { humanTone = false } = {}) {
   const leadContext = `Business: ${lead.hotel_name}\nOwner: ${lead.owner_name || 'Unknown'}\nCity: ${lead.city || 'Unknown'}${lead.business_category ? `\nCategory: ${lead.business_category}` : ''}${lead.website ? `\nWebsite: ${lead.website}` : ''}`;
 
   const response = await trackedCompletion(client, {
@@ -209,14 +251,16 @@ async function composeEmail(lead, stepNumber, portfolioItems, playbookContext, r
     max_tokens: 400,
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead) + (guidance ? `\n\n${guidance}` : '') },
+      { role: 'system', content: buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead, { humanTone }) + (guidance ? `\n\n${guidance}` : '') },
       { role: 'user', content: leadContext },
     ],
   }, { purpose: 'sequence_email_compose', leadId: lead.lead_id ?? lead.id ?? null });
 
   const parsed = JSON.parse(response.choices[0].message.content);
   const subject = (parsed.subject || '').trim() || 'Quick question';
-  const body = (parsed.body || '').trim();
+  let body = (parsed.body || '').trim();
+  // Em dashes are the commonest AI tell and the model still slips one in now and then.
+  if (humanTone) body = body.replace(/\s*[—–]\s*/g, ', ');
   return { subject, body };
 }
 
@@ -272,7 +316,7 @@ async function composeAndSendColdEmail({ leadId, lead, leadEmail, stepNumber, se
   let spamResult, qualityResult;
   let passed = false;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    composed = await composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, quality?.guidance);
+    composed = await composeEmail(lead, stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, quality?.guidance, { humanTone: Boolean(quality?.strict) });
     spamResult = checkSpamContent(composed.subject, composed.body);
     qualityResult = await ReplyQualityService.scoreColdEmail({
       leadId, lead, subject: composed.subject, body: composed.body, stepNumber, strict: Boolean(quality?.strict),

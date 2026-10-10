@@ -203,16 +203,42 @@ Respond with ONLY a JSON object: {"score": <1-5 integer>, "feedback": "short rea
 
 // strict=true (directory leads): one-decimal score against the shared "personal, human, not AI"
 // rubric (utils/humanTone.js) on top of the stage rubric. Sequences keep the original whole-number gate.
+// Facts code can check exactly. gpt-4o-mini kept "finding" a pleasantry opener in emails that open with
+// a business question, a missing yes/no ask in emails ending in one, and "over 80 words" at 45 — and
+// scored them 2-3 for it (2026-10-10). Handing it these as ground truth stops those phantom deductions.
+const PLEASANTRY_RE = /\b(i hope|hope (this|you)|i wanted to reach out|reaching out|i came across|trust (this|you)|greetings)\b/i;
+function coldEmailFacts(body) {
+  const lines = String(body || '').split(/\n+/).map(l => l.trim()).filter(Boolean);
+  const content = lines.filter((l, i) => !(i === 0 && /^(hi|hello|dear)\b[^.?!]*,$/i.test(l)));
+  const text = content.join(' ');
+  const firstSentence = (text.match(/^[^.?!]*[.?!]?/) || [''])[0].trim();
+  return [
+    `Word count (excluding the greeting): ${text.split(/\s+/).filter(Boolean).length}`,
+    `Opening sentence after the greeting: "${firstSentence}" — ${PLEASANTRY_RE.test(firstSentence) ? 'IS a pleasantry/AI opener' : 'is NOT a pleasantry opener'}`,
+    `Number of question marks: ${(text.match(/\?/g) || []).length}`,
+    `Ends with a question: ${/\?\s*$/.test(text) ? 'yes' : 'no'}`,
+    `Contains an em dash or exclamation mark: ${/[—!]/.test(text) ? 'yes' : 'no'}`,
+  ].join('\n');
+}
+
 async function scoreColdEmail({ leadId, lead, subject, body, stepNumber, strict = false }) {
-  const userContent = `${buildLeadContext(lead)}\n\nSubject: ${subject}\n\nBody:\n${body}`;
+  const userContent = `${buildLeadContext(lead)}\n\nSubject: ${subject}\n\nBody:\n${body}` +
+    (strict ? `\n\nVerified facts about this draft (computed by code — always correct, never contradict them):\n${coldEmailFacts(body)}` : '');
   const system = strict
     ? `${buildColdEmailScorePrompt(stepNumber).replace(/Respond with ONLY a JSON object:[\s\S]*$/, '')}\n${SCORING_RUBRIC}\n` +
-      'Respond with ONLY a JSON object: {"score": <0.0-5.0, one decimal>, "feedback": "what would make it read more personal and human"}.'
+      'An opening question and a closing yes/no question are the intended structure, not "two questions". ' +
+      'Only deduct for a problem you can quote word-for-word from the draft; if you cannot quote it, it is not there. ' +
+      'Respond with ONLY a JSON object: {"issues": [{"quote": "exact words from the draft", "problem": "..."}], "score": <0.0-5.0, one decimal>, "feedback": "what would make it read more personal and human"}. ' +
+      'An empty issues list means the score is 5.0.'
     : buildColdEmailScorePrompt(stepNumber);
 
+  // Strict (directory) scoring uses gpt-4o at temperature 0: gpt-4o-mini gave the same 3-line structure
+  // 5 one time and 4 the next with contradictory reasons, so no draft could reliably clear 4.5.
+  // ~26 directory drafts/day → about $0.10/day.
   const response = await trackedCompletion(client, {
-    model: 'gpt-4o-mini',
-    max_tokens: 150,
+    model: strict ? 'gpt-4o' : 'gpt-4o-mini',
+    ...(strict ? { temperature: 0 } : {}),
+    max_tokens: strict ? 400 : 150,
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: system },

@@ -266,7 +266,8 @@ async function sendEmailTouch(lead, row, isFinalTouch) {
   // tomorrow; after 3 held days the touch moves to the other channel rather than stalling the lead.
   const trade = lead.niche || lead.business_category || 'their line of business';
   const guidance = `${WRITING_RULES}\nThis owner's trade: ${trade}${lead.business_category && lead.niche ? ` (listed as "${lead.business_category}")` : ''}. ` +
-    `Use their first name (${firstName(lead)}) and refer to something real about running a ${trade} business.`;
+    `Use their first name (${firstName(lead)}) and refer to something real about running a ${trade} business.` +
+    (stepNumber > 0 ? ' This is not the first email: ask only ONE question, the closing yes/no one.' : '');
   const minScore = Number.parseFloat(await settingsService.getSetting('CADENCE_EMAIL_MIN_SCORE')) || 4.5;
 
   const { composeAndSendColdEmail } = require('../workers/sequenceEmailWorker');
