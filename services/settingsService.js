@@ -44,6 +44,7 @@ const SETTINGS_DEFS = [
   { key: 'CADENCE_WA_GAP_DAYS', category: 'Directory Outreach', description: 'Days between WhatsApp touches (default 3)' },
   { key: 'CADENCE_REST_DAYS', category: 'Directory Outreach', description: 'Rest before each new cycle, comma-separated days per cycle (default 30,60,90; the last value repeats)' },
   { key: 'CADENCE_MAX_CYCLES', category: 'Directory Outreach', description: 'Full email+WhatsApp cycles before a lead is marked no_response (default 3; 0 = never stop)' },
+  { key: 'CADENCE_EMAIL_ONLY_IF_VERIFIED', category: 'Directory Outreach', description: 'true (default) = a lead with a verified email gets email only, never WhatsApp; WhatsApp only for leads with no usable email. false = use both channels (email ⇄ WhatsApp)' },
   { key: 'CADENCE_EMAIL_MIN_SCORE',  category: 'Directory Outreach', description: 'Minimum 0-5 "personal, human, not AI-sounding" score for a directory cold email to be sent (default 4.5). Below it the draft is rewritten up to 3 times, then held until the next day' },
   { key: 'WA_TEMPLATE_MIN_POOL',     category: 'Directory Outreach', description: 'Different WhatsApp message ideas kept live per trade (default 2). Live templates per trade = this × WA_TEMPLATE_VARIANTS; extras are retired (deleted on Meta). Missing ones are written, scored and submitted automatically' },
   { key: 'WA_TEMPLATE_VARIANTS',     category: 'Directory Outreach', description: 'Versions kept per message idea, 1-3 (default 1: two versions are drafted, only the best is kept, so no near-duplicate templates)' },

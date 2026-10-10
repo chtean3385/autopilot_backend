@@ -51,6 +51,7 @@ async function loadConfig() {
     newEmailPerDay: await num('CADENCE_NEW_EMAIL_PER_DAY', DEFAULTS.newEmailPerDay, { allowZero: true }),
     newWaPerDay: await num('CADENCE_NEW_WA_PER_DAY', DEFAULTS.newWaPerDay, { allowZero: true }),
     waMaxPerDay: await num('CADENCE_WA_MAX_PER_DAY', DEFAULTS.waMaxPerDay, { allowZero: true }),
+    emailOnlyIfVerified: String(await settingsService.getSetting('CADENCE_EMAIL_ONLY_IF_VERIFIED') ?? '').trim().toLowerCase() !== 'false',
   };
 }
 
@@ -139,7 +140,7 @@ async function istDayStart() {
 }
 
 async function waSentToday() {
-  // Failed sends (Meta's async 'failed' status) don't count — they get retried and shouldn't eat the quota.
+  // Failed sends (Meta's async 'failed' status) don't count — they never reached anyone.
   const r = await pool.query(
     `SELECT COUNT(*)::int AS n FROM outreach_logs ol JOIN hotel_leads hl ON hl.id = ol.lead_id
      WHERE hl.cadence_managed AND ol.message_type = 'template' AND ol.sent_at >= $1 AND ol.error_message IS NULL`,
@@ -207,14 +208,23 @@ async function enrollNewLeads(cfg) {
 
   const out = { enrolled: 0, email: 0, whatsapp: 0, waitingForVerification: 0 };
   for (const lead of rows) {
-    const e = (await emailUsable(lead)) && remaining.email > 0;
-    const w = waUsable(lead) && remaining.whatsapp > 0;
-    if (!e && !w) {
+    // CADENCE_EMAIL_ONLY_IF_VERIFIED (default on, owner 2026-10-10): a lead with a usable, verified email is
+    // contacted by email ONLY; no email / not verified (yet) → WhatsApp. If mails.so verifies it later,
+    // processRow switches the next touch to email. Off → both channels, balanced by remaining quota.
+    let channel;
+    const emailOk = await emailUsable(lead);
+    if (cfg.emailOnlyIfVerified) {
+      if (emailOk && remaining.email <= 0) continue; // today's email intake is full — never falls back to WhatsApp
+      channel = emailOk ? 'email' : (waUsable(lead) && remaining.whatsapp > 0 ? 'whatsapp' : null);
+    } else {
+      const e = emailOk && remaining.email > 0;
+      const w = waUsable(lead) && remaining.whatsapp > 0;
+      channel = e && w ? (remaining.email >= remaining.whatsapp ? 'email' : 'whatsapp') : (e ? 'email' : (w ? 'whatsapp' : null));
+    }
+    if (!channel) {
       if (lead.email && ['unknown', 'found'].includes(lead.email_status)) out.waitingForVerification++;
       continue;
     }
-    // Both possible → whichever queue has more room left (keeps the two daily quotas balanced).
-    const channel = e && w ? (remaining.email >= remaining.whatsapp ? 'email' : 'whatsapp') : (e ? 'email' : 'whatsapp');
     const ins = await pool.query(
       `INSERT INTO lead_cadence (lead_id, current_channel, first_channel, cycle_start_channel, status, next_touch_at, started_at)
        VALUES ($1, $2, $2, $2, 'active', NOW(), NOW()) ON CONFLICT (lead_id) DO NOTHING RETURNING lead_id`,
@@ -362,7 +372,9 @@ async function processRow(row, cfg, budget) {
 
   // A WhatsApp touch needs an approved, not-yet-sent, industry-matched template — picked once here
   // and reused for the send (the picker may make a GPT call when several fit).
-  const usable = { email: await emailUsable(lead), whatsapp: waUsable(lead, row) };
+  // CADENCE_EMAIL_ONLY_IF_VERIFIED: usable email → email only, never WhatsApp (same rule as intake).
+  const usable = { email: await emailUsable(lead) };
+  usable.whatsapp = !(cfg.emailOnlyIfVerified && usable.email) && waUsable(lead, row);
   const template = usable.whatsapp ? await pickTemplate(lead, await usedTemplateIds(lead.id)) : null;
   if (!template) usable.whatsapp = false;
 
@@ -373,6 +385,9 @@ async function processRow(row, cfg, budget) {
       if (lead.email && ['unknown', 'found'].includes(lead.email_status)) return deferTouch(lead.id, 24, 'awaiting_verification');
       if (waUsable(lead, row)) return deferTouch(lead.id, 24, 'no_approved_template'); // templates may get approved
       await stopCadence(lead.id, 'stopped', 'no_usable_channel');
+      if (lead.phone || lead.whatsapp_number) {
+        await flagForCall(lead.id, row.wa_unusable ? 'WhatsApp not delivered and no usable email' : 'No WhatsApp number and no usable email');
+      }
       return 'stopped';
     }
     // e.g. no approved template yet → use email this touch instead. The touch count restarts for the
@@ -453,47 +468,57 @@ async function runCadence(trigger = 'cron') {
 }
 
 // Meta reports a template as 'failed' asynchronously (webhook), after the cadence already counted the
-// touch. Undo that touch and retry in RETRY_HOURS — the failed template is in outreach_logs, so
-// usedTemplateIds() makes the retry pick a different one. After WA_MAX_FAILED failed sends the lead's
-// WhatsApp is marked unusable and the cadence moves it to email.
-const WA_RETRY_HOURS = 24; // Meta's per-user marketing cap (131049) needs time, an immediate retry fails again
-const WA_MAX_FAILED = 3;
-
+// touch. Owner's rule (2026-10-10): one failed WhatsApp = never WhatsApp that lead again. Most failures
+// are Meta's per-recipient marketing cap (131049 "healthy ecosystem engagement"), "undeliverable" (not
+// on WhatsApp) or Meta's experiment holdout, so a retry with another template just fails again (103
+// failed sends in 3 days under the old 24h-retry rule). WhatsApp goes off, the touch is undone and the
+// lead moves to email; no usable email → the cadence stops and the lead lands on the Call list.
 async function handleWhatsappSendFailed(leadId, errMsg) {
   const row = (await pool.query(
     `SELECT lc.* FROM lead_cadence lc JOIN hotel_leads hl ON hl.id = lc.lead_id
-     WHERE lc.lead_id = $1 AND hl.cadence_managed AND lc.status = 'active' AND lc.last_channel = 'whatsapp'`,
+     WHERE lc.lead_id = $1 AND hl.cadence_managed AND lc.status IN ('active', 'resting')`,
     [leadId]
   )).rows[0];
   if (!row) return 'skipped';
+  const lead = (await pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId])).rows[0];
 
-  const failed = (await pool.query(
-    `SELECT COUNT(*)::int AS n FROM outreach_logs WHERE lead_id = $1 AND message_type = 'template' AND error_message IS NOT NULL`,
-    [leadId]
-  )).rows[0].n;
-  if (failed >= WA_MAX_FAILED) {
-    await pool.query(
-      `UPDATE lead_cadence SET wa_unusable = TRUE, current_channel = 'email', next_touch_at = NOW(),
-         last_wait_reason = 'wa_failed_too_often', updated_at = NOW() WHERE lead_id = $1`,
-      [leadId]
-    );
-    await logAction(leadId, 'cadence_whatsapp_given_up', { failed, error: errMsg }, 'error');
-    return 'given_up';
+  // Email still being verified → switch now; processRow waits for verification, then emails or flags.
+  const emailPending = Boolean(lead.email) && ['unknown', 'found'].includes(lead.email_status);
+  if (!emailPending && !(await emailUsable(lead))) {
+    await pool.query(`UPDATE lead_cadence SET wa_unusable = TRUE, updated_at = NOW() WHERE lead_id = $1`, [leadId]);
+    await stopCadence(leadId, 'stopped', 'wa_failed_no_email');
+    await flagForCall(leadId, `WhatsApp not delivered (${errMsg}) and no usable email`);
+    return 'call_list';
   }
 
-  // Touch never reached the lead → roll the counters back so the retry is the same touch, not the next one.
-  // If planAfterTouch had already switched to email after this touch, that switch is undone too.
-  const switched = row.current_channel !== 'whatsapp';
+  // The failed touch never reached them, so take it back. A lead never emailed before has had no real
+  // touch yet: email goes out on the next tick instead of waiting out the same-day guard or a rest.
+  const reachedBefore = (await pool.query(
+    `SELECT COUNT(*)::int AS n FROM email_logs WHERE lead_id = $1 AND direction = 'out' AND error IS NULL`, [leadId]
+  )).rows[0].n > 0;
   await pool.query(
-    `UPDATE lead_cadence SET current_channel = 'whatsapp',
-       touches_on_channel = $2, total_touches = GREATEST(total_touches - 1, 0),
-       next_touch_at = NOW() + ($3 || ' hours')::interval,
-       last_wait_reason = 'wa_failed_retry', updated_at = NOW()
+    `UPDATE lead_cadence SET wa_unusable = TRUE, current_channel = 'email', touches_on_channel = 0,
+       total_touches = GREATEST(total_touches - 1, 0),
+       cycle_start_channel = CASE WHEN $2 THEN cycle_start_channel ELSE 'email' END,
+       last_touch_at = CASE WHEN $2 THEN last_touch_at ELSE NULL END,
+       next_touch_at = CASE WHEN $2 AND status = 'resting' THEN next_touch_at ELSE NOW() END,
+       status = CASE WHEN $2 THEN status ELSE 'active' END,
+       last_wait_reason = 'wa_failed_to_email', updated_at = NOW()
      WHERE lead_id = $1`,
-    [leadId, switched ? Math.max((await num('CADENCE_WA_TOUCHES', DEFAULTS.waTouches)) - 1, 0) : Math.max(row.touches_on_channel - 1, 0), String(WA_RETRY_HOURS)]
+    [leadId, reachedBefore]
   );
-  await logAction(leadId, 'cadence_whatsapp_retry_scheduled', { failed, retryInHours: WA_RETRY_HOURS, error: errMsg }, 'retry');
-  return 'retry_scheduled';
+  await logAction(leadId, 'cadence_whatsapp_failed_to_email', { error: errMsg, emailPending }, 'switch_to_email');
+  return 'moved_to_email';
 }
 
-module.exports = { runCadence, planAfterTouch, enrollNewLeads, loadConfig, firstName, DEFAULTS, handleWhatsappSendFailed };
+// Leads only a phone call can reach — Leads → "📞 Call list" until marked called.
+async function flagForCall(leadId, reason) {
+  await pool.query(
+    `UPDATE hotel_leads SET call_needed_at = COALESCE(call_needed_at, NOW()), call_reason = $2, updated_at = NOW()
+     WHERE id = $1 AND call_done_at IS NULL`,
+    [leadId, String(reason).slice(0, 300)]
+  );
+  await logAction(leadId, 'call_list_flagged', { reason }, 'call');
+}
+
+module.exports = { runCadence, planAfterTouch, enrollNewLeads, loadConfig, firstName, DEFAULTS, handleWhatsappSendFailed, flagForCall };

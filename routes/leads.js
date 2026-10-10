@@ -200,6 +200,9 @@ router.get('/', async (req, res) => {
   // Website-form leads usually give both a mobile and an email, so they also show on both channel tabs.
   if (channel === 'website') {
     conditions.push(`hl.source = 'website'`);
+  } else if (channel === 'call') {
+    // Call list: WhatsApp can't reach them and there's no usable email (cadenceService.flagForCall).
+    conditions.push(`hl.call_needed_at IS NOT NULL AND hl.call_done_at IS NULL`);
   } else if (channel) {
     const p = addParam(channel);
     conditions.push(`(hl.channel = ${p} OR (hl.source = 'website' AND (
@@ -251,7 +254,7 @@ router.get('/', async (req, res) => {
       FROM hotel_leads hl
       LEFT JOIN lead_cadence lc ON lc.lead_id = hl.id
       ${where}
-      ORDER BY hl.lead_score DESC, hl.created_at DESC
+      ORDER BY ${channel === 'call' ? 'hl.call_needed_at DESC,' : ''} hl.lead_score DESC, hl.created_at DESC
       LIMIT ${limitP} OFFSET ${offsetP}
     `;
 
@@ -259,6 +262,20 @@ router.get('/', async (req, res) => {
     res.json({ leads: result.rows, total, page: Number(page), pageSize: limit });
   } catch (err) {
     console.error('[Leads GET]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Call list: owner phoned the lead — off the list (stays in the DB with call_done_at).
+router.post('/:id/call-done', async (req, res) => {
+  try {
+    const r = await pool.query(
+      `UPDATE hotel_leads SET call_done_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING id`, [req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Lead not found' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[Leads call-done]', err.message);
     res.status(500).json({ error: err.message });
   }
 });

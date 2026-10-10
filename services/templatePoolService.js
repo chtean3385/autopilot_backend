@@ -119,7 +119,9 @@ const TEMPLATE_RULES = `Write like Chetan, founder of Dreams Technology, an IT s
 - Simple words only. Short sentences. If a 10th-pass shop owner would need to read it twice, it is too hard.
 - No sales words or jargon: "solution", "leverage", "streamline", "boost", "CRM", "digital transformation", "next level", "seamless".
 - No AI tells: no "I hope this message finds you well", "I wanted to reach out", "I came across", no em dashes (—), no exclamation marks, no emojis, no lists, no flattery.
-- Never invent facts about them. Never criticise their business.`;
+- Never invent facts about them. Never criticise their business.
+- Never "We help (small) businesses..." or "helping businesses grow": say plainly what we build ("We build websites, apps and billing software").
+- Never invent what other owners say or feel ("Many owners mention...", "most owners tell us...", "aap bhi aisa mehsoos karte hain?"). The trade line states a plain, everyday fact of their work.`;
 
 async function writeIdeas(niche, count, variants, avoidBodies, rejectionNotes, feedback = null, lang = 'en') {
   const trade = niche === GENERIC_NICHE ? 'small and new businesses of any kind (mostly manufacturers and traders in GIDC estates)' : niche;
@@ -179,7 +181,8 @@ const TEMPLATE_REVIEW_CONTEXT =
   'Our readers are Indian small-business owners, many not comfortable with formal English. Score 4.0 or lower if: it does not say ' +
   'early on who is writing (Chetan / Dreams Technology) and that we are an IT/software team; it reads like we sell only one product ' +
   '(e.g. only a CRM or only WhatsApp enquiry tracking); it is long-winded (over ~55 words); it uses formal or hard words ("would you be open to", "manage", ' +
-  '"keep track of", "streamline", bookish Hindi); or the question is not easy to answer in a word or two.\n' +
+  '"keep track of", "streamline", bookish Hindi); it says "we help businesses" instead of what we build; it claims what ' +
+  '"many owners" say or feel; or the question is not easy to answer in a word or two.\n' +
   'Also check Meta approval risk: high risk = misleading or vague claims, pressure, prices/offers, "free", links, ALL CAPS, ' +
   'threats, asking for sensitive info, or text that reads like spam/promotion more than a conversation opener.';
 

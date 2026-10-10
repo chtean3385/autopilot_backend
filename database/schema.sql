@@ -594,3 +594,9 @@ ALTER TABLE lead_cadence ADD COLUMN IF NOT EXISTS last_wait_reason VARCHAR(40);
 -- Website contact-form leads (database/migrate_website_form.sql)
 ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS website_form JSONB;
 ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS website_form_at TIMESTAMP;
+
+-- Call list: directory leads WhatsApp can't reach and with no usable email (database/migrate_call_list.sql)
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS call_needed_at TIMESTAMP;
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS call_reason TEXT;
+ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS call_done_at TIMESTAMP;
+CREATE INDEX IF NOT EXISTS idx_leads_call_needed ON hotel_leads(call_needed_at) WHERE call_done_at IS NULL;

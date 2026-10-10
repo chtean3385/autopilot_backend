@@ -611,6 +611,11 @@ async function initDB() {
     -- Website contact-form leads (migrate_website_form.sql)
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS website_form JSONB;
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS website_form_at TIMESTAMP;
+    -- Call list (migrate_call_list.sql)
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS call_needed_at TIMESTAMP;
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS call_reason TEXT;
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS call_done_at TIMESTAMP;
+    CREATE INDEX IF NOT EXISTS idx_leads_call_needed ON hotel_leads(call_needed_at) WHERE call_done_at IS NULL;
   `);
   console.log('✅ Database tables ready');
 }

@@ -31,7 +31,7 @@ aiUsage.trackedCompletion = async (client, params, { purpose } = {}) => {
 };
 
 const pool = require(B + 'config/db');
-const { planAfterTouch, runCadence } = require(B + 'services/cadenceService');
+const { planAfterTouch, runCadence, handleWhatsappSendFailed } = require(B + 'services/cadenceService');
 const { handleCadenceReply } = require(B + 'services/cadenceReplyService');
 
 let failures = 0;
@@ -116,6 +116,7 @@ async function testCadenceEndToEnd() {
   }
   for (const [k, v] of Object.entries({
     CADENCE_ENABLED: 'true', CADENCE_NEW_EMAIL_PER_DAY: 2, CADENCE_NEW_WA_PER_DAY: 2, CADENCE_MAX_CYCLES: 2,
+    CADENCE_EMAIL_ONLY_IF_VERIFIED: 'false', // this timeline checks the both-channels mode; the default is tested below
   })) await setSetting(k, v);
 
   const sfx = String(Date.now()).slice(-6);
@@ -168,6 +169,42 @@ async function testCadenceEndToEnd() {
   const notDry = await pool.query(
     `SELECT COUNT(*)::int n FROM email_logs WHERE lead_id = ANY($1) AND provider_message_id NOT LIKE '%dryrun%'`, [ids]);
   check(notDry.rows[0].n === 0, 'every email went through the dry-run guard');
+
+  // CADENCE_EMAIL_ONLY_IF_VERIFIED on (the default): verified email → email only, never WhatsApp.
+  await pool.query(`DELETE FROM settings WHERE key = 'CADENCE_EMAIL_ONLY_IF_VERIFIED'`);
+  await pool.query(`UPDATE lead_cadence SET started_at = started_at - INTERVAL '3 days'`); // free today's intake quota
+  const sfx2 = String(Date.now()).slice(-6);
+  const M = {
+    both: await makeLead('CadTest Both2', { email: `both2.${sfx2}@example.com`, emailStatus: 'verified', wa: `9195${sfx2}04` }),
+    waFailEmail: await makeLead('CadTest WaFailEmail', { email: `wfe.${sfx2}@example.com`, emailStatus: 'unknown', wa: `9194${sfx2}05` }),
+    waFailNoEmail: await makeLead('CadTest WaFailNoEmail', { wa: `9193${sfx2}06` }),
+  };
+  const mIds = Object.values(M).map((l) => l.id);
+  const mSent = { both: '', waFailEmail: '', waFailNoEmail: '' };
+  for (let tick = 1; tick <= 4; tick++) {
+    const before = await pool.query(`SELECT COALESCE(MAX(id), 0) AS m FROM agent_actions`);
+    await runCadence('manual');
+    const sent = await pool.query(
+      `SELECT lead_id, action FROM agent_actions WHERE id > $1 AND action IN ('cadence_email_sent','cadence_whatsapp_sent') AND lead_id = ANY($2)`,
+      [before.rows[0].m, mIds]);
+    for (const [k, l] of Object.entries(M)) mSent[k] += sent.rows.filter((r) => r.lead_id === l.id).map((r) => (r.action === 'cadence_email_sent' ? 'E' : 'W')).join('');
+    if (tick === 1) {
+      // Meta refuses both first WhatsApp templates (async webhook). One lead's email is verified meanwhile.
+      await pool.query(`UPDATE hotel_leads SET email_status = 'verified' WHERE id = $1`, [M.waFailEmail.id]);
+      for (const l of [M.waFailEmail, M.waFailNoEmail]) await handleWhatsappSendFailed(l.id, 'This message was not delivered to maintain healthy ecosystem engagement.');
+    }
+    await pool.query(
+      `UPDATE lead_cadence SET next_touch_at = NOW() - INTERVAL '1 minute', last_touch_at = last_touch_at - INTERVAL '5 days'
+       WHERE lead_id = ANY($1) AND status IN ('active', 'resting')`, [mIds]);
+  }
+  console.log('      email-only-if-verified:', JSON.stringify(mSent));
+  check(/^E+$/.test(mSent.both), 'verified email + WhatsApp → email only (default)', mSent.both);
+  check(/^WE+$/.test(mSent.waFailEmail), 'WhatsApp failed → never WhatsApp again, moved to email', mSent.waFailEmail);
+  check(mSent.waFailNoEmail === 'W', 'WhatsApp failed, no email → nothing more sent', mSent.waFailNoEmail);
+  const callRow = (await pool.query(`SELECT call_needed_at, call_reason FROM hotel_leads WHERE id = $1`, [M.waFailNoEmail.id])).rows[0];
+  check(Boolean(callRow.call_needed_at) && /WhatsApp not delivered/.test(callRow.call_reason || ''), 'WhatsApp failed, no email → on the Call list', callRow.call_reason);
+  const notOnList = (await pool.query(`SELECT call_needed_at FROM hotel_leads WHERE id = $1`, [M.waFailEmail.id])).rows[0];
+  check(!notOnList.call_needed_at, 'lead moved to email is not on the Call list');
 
   // disabled → nothing
   await setSetting('CADENCE_ENABLED', 'false');
