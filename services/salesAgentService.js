@@ -28,6 +28,14 @@ async function findCampaignContext(leadId) {
 
 async function resolveAgent(leadId) {
   const context = await findCampaignContext(leadId);
+  // Pipeline leads (resort_crm = Meta-ad leads for our own hotel CRM) get their pipeline's agent and
+  // nothing else — never a hotel-industry agent pitching something different. No agent → null (handoff).
+  const pipeline = (await pool.query(`SELECT pipeline FROM hotel_leads WHERE id = $1`, [leadId])).rows[0]?.pipeline;
+  if (pipeline) {
+    const own = await pool.query(
+      `SELECT * FROM sales_agents WHERE industry = $1 AND active = TRUE AND channel = 'whatsapp' ORDER BY id LIMIT 1`, [pipeline]);
+    return { agent: own.rows[0] || null, campaign: context };
+  }
   if (context?.agent_id) {
     const result = await pool.query(`SELECT * FROM sales_agents WHERE id = $1 AND active = TRUE AND channel = 'whatsapp'`, [context.agent_id]);
     const candidate = result.rows[0];
@@ -59,6 +67,7 @@ async function resolveAgent(leadId) {
     `SELECT sa.* FROM sales_agents sa
      LEFT JOIN hotel_leads hl ON hl.id = $1
      WHERE sa.active = TRUE AND sa.auto_generated = FALSE AND sa.channel = 'whatsapp'
+       AND COALESCE(sa.industry, '') <> 'resort_crm' -- pipeline agent: resort_crm leads only (above)
        AND (sa.industry IS NULL OR LOWER(sa.industry) = 'all'
             OR (sa.industry IS NOT NULL AND hl.business_category ILIKE '%' || sa.industry || '%'))
      ORDER BY (sa.industry IS NOT NULL AND LOWER(sa.industry) != 'all'
@@ -463,7 +472,9 @@ async function handleReply(lead, incomingText) {
 }
 
 module.exports = {
-  handleReply, logAgentAction,
+  handleReply, logAgentAction, resolveAgent,
+  // Reused by resortReplyService.js (Dream Stay ad leads).
+  markNeedsAttention, notifyOwner, getMemory, saveMemory,
   // Reused by cadenceReplyService.js (directory leads) — same gate, same never-repeat check.
   classifyReplyIntent, tooSimilarToPrior, detectHandoffReason, getConversationHistory,
 };

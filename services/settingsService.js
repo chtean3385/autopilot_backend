@@ -52,6 +52,9 @@ const SETTINGS_DEFS = [
   { key: 'WA_TEMPLATE_MIN_SCORE',    category: 'Directory Outreach', description: 'Minimum 0-5 "personal, human, not AI-sounding" score for a template to be submitted to Meta (default 4.5)' },
   { key: 'WA_TEMPLATE_AUTO_SUBMIT',  category: 'Directory Outreach', description: 'Submit passing templates to Meta automatically (default true). false = they wait as drafts on the Templates page' },
   { key: 'WA_TEMPLATE_MAX_SUBMIT_PER_DAY', category: 'Directory Outreach', description: 'Max templates submitted to Meta per day (default 15) — stays well inside Meta template creation limits' },
+  { key: 'RESORT_PIPELINE_ENABLED',  category: 'Resort CRM',         description: 'Master switch for the Dream Stay (resort CRM) ad-lead WhatsApp pipeline. Default false = nothing is sent' },
+  { key: 'RESORT_NEW_PER_DAY',       category: 'Resort CRM',         description: 'New ad leads that get their first WhatsApp per day (default 20). Best leads first: wants demo, then "immediately"' },
+  { key: 'RESORT_GAP_DAYS',          category: 'Resort CRM',         description: 'Days before the 2nd and 3rd WhatsApp when there is no reply (default "2,4"). After the 3rd: no_response' },
 ];
 
 async function getSetting(key) {

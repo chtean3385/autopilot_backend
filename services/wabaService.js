@@ -383,6 +383,26 @@ class WABAService {
     }
   }
 
+  // Image by public URL (free-form, so only inside the 24h window). Used by the Dream Stay reply agent
+  // to send real product screenshots (services/resortReplyService.js).
+  static async sendImageMessage(recipientPhone, imageUrl, caption = '') {
+    if (isDryRun()) return dryRunResult('whatsapp-image', `to ${recipientPhone}: ${imageUrl}`);
+    try {
+      const response = await axios.post(
+        `${WABA_API_URL}/${process.env.WABA_PHONE_ID}/messages`,
+        { messaging_product: 'whatsapp', recipient_type: 'individual', to: recipientPhone, type: 'image',
+          image: { link: imageUrl, ...(caption ? { caption } : {}) } },
+        { headers: { Authorization: `Bearer ${process.env.WABA_API_TOKEN}`, 'Content-Type': 'application/json' } }
+      );
+      channelHealth.markOk('whatsapp');
+      return { success: true, messageId: response.data.messages[0].id };
+    } catch (error) {
+      console.error('[WABA] sendImageMessage error:', error.response?.data || error.message);
+      markWhatsappFailure(error);
+      return { success: false, error: error.response?.data?.error?.message || error.message };
+    }
+  }
+
   static async getAccountHealth() {
     try {
       const version = process.env.WABA_API_VERSION || 'v18.0';

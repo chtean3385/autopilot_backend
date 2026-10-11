@@ -898,7 +898,7 @@ async function sendTask(taskId) {
       `SELECT hl.* FROM hotel_leads hl
        JOIN lead_group_members lgm ON lgm.lead_id = hl.id
        WHERE lgm.group_id = $1
-         AND hl.cadence_managed = FALSE`, // directory leads: only the cadence worker contacts them
+         AND hl.cadence_managed = FALSE AND hl.pipeline IS NULL`, // directory + resort CRM leads: only their own worker contacts them
       [campaign.group_id]
     );
     const leads = leadsResult.rows;
@@ -1062,7 +1062,7 @@ async function runFollowUps(trigger = 'cron') {
         INNER JOIN outreach_logs ol ON ol.lead_id = hl.id
         WHERE hl.status = 'new'
           AND hl.needs_attention = FALSE
-          AND hl.cadence_managed = FALSE
+          AND hl.cadence_managed = FALSE AND hl.pipeline IS NULL
           AND hl.whatsapp_number IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE

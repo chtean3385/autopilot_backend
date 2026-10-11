@@ -13,6 +13,7 @@ const { getRunning } = require('../utils/jobTracker');
 const IST = 'Asia/Kolkata';
 const JOBS = [
   { key: 'cadence', cron: '*/15 * * * *', every: 'Every 15 min' },
+  { key: 'resort_pipeline', cron: '7,22,37,52 * * * *', every: 'Every 15 min' },
   { key: 'email_sequences', cron: '*/15 * * * *', every: 'Every 15 min' },
   { key: 'whatsapp_followups', cron: '0 12 * * *', tz: IST, every: 'Daily 12:00 pm' },
   { key: 'campaigns', cron: '*/5 * * * *', every: 'Every 5 min' },
@@ -81,7 +82,7 @@ async function getPipeline() {
                 FROM email_senders ORDER BY id`),
     one(`
       SELECT COUNT(*)::int AS waiting FROM hotel_leads hl
-      WHERE hl.status = 'new' AND hl.needs_attention = FALSE AND hl.cadence_managed = FALSE
+      WHERE hl.status = 'new' AND hl.needs_attention = FALSE AND hl.cadence_managed = FALSE AND hl.pipeline IS NULL
         AND hl.whatsapp_number IS NOT NULL
         AND EXISTS (SELECT 1 FROM outreach_logs ol WHERE ol.lead_id = hl.id)
         AND NOT EXISTS (SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE)`),

@@ -87,6 +87,9 @@ router.post('/whatsapp', async (req, res) => {
                 // Cadence leads: undo the touch and retry later with a different template.
                 await require('../services/cadenceService').handleWhatsappSendFailed(leadId, errMsg)
                   .catch((e) => console.error('[Webhook] cadence retry scheduling failed:', e.message));
+                // Dream Stay ad leads: WhatsApp is their only channel → Call list (no-op for other leads).
+                await require('../services/resortPipelineService').onSendFailed(leadId, errMsg)
+                  .catch((e) => console.error('[Webhook] resort pipeline failure handling failed:', e.message));
                 // In-system flag: a Live Feed row, at most one per ~10 min so a bulk failure
                 // (billing block failing hundreds of sends) surfaces without burying the feed.
                 const feedThrottle = await pool.query(
@@ -219,6 +222,18 @@ router.post('/whatsapp', async (req, res) => {
                 .catch((e) => {
                   console.error('[CadenceReply] failed:', e.message);
                   agentService.logAgentAction(leadId, 'cadence_reply_failed', { detail: { error: e.message }, decision: 'error' }).catch(() => {});
+                });
+              continue;
+            }
+            // Dream Stay ad leads (_docs/resort-crm/plan.md): their own agent answers, books demos,
+            // never quotes prices (services/resortReplyService.js).
+            if (leadRow.rows[0]?.pipeline === 'resort_crm') {
+              require('../services/resortReplyService')
+                .handleResortReply(leadRow.rows[0], msgText)
+                .then((out) => console.log(`[Webhook] Dream Stay lead ${leadId} replied → ${out.gate || out.reason || 'done'}`))
+                .catch((e) => {
+                  console.error('[ResortReply] failed:', e.message);
+                  agentService.logAgentAction(leadId, 'whatsapp_reply_failed', { detail: { error: e.message, pipeline: 'resort_crm' }, decision: 'error' }).catch(() => {});
                 });
               continue;
             }

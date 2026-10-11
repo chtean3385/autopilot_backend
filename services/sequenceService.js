@@ -74,7 +74,7 @@ class SequenceService {
     if (!sequence) return { success: false, error: 'Sequence not found' };
 
     const leadsResult = await pool.query(
-      `SELECT id, email, channel, email_status, cadence_managed FROM hotel_leads WHERE id = ANY($1::int[])`,
+      `SELECT id, email, channel, email_status, cadence_managed, pipeline FROM hotel_leads WHERE id = ANY($1::int[])`,
       [leadIds]
     );
     const leadsById = new Map(leadsResult.rows.map(l => [l.id, l]));
@@ -96,6 +96,7 @@ class SequenceService {
       const lead = leadsById.get(id);
       if (!lead || lead.channel !== 'email' || !lead.email) { skippedNotEligible++; continue; }
       if (lead.cadence_managed && !allowCadenceManaged) { skippedCadenceManaged++; continue; }
+      if (lead.pipeline) { skippedNotEligible++; continue; } // resort CRM leads: WhatsApp-only pipeline, never email sequences
       if (alreadyEnrolled.has(id)) { skippedAlreadyEnrolled++; continue; }
       if (lead.email_status !== 'verified') { skippedUnverified++; continue; }
       await pool.query(

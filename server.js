@@ -559,6 +559,28 @@ async function initDB() {
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS cadence_managed BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE INDEX IF NOT EXISTS idx_leads_whatsapp_number ON hotel_leads(whatsapp_number);
     CREATE INDEX IF NOT EXISTS idx_leads_cadence_managed ON hotel_leads(cadence_managed) WHERE cadence_managed = TRUE;
+    -- Resort CRM pipeline (database/migrate_resort_crm_pipeline.sql) — pipeline leads (Meta-ad leads for our
+    -- own hotel CRM) are contacted only by their own worker; every other send path skips pipeline IS NOT NULL.
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS pipeline VARCHAR(30);
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS ad_form JSONB;
+    CREATE INDEX IF NOT EXISTS idx_leads_pipeline ON hotel_leads(pipeline) WHERE pipeline IS NOT NULL;
+    -- Task 6: per-lead pipeline state. Touches = WhatsApp templates sent (intro → follow-up → last), then
+    -- 'no_response'. Any reply → 'replied' (the Dream Stay agent owns the chat); a demo date/time agreed in
+    -- chat → 'demo_booked' with demo_slot (as agreed, e.g. "Thu 16 Oct, 4 pm").
+    CREATE TABLE IF NOT EXISTS resort_pipeline (
+        lead_id INT PRIMARY KEY REFERENCES hotel_leads(id) ON DELETE CASCADE,
+        status VARCHAR(20) NOT NULL DEFAULT 'active', -- active | replied | demo_booked | no_response | stopped | failed
+        touches INT NOT NULL DEFAULT 0,
+        next_touch_at TIMESTAMP,
+        last_touch_at TIMESTAMP,
+        last_template VARCHAR(100),
+        demo_slot TEXT,
+        demo_at TIMESTAMP,
+        stop_reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_resort_pipeline_due ON resort_pipeline(status, next_touch_at);
     ALTER TABLE directory_sources ADD COLUMN IF NOT EXISTS category_filter TEXT;
     -- Directory crawl pacing (database/migrate_directory_crawl_pacing.sql): per-site rest + block cool-down.
     ALTER TABLE directory_sources ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMP;
@@ -658,6 +680,7 @@ app.use('/api/proposals', require('./routes/proposals'));
 app.use('/api/agent-activity', require('./routes/agentActivity'));
 app.use('/api/directory-sources', require('./routes/directorySources'));
 app.use('/api/cadence', require('./routes/cadence'));
+app.use('/api/resort-crm', require('./routes/resortCrm'));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -677,10 +700,14 @@ require('./workers/emailVerificationWorker');
 require('./workers/playbookInsightsWorker');
 require('./workers/directoryCrawlWorker');
 require('./workers/cadenceWorker');
+require('./workers/resortPipelineWorker');
 require('./services/schedulerService');
 
 const PORT = process.env.PORT || 5000;
-initDB().then(() => {
+initDB().then(async () => {
+  // Resort CRM pipeline: create the Dream Stay sales agent on first boot (never overwrites edits).
+  await require('./services/resortCrmAgentService').ensureAgent()
+    .catch((e) => console.error('[ResortCRM] ensureAgent failed:', e.message));
   app.listen(PORT, () => {
     console.log(`🚀 Backend running on http://localhost:${PORT}`);
   });

@@ -30,6 +30,7 @@ async function runCampaignTick() {
         LEFT JOIN outreach_logs ol ON hl.id = ol.lead_id
         WHERE hl.city = $1
         AND ol.id IS NULL
+        AND hl.cadence_managed = FALSE AND hl.pipeline IS NULL  -- directory + resort CRM leads have their own workers
         LIMIT 10  -- Process 10 at a time
       `;
 

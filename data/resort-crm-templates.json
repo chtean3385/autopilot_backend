@@ -1,0 +1,42 @@
+{
+  "_comment": "Resort CRM (Dream Stay) WhatsApp templates — _docs/resort-crm/plan.md task 5. Hand-written, facts only from resort-crm-knowledge.md. {{1}} = first name (or 'there'), {{2}} = 'your hotel in Kochi'-style phrase. role picks when each is sent (services/resortPipelineService.js). Editing a body after Meta approval needs a NEW template_name (Meta can't edit an approved body in place).",
+  "footer": "Reply STOP to opt out",
+  "templates": [
+    {
+      "role": "intro_late",
+      "template_name": "dreamstay_intro_late_v1",
+      "body": "Hi {{1}}, this is Chetan from Dreams Technology 👋\n\nSome time back you asked about Dream Stay, our hotel and resort software, through our ad. Sorry it took us a while to get back to you!\n\nAre you still looking for an easier way to manage bookings, GST bills and guest messages for {{2}}? I'd be happy to show you a free 20-minute demo. Just tell me a day and time that suits you.",
+      "examples": ["Geogy", "your hotel in Kochi"]
+    },
+    {
+      "role": "intro_fresh",
+      "template_name": "dreamstay_intro_fresh_v1",
+      "body": "Hi {{1}}, this is Chetan from Dreams Technology 👋\n\nThank you for asking about Dream Stay, our hotel and resort software. I'd love to show you how it can run {{2}}: bookings, check-in, GST bills and WhatsApp messages to guests, all from one screen.\n\nWhich day and time suits you for a free 20-minute demo?",
+      "examples": ["Ramesh", "your hotel in Jodhpur"]
+    },
+    {
+      "role": "followup_no_software",
+      "template_name": "dreamstay_fu_register_v1",
+      "body": "Hi {{1}}, a quick thought. Many owners who use Dream Stay were running everything on a register or Excel before.\n\nNow room status, check-in with guest ID, GST bills and payment tracking take a few taps, even from the phone. And guests get their booking confirmation on WhatsApp automatically.\n\nWould a short demo help? Tell me a day and time and I'll set it up.",
+      "examples": ["Geogy"]
+    },
+    {
+      "role": "followup_has_software",
+      "template_name": "dreamstay_fu_switch_v1",
+      "body": "Hi {{1}}, since you already use hotel software, may I ask what it doesn't do well for you?\n\nDream Stay has things many owners miss elsewhere: QR self check-in for guests, your own booking website, and WhatsApp messages to guests built in. Setup and onboarding are free.\n\nHappy to show you in a 20-minute demo. Which day and time works for you?",
+      "examples": ["Anand"]
+    },
+    {
+      "role": "followup_direct_bookings",
+      "template_name": "dreamstay_fu_website_v1",
+      "body": "Hi {{1}}, one thing hotel owners really like about Dream Stay: a booking website for {{2}} where guests book you directly, without OTA commission. They verify by OTP, can pay online, and you get a WhatsApp alert for every booking.\n\nShall I show you how it would look? Just share a day and time for a quick demo.",
+      "examples": ["Michal", "your hotel in Kodaikanal"]
+    },
+    {
+      "role": "last",
+      "template_name": "dreamstay_last_v1",
+      "body": "Hi {{1}}, I don't want to keep messaging you if the timing isn't right.\n\nShould I close your enquiry for now, or would you still like a free demo of Dream Stay? A one-word reply is enough 🙏",
+      "examples": ["Geogy"]
+    }
+  ]
+}
