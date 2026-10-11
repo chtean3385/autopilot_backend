@@ -172,12 +172,14 @@ class WABAService {
     try {
       const components = [];
 
-      // Header image component — if provided, include as IMAGE header
+      // Header image component — Meta wants an upload handle as the sample, not a URL
+      // (a URL is rejected as "Missing sample parameter for title type", subcode 2388273)
       if (templateData.header_image_url) {
+        const handle = await this.uploadHeaderSample(templateData.header_image_url);
         components.push({
           type: 'HEADER',
           format: 'IMAGE',
-          example: { header_handle: [templateData.header_image_url] }
+          example: { header_handle: [handle] }
         });
       }
 
@@ -219,8 +221,28 @@ class WABAService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('[WABA] Template submit error:', error.response?.data || error.message);
-      return { success: false, error: error.response?.data?.error?.message || error.message };
+      const err = error.response?.data?.error;
+      // error_user_msg is the human-readable reason; message alone is just "Invalid parameter"
+      const reason = err ? [err.message, err.error_user_msg].filter(Boolean).join(' — ') : error.message;
+      return { success: false, error: reason };
     }
+  }
+
+  // Upload an image via Meta's Resumable Upload API and return the handle that template
+  // IMAGE headers need as their sample. The app id is looked up from the token itself.
+  static async uploadHeaderSample(imageUrl) {
+    const token = process.env.WABA_API_TOKEN;
+    const img = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 30000 });
+    const fileType = (img.headers['content-type'] || 'image/jpeg').split(';')[0];
+    const { data: app } = await axios.get(`${WABA_API_URL}/app`, { params: { access_token: token } });
+    const { data: session } = await axios.post(`${WABA_API_URL}/${app.id}/uploads`, null, {
+      params: { file_length: img.data.length, file_type: fileType, access_token: token }
+    });
+    const { data: uploaded } = await axios.post(`${WABA_API_URL}/${session.id}`, img.data, {
+      headers: { Authorization: `OAuth ${token}`, file_offset: '0', 'Content-Type': fileType },
+      maxBodyLength: Infinity
+    });
+    return uploaded.h;
   }
 
   // Meta template status → our waba_templates.status
