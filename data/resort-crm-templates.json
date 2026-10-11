@@ -6,8 +6,9 @@
       "role": "intro_utility",
       "template_name": "dreamstay_enquiry_followup",
       "category": "UTILITY",
-      "owner_submits": true,
-      "_why": "131049 (Meta's per-person marketing cap) blocked 5 of the first 7 MARKETING intros on 2026-10-11. A plain UTILITY follow-up of the lead's own enquiry isn't capped; their reply opens the 24h window for the AI. Created by the owner in Meta Business Manager (quick-reply buttons 'Yes, share details' / 'Not interested'), so 'Submit to Meta' skips it. Used for the first touch only when Meta approved it AS UTILITY.",
+      "buttons": ["Yes, share details", "Not interested"],
+      "no_footer": true,
+      "_why": "131049 (Meta's per-person marketing cap) blocked 5 of the first 7 MARKETING intros on 2026-10-11. A plain UTILITY follow-up of the lead's own enquiry isn't capped; their reply opens the 24h window for the AI. Used for the first touch only when Meta approved it AS UTILITY. Keep it non-promotional (no demo pitch, no features) or Meta re-categorises it as marketing.",
       "body": "Hi {{1}}, this is regarding the enquiry you submitted for Dream Stay hotel management software through our Facebook/Instagram form.\n\nPlease reply to this message and we will share the information you requested.",
       "examples": ["Geogy"]
     },

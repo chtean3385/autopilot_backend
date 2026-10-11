@@ -39,15 +39,14 @@ async function loadConfig() {
 async function ensureTemplates() {
   let added = 0;
   for (const t of TEMPLATE_FILE.templates) {
-    // owner_submits: the owner creates it in Meta Business Manager themselves (it has buttons) — kept out of
-    // "Submit to Meta" by starting at 'pending_approval'; Meta's status webhook / syncFromMeta() fill in the rest.
+    // category / buttons / no_footer come from the JSON (the UTILITY follow-up has quick-reply buttons, no footer).
     const r = await pool.query(
       `INSERT INTO waba_templates (template_name, template_category, body_text, footer_text, status, industry,
          template_group, parameter_mapping, examples, created_by, auto_generated)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'resort_crm_pipeline', FALSE)
        ON CONFLICT (template_name) DO NOTHING RETURNING id`,
-      [t.template_name, t.category || 'MARKETING', t.body, t.owner_submits ? null : TEMPLATE_FILE.footer,
-       t.owner_submits ? 'pending_approval' : 'draft', PIPELINE, `dreamstay_${t.role}`,
+      [t.template_name, t.category || 'MARKETING', t.body, t.no_footer ? null : TEMPLATE_FILE.footer,
+       'draft', PIPELINE, `dreamstay_${t.role}`,
        JSON.stringify(PARAM_MAPPING), JSON.stringify(t.examples)]);
     added += r.rowCount;
   }
@@ -63,8 +62,9 @@ async function submitTemplates() {
   for (const t of drafts) {
     const res = await WABAService.submitTemplateToMeta({
       template_name: t.template_name, body_text: t.body_text, footer_text: t.footer_text,
-      template_category: 'MARKETING', language: 'en_US',
+      template_category: (t.template_category || 'MARKETING').toUpperCase(), language: 'en_US',
       examples: typeof t.examples === 'string' ? JSON.parse(t.examples) : t.examples,
+      buttons: TEMPLATE_FILE.templates.find((x) => x.template_name === t.template_name)?.buttons,
     });
     if (res.success) {
       await pool.query(

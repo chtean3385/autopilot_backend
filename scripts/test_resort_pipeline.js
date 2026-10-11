@@ -17,7 +17,9 @@ process.env.WABA_API_TOKEN = 'test'; process.env.WABA_PHONE_ID = 'test';
 // ── Stubs (installed before any service is loaded) ──
 const axios = require('axios');
 const sent = []; // { to, type, template, text, image }
+const metaSubmits = []; // template payloads sent to Meta
 axios.post = async (url, body) => {
+  if (String(url).includes('message_templates')) metaSubmits.push(body);
   if (body?.to) sent.push({ to: body.to, type: body.type, template: body.template?.name, text: body.text?.body, image: body.image?.link });
   return { data: { messages: [{ id: `wamid.t${Date.now()}${Math.random()}` }], id: 'meta1', status: 'PENDING' } };
 };
@@ -177,7 +179,11 @@ function metaExport(rows) {
   check((await pool.query(`SELECT status FROM resort_pipeline WHERE lead_id = $1`, [ids[2]])).rows[0].status === 'no_response', 'after the 3rd message with no reply → no_response');
 
   // ── Utility template + one-click queue (131049 fix) ──
-  check(!submitted.some((s) => s.template === 'dreamstay_enquiry_followup'), 'owner-made utility template is never submitted by us');
+  const up = metaSubmits.find((b) => b.name === 'dreamstay_enquiry_followup');
+  const btns = up?.components.find((c) => c.type === 'BUTTONS')?.buttons.map((b) => `${b.type}:${b.text}`).join('|');
+  check(up?.category === 'UTILITY' && btns === 'QUICK_REPLY:Yes, share details|QUICK_REPLY:Not interested' && !up.components.some((c) => c.type === 'FOOTER'),
+    'utility template submitted as UTILITY with 2 quick-reply buttons, no footer', `${up?.category} ${btns}`);
+  check(metaSubmits.filter((b) => b.name !== 'dreamstay_enquiry_followup').every((b) => b.category === 'MARKETING'), 'the other templates still go as MARKETING');
   const qPhones = [`+9197${tag}0004`, `+9197${tag}0005`, `+9197${tag}0006`];
   const qImp = await importAdLeads(metaExport([
     ['q1', recent, 'ig', 'hotel', '1-10', 'no', 'immediately', 'yes', `d${tag}@x.com`, 'Asha Rao', `p:${qPhones[0]}`, '', 'goa', 'complete', ''],

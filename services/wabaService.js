@@ -198,6 +198,11 @@ class WABAService {
         components.push({ type: 'FOOTER', text: templateData.footer_text });
       }
 
+      // Optional quick-reply buttons (labels only, max 25 chars each) — e.g. the Dream Stay utility follow-up.
+      if (Array.isArray(templateData.buttons) && templateData.buttons.length) {
+        components.push({ type: 'BUTTONS', buttons: templateData.buttons.map((text) => ({ type: 'QUICK_REPLY', text })) });
+      }
+
       const payload = {
         name: templateData.template_name,
         language: templateData.language || 'en_US', // 'hi' for Hindi directory templates (templatePoolService)
