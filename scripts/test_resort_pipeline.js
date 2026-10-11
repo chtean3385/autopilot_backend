@@ -59,6 +59,11 @@ function metaExport(rows) {
 
 (async () => {
   await pool.query(fs.readFileSync(path.join(__dirname, '../database/migrate_resort_crm_pipeline.sql'), 'utf8'));
+  // Leads already in this test DB (e.g. a manual preview import) would take the daily quota — park them for the run.
+  await pool.query(`UPDATE hotel_leads SET pipeline = 'resort_crm_parked' WHERE pipeline = 'resort_crm'`);
+  // Start from no Dream Stay templates (a crashed earlier run can leave them approved).
+  await pool.query(`UPDATE outreach_logs SET template_id = NULL WHERE template_id IN (SELECT id FROM waba_templates WHERE industry = 'resort_crm')`);
+  await pool.query(`DELETE FROM waba_templates WHERE industry = 'resort_crm'`);
   const tag = String(Date.now()).slice(-4);
   const phones = [`+9198${tag}0001`, `+9198${tag}0002`, `+9198${tag}0003`];
   const recent = new Date(Date.now() - 2 * 86400000).toISOString();
@@ -96,7 +101,7 @@ function metaExport(rows) {
   const waiting = await pipe.runPipeline('manual');
   check(waiting.sent === 0 && waiting.waiting_template === 2, 'templates not approved yet → waits, sends nothing', JSON.stringify(waiting));
 
-  await pool.query(`UPDATE waba_templates SET status = 'approved' WHERE industry = 'resort_crm'`);
+  await pool.query(`UPDATE waba_templates SET status = 'approved' WHERE industry = 'resort_crm' AND template_name <> 'dreamstay_enquiry_followup'`);
   await pool.query(`UPDATE resort_pipeline SET next_touch_at = NOW() WHERE lead_id = ANY($1)`, [ids]);
   const t1 = await pipe.runPipeline('manual');
   const sentTo = (i) => sent.filter((s) => s.to && last10(s.to) === last10(leads[i].whatsapp_number));
@@ -170,6 +175,56 @@ function metaExport(rows) {
   await pool.query(`UPDATE resort_pipeline SET status = 'active', touches = 3, next_touch_at = NOW() WHERE lead_id = $1`, [ids[2]]);
   await pipe.runPipeline('manual');
   check((await pool.query(`SELECT status FROM resort_pipeline WHERE lead_id = $1`, [ids[2]])).rows[0].status === 'no_response', 'after the 3rd message with no reply → no_response');
+
+  // ── Utility template + one-click queue (131049 fix) ──
+  check(!submitted.some((s) => s.template === 'dreamstay_enquiry_followup'), 'owner-made utility template is never submitted by us');
+  const qPhones = [`+9197${tag}0004`, `+9197${tag}0005`, `+9197${tag}0006`];
+  const qImp = await importAdLeads(metaExport([
+    ['q1', recent, 'ig', 'hotel', '1-10', 'no', 'immediately', 'yes', `d${tag}@x.com`, 'Asha Rao', `p:${qPhones[0]}`, '', 'goa', 'complete', ''],
+    ['q2', recent, 'fb', 'hotel', '1-10', 'no', 'immediately', 'yes', `e${tag}@x.com`, 'Ravi Shah', `p:${qPhones[1]}`, '', 'surat', 'complete', ''],
+    ['q3', recent, 'fb', 'resort', '1-10', 'no', 'just_exploring', 'no', `f${tag}@x.com`, 'Neha Jain', `p:${qPhones[2]}`, '', 'udaipur', 'complete', ''],
+  ]), 'q.csv');
+  const qIds = qImp.rows.map((r) => r.lead_id);
+  // q2: its marketing intro was blocked by Meta 131049 (as happened live) → failed + on the Call list.
+  await pool.query(`INSERT INTO resort_pipeline (lead_id, status, touches, stop_reason) VALUES ($1, 'failed', 1,
+    'This message was not delivered to maintain healthy ecosystem engagement.')`, [qIds[1]]);
+  await pool.query(`UPDATE hotel_leads SET call_needed_at = NOW(), call_reason = 'Dream Stay ad lead — WhatsApp not delivered' WHERE id = $1`, [qIds[1]]);
+
+  let threw = await pipe.queueAll().then(() => false, () => true);
+  check(threw, 'queue refuses while the utility template is not approved');
+  await pool.query(`UPDATE waba_templates SET status = 'approved', template_category = 'MARKETING' WHERE template_name = 'dreamstay_enquiry_followup'`);
+  threw = await pipe.queueAll().then(() => false, () => true);
+  check(threw, 'queue refuses if Meta approved it as MARKETING (131049 would still apply)');
+  await pool.query(`UPDATE waba_templates SET template_category = 'UTILITY' WHERE template_name = 'dreamstay_enquiry_followup'`);
+
+  const qs = await pipe.queueAll({ gapMinutes: 2 });
+  const qRows = (await pool.query(`SELECT lead_id, next_touch_at, queued, status FROM resort_pipeline WHERE lead_id = ANY($1) ORDER BY next_touch_at`, [qIds])).rows;
+  check(qs.queued === 3 && qs.retries === 1 && qRows.every((r) => r.queued && r.status === 'active'), 'queues the 2 new leads + the 131049-blocked one', JSON.stringify(qs));
+  const gaps = qRows.slice(1).map((r, i) => Math.round((new Date(r.next_touch_at) - new Date(qRows[i].next_touch_at)) / 60000));
+  check(gaps.every((g) => g === 2), 'sends spaced exactly 2 minutes apart', gaps.join(','));
+  check(!(await pool.query(`SELECT call_needed_at FROM hotel_leads WHERE id = $1`, [qIds[1]])).rows[0].call_needed_at, 'retried lead taken off the Call list');
+
+  const beforeQ = sent.length;
+  await pool.query(`UPDATE resort_pipeline SET next_touch_at = NOW() - INTERVAL '1 minute' WHERE lead_id = ANY($1)`, [qIds]); // all "due"
+  await pipe.runPipeline('manual');
+  check(sent.length === beforeQ, 'the regular tick never sends queued rows (no burst)');
+  await pipe.runQueueTick();
+  const qSent = sent.slice(beforeQ);
+  check(qSent.length === 1 && qSent[0].template === 'dreamstay_enquiry_followup', 'queue tick sends ONE message, the utility template', JSON.stringify(qSent.map((s) => s.template)));
+  await pipe.runQueueTick(); await pipe.runQueueTick();
+  check(sent.length - beforeQ === 3, 'next ticks send the rest one by one');
+  const retried = (await pool.query(`SELECT status, touches, queued FROM resort_pipeline WHERE lead_id = $1`, [qIds[1]])).rows[0];
+  check(retried.status === 'active' && retried.touches === 1 && !retried.queued, 'blocked lead got the utility message and continues in the normal pipeline', JSON.stringify(retried));
+  const again = await pipe.queueAll();
+  check(again.queued === 0, 'pressing again queues nobody (each lead gets the utility message once)');
+
+  // Stop sending: unsent queued leads go back to "not started".
+  await pool.query(`DELETE FROM outreach_logs WHERE lead_id = $1`, [qIds[2]]);
+  await pool.query(`DELETE FROM resort_pipeline WHERE lead_id = $1`, [qIds[2]]);
+  await pipe.queueAll();
+  const c = await pipe.cancelQueue();
+  check(c.cancelled === 1 && !(await pool.query(`SELECT 1 FROM resort_pipeline WHERE lead_id = $1`, [qIds[2]])).rowCount, 'Stop sending puts unsent leads back to not started');
+  ids.push(...qIds);
 
   const sum = await pipe.summary();
   check(sum.leads >= 3 && sum.demo_booked >= 1, 'summary counts', JSON.stringify(sum));

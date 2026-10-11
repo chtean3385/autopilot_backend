@@ -29,6 +29,11 @@ router.get('/summary', wrap(() => pipeline.summary()));
 router.get('/templates', wrap(() => pipeline.templateStatus()));
 // Sends the Dream Stay templates to Meta for approval (owner-triggered; Meta answers via the webhook).
 router.post('/templates/submit', wrap(() => pipeline.submitTemplates()));
+// Pull real status + category from Meta (templates the owner created/edited in Business Manager).
+router.post('/templates/sync', wrap(() => pipeline.syncFromMeta()));
+// One click: queue the utility enquiry follow-up to every lead not reached yet, gap_minutes apart (default 2).
+router.post('/queue', wrap((req) => pipeline.queueAll({ gapMinutes: req.body?.gap_minutes })));
+router.post('/queue/cancel', wrap(() => pipeline.cancelQueue()));
 // Run one pipeline tick now (skips the send window, still needs RESORT_PIPELINE_ENABLED=true).
 router.post('/run', wrap(() => pipeline.runPipeline('manual')));
 // Test one lead: send its next WhatsApp now, even with the pipeline switched off.

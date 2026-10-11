@@ -39,12 +39,15 @@ async function loadConfig() {
 async function ensureTemplates() {
   let added = 0;
   for (const t of TEMPLATE_FILE.templates) {
+    // owner_submits: the owner creates it in Meta Business Manager themselves (it has buttons) — kept out of
+    // "Submit to Meta" by starting at 'pending_approval'; Meta's status webhook / syncFromMeta() fill in the rest.
     const r = await pool.query(
       `INSERT INTO waba_templates (template_name, template_category, body_text, footer_text, status, industry,
          template_group, parameter_mapping, examples, created_by, auto_generated)
-       VALUES ($1, 'MARKETING', $2, $3, 'draft', $4, $5, $6, $7, 'resort_crm_pipeline', FALSE)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'resort_crm_pipeline', FALSE)
        ON CONFLICT (template_name) DO NOTHING RETURNING id`,
-      [t.template_name, t.body, TEMPLATE_FILE.footer, PIPELINE, `dreamstay_${t.role}`,
+      [t.template_name, t.category || 'MARKETING', t.body, t.owner_submits ? null : TEMPLATE_FILE.footer,
+       t.owner_submits ? 'pending_approval' : 'draft', PIPELINE, `dreamstay_${t.role}`,
        JSON.stringify(PARAM_MAPPING), JSON.stringify(t.examples)]);
     added += r.rowCount;
   }
@@ -76,7 +79,7 @@ async function submitTemplates() {
 async function templateStatus() {
   await ensureTemplates();
   return (await pool.query(
-    `SELECT t.id, t.template_name, t.template_group, t.status, t.rejection_reason, t.submitted_at, t.body_text,
+    `SELECT t.id, t.template_name, t.template_group, t.status, t.template_category, t.rejection_reason, t.submitted_at, t.body_text,
             (SELECT COUNT(*)::int FROM outreach_logs ol WHERE ol.template_id = t.id) AS sent
      FROM waba_templates t WHERE t.industry = $1 ORDER BY t.id`, [PIPELINE])).rows;
 }
@@ -114,7 +117,30 @@ function roleForTouch(lead, touch) {
 async function approvedTemplate(role) {
   return (await pool.query(
     `SELECT * FROM waba_templates WHERE industry = $1 AND template_group = $2 AND status = 'approved'
+       AND ($2 <> 'dreamstay_intro_utility' OR UPPER(template_category) = 'UTILITY')
      ORDER BY id DESC LIMIT 1`, [PIPELINE, `dreamstay_${role}`])).rows[0] || null;
+}
+
+// The UTILITY enquiry follow-up, only if Meta approved it AS utility. Meta's 131049 per-person cap only
+// applies to MARKETING templates — if Meta re-categorised it, it's no better than the marketing intro.
+const utilityIntro = () => approvedTemplate('intro_utility');
+
+// Ask Meta for the real status + category of every Dream Stay template (the owner may have created or
+// edited them in Business Manager, and Meta can re-categorise a template after approval).
+async function syncFromMeta() {
+  await ensureTemplates();
+  const rows = (await pool.query(`SELECT id, template_name FROM waba_templates WHERE industry = $1`, [PIPELINE])).rows;
+  const out = [];
+  for (const r of rows) {
+    const meta = await WABAService.getTemplateDetails(r.template_name);
+    if (!meta) { out.push({ template: r.template_name, found: false }); continue; }
+    await pool.query(
+      `UPDATE waba_templates SET status = $2, template_category = COALESCE($3, template_category),
+         rejection_reason = $4, meta_template_id = COALESCE(meta_template_id, $5), updated_at = NOW() WHERE id = $1`,
+      [r.id, WABAService.localStatus(meta.status), meta.category || null, meta.rejected_reason && meta.rejected_reason !== 'NONE' ? meta.rejected_reason : null, meta.id || null]);
+    out.push({ template: r.template_name, found: true, status: meta.status, category: meta.category });
+  }
+  return out;
 }
 
 // ── Sending ────────────────────────────────────────────────────────────────────────────────────────
@@ -142,8 +168,9 @@ async function sendNextTouch(leadId, cfg) {
 
   const touch = state.touches + 1;
   if (touch > MAX_TOUCHES) { await finishNoResponse(leadId); return 'no_response'; }
-  const role = roleForTouch(lead, touch);
-  const template = await approvedTemplate(role);
+  const utility = touch === 1 ? await utilityIntro() : null;
+  const role = utility ? 'intro_utility' : roleForTouch(lead, touch);
+  const template = utility || await approvedTemplate(role);
   if (!template) {
     // Not approved by Meta yet — try again in an hour. Shows on the pipeline page as waiting.
     await setState(leadId, { next_touch_at: hoursFromNow(1) });
@@ -166,7 +193,7 @@ async function sendNextTouch(leadId, cfg) {
     [leadId, template.id, res.messageId, renderBody(template.body_text, lead)]);
   const gapDays = touch < MAX_TOUCHES ? cfg.gaps[touch - 1] : null;
   await setState(leadId, {
-    touches: touch, last_touch_at: new Date(), last_template: template.template_name,
+    touches: touch, last_touch_at: new Date(), last_template: template.template_name, queued: false,
     next_touch_at: gapDays ? hoursFromNow(gapDays * 24) : hoursFromNow(cfg.gaps[1] * 24), // after the last: wait, then no_response
   });
   await logAction(leadId, 'resort_whatsapp_sent', { template: template.template_name, touch, role }, 'send', renderBody(template.body_text, lead));
@@ -255,7 +282,8 @@ async function runPipeline(trigger = 'cron') {
   try {
     stats.enrolled = await enrollNew(cfg);
     const due = (await pool.query(
-      `SELECT lead_id FROM resort_pipeline WHERE status = 'active' AND next_touch_at <= NOW() ORDER BY next_touch_at LIMIT 50`)).rows;
+      `SELECT lead_id FROM resort_pipeline WHERE status = 'active' AND NOT queued AND next_touch_at <= NOW()
+       ORDER BY next_touch_at LIMIT 50`)).rows; // queued rows belong to the one-click queue (runQueueTick)
     stats.due = due.length;
     for (const { lead_id: leadId } of due) {
       try {
@@ -286,6 +314,100 @@ async function sendNowForLead(leadId) {
   return sendNextTouch(leadId, await loadConfig());
 }
 
+// ── One-click "send to all" queue ──────────────────────────────────────────────────────────────────
+// Owner presses one button: every lead not reached yet gets the UTILITY enquiry follow-up, one at a time,
+// gapMinutes apart (runQueueTick sends at most one per minute, so a restart can't burst them). Includes
+// leads whose MARKETING intro Meta blocked with 131049 — the utility template isn't subject to that cap.
+// Independent of RESORT_PIPELINE_ENABLED and the send window (an explicit owner action); follow-ups after
+// it still need the master switch.
+const QUEUE_ELIGIBLE = `
+  hl.pipeline = $1 AND hl.whatsapp_number IS NOT NULL AND COALESCE(hl.ai_paused, FALSE) = FALSE
+  AND hl.status NOT IN ('not_interested', 'unsubscribed', 'dead')
+  AND NOT EXISTS (SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE)
+  AND NOT EXISTS (SELECT 1 FROM outreach_logs u JOIN waba_templates t ON t.id = u.template_id     -- utility tried once already
+                  WHERE u.lead_id = hl.id AND t.template_group = 'dreamstay_intro_utility')
+  AND (rp.lead_id IS NULL
+       OR (rp.status = 'failed' AND rp.touches <= 1 AND rp.stop_reason ILIKE '%ecosystem%'))`;
+
+async function queueEligibleCount() {
+  return (await pool.query(
+    `SELECT COUNT(*)::int AS n FROM hotel_leads hl LEFT JOIN resort_pipeline rp ON rp.lead_id = hl.id WHERE ${QUEUE_ELIGIBLE}`,
+    [PIPELINE])).rows[0].n;
+}
+
+async function queueAll({ gapMinutes = 2 } = {}) {
+  const gap = Math.min(Math.max(Number(gapMinutes) || 2, 1), 60);
+  if (!(await utilityIntro())) {
+    throw new Error('The utility template "dreamstay_enquiry_followup" is not approved by Meta as UTILITY yet — press "Check Meta" after approval');
+  }
+  const leads = (await pool.query(
+    `SELECT hl.id, rp.lead_id IS NOT NULL AS retry FROM hotel_leads hl LEFT JOIN resort_pipeline rp ON rp.lead_id = hl.id
+     WHERE ${QUEUE_ELIGIBLE}
+     ORDER BY (hl.ad_form->>'wants_demo' = 'yes') DESC NULLS LAST,
+              CASE hl.ad_form->>'timeline' WHEN 'immediately' THEN 0 WHEN 'within_30_days' THEN 1
+                   WHEN 'within_3_months' THEN 2 WHEN 'just_exploring' THEN 3 ELSE 4 END, hl.id`,
+    [PIPELINE])).rows;
+  // Continue after anything already queued, so pressing twice never doubles up or bunches sends.
+  const lastQueued = (await pool.query(`SELECT MAX(next_touch_at) AS t FROM resort_pipeline WHERE queued AND status = 'active'`)).rows[0].t;
+  const start = Math.max(Date.now(), lastQueued ? new Date(lastQueued).getTime() + gap * 60000 : 0);
+  let i = 0;
+  for (const l of leads) {
+    const at = new Date(start + i * gap * 60000);
+    if (l.retry) {
+      // Blocked marketing intro → try again with the utility template; off the Call list unless already called.
+      await pool.query(
+        `UPDATE resort_pipeline SET status = 'active', touches = 0, queued = TRUE, next_touch_at = $2, stop_reason = NULL, updated_at = NOW()
+         WHERE lead_id = $1`, [l.id, at]);
+      await pool.query(
+        `UPDATE hotel_leads SET call_needed_at = NULL, call_reason = NULL, updated_at = NOW()
+         WHERE id = $1 AND call_done_at IS NULL AND call_reason LIKE 'Dream Stay%'`, [l.id]);
+    } else {
+      await pool.query(
+        `INSERT INTO resort_pipeline (lead_id, status, queued, next_touch_at) VALUES ($1, 'active', TRUE, $2)
+         ON CONFLICT (lead_id) DO NOTHING`, [l.id, at]);
+    }
+    i++;
+  }
+  await logAction(null, 'resort_queue_started', { leads: leads.length, gap_minutes: gap }, 'send');
+  return { queued: leads.length, retries: leads.filter((l) => l.retry).length, gap_minutes: gap,
+    finishes_at: leads.length ? new Date(start + (leads.length - 1) * gap * 60000) : null };
+}
+
+// Unsent queued leads go back to "not started" (retried 131049 leads back to failed would need their old
+// reason — they simply stay not started, which is accurate: nothing reached them).
+async function cancelQueue() {
+  const r = await pool.query(`DELETE FROM resort_pipeline WHERE queued AND status = 'active' AND touches = 0 RETURNING lead_id`);
+  return { cancelled: r.rowCount };
+}
+
+let queueBusy = false;
+async function runQueueTick() {
+  if (queueBusy) return { skipped: 'busy' };
+  queueBusy = true;
+  try {
+    const next = (await pool.query(
+      `SELECT lead_id FROM resort_pipeline WHERE queued AND status = 'active' AND next_touch_at <= NOW()
+       ORDER BY next_touch_at LIMIT 1`)).rows[0];
+    if (!next) return { sent: 0 };
+    const out = await sendNextTouch(next.lead_id, await loadConfig());
+    if (out !== 'sent') {
+      // Not sent (replied meanwhile, flagged, template gone…) — leave the queue so it can't block it.
+      await pool.query(`UPDATE resort_pipeline SET queued = FALSE, updated_at = NOW() WHERE lead_id = $1`, [next.lead_id]);
+    }
+    return { lead_id: next.lead_id, result: out };
+  } finally {
+    queueBusy = false;
+  }
+}
+
+async function queueStatus() {
+  const q = (await pool.query(
+    `SELECT COUNT(*)::int AS waiting, MIN(next_touch_at) AS next_at, MAX(next_touch_at) AS last_at
+     FROM resort_pipeline WHERE queued AND status = 'active'`)).rows[0];
+  const utility = await utilityIntro();
+  return { ...q, eligible: await queueEligibleCount(), utility_ready: Boolean(utility) };
+}
+
 async function summary() {
   const counts = (await pool.query(`
     SELECT
@@ -297,10 +419,11 @@ async function summary() {
       COUNT(*) FILTER (WHERE rp.status = 'no_response')::int AS no_response,
       COUNT(*) FILTER (WHERE rp.status IN ('failed', 'stopped'))::int AS stopped
     FROM resort_pipeline rp`, [PIPELINE])).rows[0];
-  return { ...counts, config: await loadConfig() };
+  return { ...counts, config: await loadConfig(), queue: await queueStatus() };
 }
 
 module.exports = {
   runPipeline, sendNowForLead, sendNextTouch, onReply, onSendFailed, ensureTemplates, submitTemplates,
+  syncFromMeta, queueAll, cancelQueue, runQueueTick, queueStatus,
   templateStatus, summary, roleForTouch, leadVars, renderBody, loadConfig, setState, PIPELINE,
 };

@@ -562,6 +562,7 @@ CREATE TABLE IF NOT EXISTS resort_pipeline (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_resort_pipeline_due ON resort_pipeline(status, next_touch_at);
+ALTER TABLE resort_pipeline ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT FALSE; -- one-click send queue
 ALTER TABLE directory_sources ADD COLUMN IF NOT EXISTS category_filter TEXT;
 -- Directory crawl pacing (database/migrate_directory_crawl_pacing.sql): per-site rest + block cool-down.
 ALTER TABLE directory_sources ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMP;

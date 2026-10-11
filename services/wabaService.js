@@ -430,7 +430,7 @@ class WABAService {
   static async getTemplateDetails(templateName) {
     try {
       // Explicitly request components field — not always returned by default
-      const url = `${WABA_API_URL}/${process.env.WABA_BUSINESS_ACCOUNT_ID}/message_templates?name=${encodeURIComponent(templateName)}&fields=name,status,language,components`;
+      const url = `${WABA_API_URL}/${process.env.WABA_BUSINESS_ACCOUNT_ID}/message_templates?name=${encodeURIComponent(templateName)}&fields=name,status,category,rejected_reason,language,components`;
       const response = await axios.get(url, { headers: { Authorization: `Bearer ${process.env.WABA_API_TOKEN}` } });
       const results = response.data.data || [];
       console.log(`[WABA] getTemplateDetails("${templateName}"): ${results.length} result(s) from Meta`);

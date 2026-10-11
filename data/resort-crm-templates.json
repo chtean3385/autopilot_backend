@@ -3,6 +3,15 @@
   "footer": "Reply STOP to opt out",
   "templates": [
     {
+      "role": "intro_utility",
+      "template_name": "dreamstay_enquiry_followup",
+      "category": "UTILITY",
+      "owner_submits": true,
+      "_why": "131049 (Meta's per-person marketing cap) blocked 5 of the first 7 MARKETING intros on 2026-10-11. A plain UTILITY follow-up of the lead's own enquiry isn't capped; their reply opens the 24h window for the AI. Created by the owner in Meta Business Manager (quick-reply buttons 'Yes, share details' / 'Not interested'), so 'Submit to Meta' skips it. Used for the first touch only when Meta approved it AS UTILITY.",
+      "body": "Hi {{1}}, this is regarding the enquiry you submitted for Dream Stay hotel management software through our Facebook/Instagram form.\n\nPlease reply to this message and we will share the information you requested.",
+      "examples": ["Geogy"]
+    },
+    {
       "role": "intro_late",
       "template_name": "dreamstay_intro_late_v1",
       "body": "Hi {{1}}, this is Chetan from Dreams Technology 👋\n\nSome time back you asked about Dream Stay, our hotel and resort software, through our ad. Sorry it took us a while to get back to you!\n\nAre you still looking for an easier way to manage bookings, GST bills and guest messages for {{2}}? I'd be happy to show you a free 20-minute demo. Just tell me a day and time that suits you.",

@@ -22,3 +22,6 @@ CREATE TABLE IF NOT EXISTS resort_pipeline (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_resort_pipeline_due ON resort_pipeline(status, next_touch_at);
+-- One-click "send to all" queue (2026-10-11): first messages go out one by one with a gap, independent of
+-- RESORT_PIPELINE_ENABLED (the owner pressed the button); the regular tick never sends queued rows.
+ALTER TABLE resort_pipeline ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT FALSE;

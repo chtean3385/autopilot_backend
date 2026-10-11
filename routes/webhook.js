@@ -141,7 +141,10 @@ router.post('/whatsapp', async (req, res) => {
             }
 
             const fromPhone = msg.from; // E.164 without +
-            const msgText = msg.text?.body || '';
+            // Typed text, or the label of a tapped quick-reply button (template buttons arrive as
+            // type 'button', interactive-message buttons as 'interactive') — they used to arrive as "".
+            const msgText = msg.text?.body || msg.button?.text
+              || msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || '';
             console.log(`[Webhook] Incoming reply from ${fromPhone}: "${msgText}"`);
 
             // Find the lead by phone (strip non-digits for comparison)
