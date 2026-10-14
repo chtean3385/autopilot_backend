@@ -12,7 +12,8 @@ router.post('/import', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
   try {
     const dryRun = ['1', 'true'].includes(String(req.query.dry_run || req.body.dry_run || ''));
-    res.json({ dry_run: dryRun, ...(await importAdLeads(req.file.buffer, req.file.originalname, { dryRun })) });
+    res.json({ dry_run: dryRun, ...(await importAdLeads(req.file.buffer, req.file.originalname, { dryRun, groupId: Number(req.query.group_id || req.body.group_id) || null,
+      pastEnquiry: ['1', 'true'].includes(String(req.query.past_enquiry || req.body.past_enquiry || '')) })) });
   } catch (err) {
     console.error('[ResortCRM Import]', err.message);
     res.status(400).json({ error: err.message || 'Failed to read file.' });
@@ -32,7 +33,9 @@ router.post('/templates/submit', wrap(() => pipeline.submitTemplates()));
 // Pull real status + category from Meta (templates the owner created/edited in Business Manager).
 router.post('/templates/sync', wrap(() => pipeline.syncFromMeta()));
 // One click: queue the utility enquiry follow-up to every lead not reached yet, gap_minutes apart (default 2).
-router.post('/queue', wrap((req) => pipeline.queueAll({ gapMinutes: req.body?.gap_minutes })));
+router.post('/queue', wrap((req) => pipeline.queueAll({ gapMinutes: req.body?.gap_minutes, templateId: req.body?.template_id, groupId: req.body?.group_id })));
+// How many leads a template send to this group would reach (nothing is sent).
+router.get('/queue/preview', wrap((req) => pipeline.previewTemplateSend({ templateId: req.query.template_id, groupId: req.query.group_id })));
 router.post('/queue/cancel', wrap(() => pipeline.cancelQueue()));
 // Run one pipeline tick now (skips the send window, still needs RESORT_PIPELINE_ENABLED=true).
 router.post('/run', wrap(() => pipeline.runPipeline('manual')));

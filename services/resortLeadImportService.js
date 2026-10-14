@@ -118,9 +118,19 @@ function normalizeRow(row) {
 }
 
 // Returns a per-row report. dryRun = parse + dedupe only, nothing written.
-async function importAdLeads(buffer, originalname, { dryRun = false } = {}) {
+async function importAdLeads(buffer, originalname, { dryRun = false, groupId = null, pastEnquiry = false } = {}) {
   const rows = await parseRows(buffer, originalname);
-  const report = { total: rows.length, added: 0, duplicates: 0, invalid: 0, rows: [] };
+  const report = { total: rows.length, added: 0, duplicates: 0, invalid: 0, grouped: 0, rows: [] };
+  // Optional lead group (e.g. "Ad_replied"): new leads join it, and so do leads of this pipeline that were imported earlier.
+  // pastEnquiry = chats from WhatsApp, not Meta form leads: the automatic pipeline and "Send to all" skip them,
+  // they only get the template the owner picks (resortPipelineService.queueAll with templateId).
+  const addToGroup = async (leadId) => {
+    if (dryRun) return;
+    if (pastEnquiry) await pool.query(`UPDATE hotel_leads SET ad_form = COALESCE(ad_form, '{}'::jsonb) || '{"past_enquiry": true}'::jsonb WHERE id = $1`, [leadId]);
+    if (!groupId) return;
+    await pool.query('INSERT INTO lead_group_members (group_id, lead_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [groupId, leadId]);
+    report.grouped++;
+  };
   const seenInFile = new Set();
 
   for (const row of rows) {
@@ -141,6 +151,7 @@ async function importAdLeads(buffer, originalname, { dryRun = false } = {}) {
       [lead.whatsapp_number, lead.email])).rows[0];
     if (dup) {
       report.duplicates++;
+      if (dup.pipeline === PIPELINE) await addToGroup(dup.id);
       report.rows.push({ ...label, result: 'duplicate', lead_id: dup.id, reason: dup.pipeline === PIPELINE ? 'already imported' : 'already a lead in the CRM' });
       continue;
     }
@@ -155,6 +166,7 @@ async function importAdLeads(buffer, originalname, { dryRun = false } = {}) {
         [lead.hotel_name, lead.owner_name, lead.email, lead.whatsapp_number, lead.city, lead.website,
          lead.business_category, PIPELINE, JSON.stringify(lead.ad_form)]);
       label.lead_id = ins.rows[0].id;
+      await addToGroup(label.lead_id);
     }
     report.added++;
     report.rows.push({ ...label, result: dryRun ? 'would_add' : 'added' });

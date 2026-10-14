@@ -168,9 +168,14 @@ async function sendNextTouch(leadId, cfg) {
 
   const touch = state.touches + 1;
   if (touch > MAX_TOUCHES) { await finishNoResponse(leadId); return 'no_response'; }
-  const utility = touch === 1 ? await utilityIntro() : null;
-  const role = utility ? 'intro_utility' : roleForTouch(lead, touch);
-  const template = utility || await approvedTemplate(role);
+  // Past-enquiry sends: the owner picked the first-touch template themselves (state.intro_template_id).
+  const picked = touch === 1 && state.intro_template_id
+    ? (await pool.query(`SELECT * FROM waba_templates WHERE id = $1 AND status = 'approved'`, [state.intro_template_id])).rows[0] || null
+    : null;
+  if (touch === 1 && state.intro_template_id && !picked) { await setState(leadId, { next_touch_at: hoursFromNow(1) }); return 'no_approved_template:picked'; }
+  const utility = !picked && touch === 1 ? await utilityIntro() : null;
+  const role = picked ? 'intro_picked' : utility ? 'intro_utility' : roleForTouch(lead, touch);
+  const template = picked || utility || await approvedTemplate(role);
   if (!template) {
     // Not approved by Meta yet — try again in an hour. Shows on the pipeline page as waiting.
     await setState(leadId, { next_touch_at: hoursFromNow(1) });
@@ -257,6 +262,7 @@ async function enrollNew(cfg) {
      SELECT hl.id, 'active', NOW() FROM hotel_leads hl
      WHERE hl.pipeline = $1 AND hl.status = 'new' AND hl.whatsapp_number IS NOT NULL
        AND hl.needs_attention = FALSE AND COALESCE(hl.ai_paused, FALSE) = FALSE
+       AND COALESCE(hl.ad_form->>'past_enquiry', '') <> 'true'
        AND NOT EXISTS (SELECT 1 FROM resort_pipeline rp WHERE rp.lead_id = hl.id)
        AND NOT EXISTS (SELECT 1 FROM outreach_logs ol WHERE ol.lead_id = hl.id)
      ORDER BY (hl.ad_form->>'wants_demo' = 'yes') DESC NULLS LAST,
@@ -323,6 +329,7 @@ async function sendNowForLead(leadId) {
 const QUEUE_ELIGIBLE = `
   hl.pipeline = $1 AND hl.whatsapp_number IS NOT NULL AND COALESCE(hl.ai_paused, FALSE) = FALSE
   AND hl.status NOT IN ('not_interested', 'unsubscribed', 'dead')
+  AND COALESCE(hl.ad_form->>'past_enquiry', '') <> 'true' -- past enquiries are only sent via "send a template to a group"
   AND NOT EXISTS (SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE)
   AND NOT EXISTS (SELECT 1 FROM outreach_logs u JOIN waba_templates t ON t.id = u.template_id     -- utility tried once already
                   WHERE u.lead_id = hl.id AND t.template_group = 'dreamstay_intro_utility')
@@ -335,8 +342,35 @@ async function queueEligibleCount() {
     [PIPELINE])).rows[0].n;
 }
 
-async function queueAll({ gapMinutes = 2 } = {}) {
+// Leads a send of an owner-picked template would reach: this pipeline's leads in the group, not yet in the
+// pipeline, never replied, never sent that template.
+const PICKED_ELIGIBLE = `
+  hl.pipeline = $1 AND hl.whatsapp_number IS NOT NULL AND COALESCE(hl.ai_paused, FALSE) = FALSE
+  AND hl.status NOT IN ('not_interested', 'unsubscribed', 'dead')
+  AND hl.id IN (SELECT lead_id FROM lead_group_members WHERE group_id = $2)
+  AND NOT EXISTS (SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE)
+  AND NOT EXISTS (SELECT 1 FROM outreach_logs u WHERE u.lead_id = hl.id AND u.template_id = $3)
+  AND rp.lead_id IS NULL`;
+
+async function pickedTemplate(templateId) {
+  const t = (await pool.query('SELECT * FROM waba_templates WHERE id = $1', [Number(templateId) || 0])).rows[0];
+  if (!t) throw new Error('Template not found');
+  if (t.status !== 'approved') throw new Error(`Template "${t.template_name}" is not approved by Meta yet (status: ${t.status})`);
+  return t;
+}
+
+async function previewTemplateSend({ templateId, groupId }) {
+  if (!Number(groupId)) throw new Error('Pick a group');
+  const t = await pickedTemplate(templateId);
+  const n = (await pool.query(
+    `SELECT COUNT(*)::int AS n FROM hotel_leads hl LEFT JOIN resort_pipeline rp ON rp.lead_id = hl.id WHERE ${PICKED_ELIGIBLE}`,
+    [PIPELINE, Number(groupId), t.id])).rows[0].n;
+  return { template: t.template_name, eligible: n };
+}
+
+async function queueAll({ gapMinutes = 2, templateId = null, groupId = null } = {}) {
   const gap = Math.min(Math.max(Number(gapMinutes) || 2, 1), 60);
+  if (templateId) return queuePicked({ gap, templateId, groupId });
   if (!(await utilityIntro())) {
     throw new Error('The utility template "dreamstay_enquiry_followup" is not approved by Meta as UTILITY yet — press "Check Meta" after approval');
   }
@@ -370,6 +404,27 @@ async function queueAll({ gapMinutes = 2 } = {}) {
   }
   await logAction(null, 'resort_queue_started', { leads: leads.length, gap_minutes: gap }, 'send');
   return { queued: leads.length, retries: leads.filter((l) => l.retry).length, gap_minutes: gap,
+    finishes_at: leads.length ? new Date(start + (leads.length - 1) * gap * 60000) : null };
+}
+
+// Owner-picked template to a group (e.g. Ad_replied): same paced queue, first touch uses that template.
+async function queuePicked({ gap, templateId, groupId }) {
+  if (!Number(groupId)) throw new Error('Pick a group');
+  const t = await pickedTemplate(templateId);
+  const leads = (await pool.query(
+    `SELECT hl.id FROM hotel_leads hl LEFT JOIN resort_pipeline rp ON rp.lead_id = hl.id WHERE ${PICKED_ELIGIBLE} ORDER BY hl.id`,
+    [PIPELINE, Number(groupId), t.id])).rows;
+  const lastQueued = (await pool.query(`SELECT MAX(next_touch_at) AS t FROM resort_pipeline WHERE queued AND status = 'active'`)).rows[0].t;
+  const start = Math.max(Date.now(), lastQueued ? new Date(lastQueued).getTime() + gap * 60000 : 0);
+  let i = 0;
+  for (const l of leads) {
+    await pool.query(
+      `INSERT INTO resort_pipeline (lead_id, status, queued, next_touch_at, intro_template_id) VALUES ($1, 'active', TRUE, $2, $3)
+       ON CONFLICT (lead_id) DO NOTHING`, [l.id, new Date(start + i * gap * 60000), t.id]);
+    i++;
+  }
+  await logAction(null, 'resort_queue_started', { leads: leads.length, gap_minutes: gap, template: t.template_name, group_id: Number(groupId) }, 'send');
+  return { queued: leads.length, retries: 0, gap_minutes: gap, template: t.template_name,
     finishes_at: leads.length ? new Date(start + (leads.length - 1) * gap * 60000) : null };
 }
 
@@ -423,6 +478,7 @@ async function summary() {
 }
 
 module.exports = {
+  previewTemplateSend,
   runPipeline, sendNowForLead, sendNextTouch, onReply, onSendFailed, ensureTemplates, submitTemplates,
   syncFromMeta, queueAll, cancelQueue, runQueueTick, queueStatus,
   templateStatus, summary, roleForTouch, leadVars, renderBody, loadConfig, setState, PIPELINE,
