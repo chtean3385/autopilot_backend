@@ -85,7 +85,9 @@ function normalizeRow(row) {
   const type = pick(row, 'what_best_describes_your_business?', 'what_best_describes_your_business').toLowerCase() || 'other';
   if (!whatsapp) return { error: `no valid mobile number (${phoneRaw || 'empty'})`, name: fullName };
 
-  const isBusinessName = BUSINESS_WORDS.test(fullName);
+  // An explicit business_name column (e.g. typed by the customer in a WhatsApp chat) always wins over guessing from the contact name.
+  const bizName = pick(row, 'business_name', 'hotel_name', 'property_name');
+  const isBusinessName = !bizName && BUSINESS_WORDS.test(fullName);
   const ad_form = {
     business_type: type,
     rooms: fixRooms(pick(row, 'how_many_rooms_do_you_manage?', 'how_many_rooms_do_you_manage')),
@@ -102,8 +104,8 @@ function normalizeRow(row) {
   const website = pick(row, 'website');
   return {
     lead: {
-      hotel_name: isBusinessName ? titleCase(fullName) : `${TYPE_LABEL[type] || 'Property'}${city ? ` in ${city}` : ''}`,
-      owner_name: isBusinessName ? '' : titleCase(fullName),
+      hotel_name: bizName ? bizName : isBusinessName ? titleCase(fullName) : `${TYPE_LABEL[type] || 'Property'}${city ? ` in ${city}` : ''}`,
+      owner_name: isBusinessName ? '' : titleCase(fullName).replace(/^(?=.)/, ''),
       email: pick(row, 'email').toLowerCase(),
       whatsapp_number: whatsapp,
       city,
