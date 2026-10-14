@@ -56,6 +56,9 @@ const check = (ok, label, extra = '') => { if (!ok) failures++; console.log(`${o
   // Re-import into another group: duplicates of this pipeline join that group too, nothing is added twice
   const again = await importAdLeads(csv(rows), 'x.csv', { groupId: other });
   check(again.added === 0 && again.duplicates === 3 && again.grouped === 3, 'earlier imports can be added to a group by re-importing');
+  const renamed = await importAdLeads(csv([`"Hotel Surya Palace Renamed","${p(1)}","Sikar","",""`]), 'x.csv', { groupId: g, pastEnquiry: true });
+  check(renamed.duplicates === 1 && (await pool.query('SELECT hotel_name FROM hotel_leads WHERE id = $1', [imp.rows[0].lead_id])).rows[0].hotel_name === 'Hotel Surya Palace Renamed', 'a named re-import updates the name of a lead imported earlier');
+  await pool.query(`UPDATE hotel_leads SET hotel_name = 'Hotel Surya Palace' WHERE id = $1`, [imp.rows[0].lead_id]);
   const dry = await importAdLeads(csv(rows), 'x.csv', { dryRun: true, groupId: g });
   check(dry.grouped === 0, 'dry run touches no group');
 

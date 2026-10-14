@@ -104,6 +104,7 @@ function normalizeRow(row) {
   const website = pick(row, 'website');
   return {
     lead: {
+      named: Boolean(bizName),
       hotel_name: bizName ? bizName : isBusinessName ? titleCase(fullName) : `${TYPE_LABEL[type] || 'Property'}${city ? ` in ${city}` : ''}`,
       owner_name: isBusinessName ? '' : titleCase(fullName).replace(/^(?=.)/, ''),
       email: pick(row, 'email').toLowerCase(),
@@ -151,7 +152,14 @@ async function importAdLeads(buffer, originalname, { dryRun = false, groupId = n
       [lead.whatsapp_number, lead.email])).rows[0];
     if (dup) {
       report.duplicates++;
-      if (dup.pipeline === PIPELINE) await addToGroup(dup.id);
+      if (dup.pipeline === PIPELINE) {
+        await addToGroup(dup.id);
+        // Already imported earlier (e.g. before names were known): a real business name from this file replaces the generic one.
+        if (pastEnquiry && !dryRun && lead.named) {
+          await pool.query(`UPDATE hotel_leads SET hotel_name = $2, city = COALESCE(NULLIF(city, ''), NULLIF($3, '')), updated_at = NOW() WHERE id = $1 AND pipeline = $4`,
+            [dup.id, lead.hotel_name, lead.city, PIPELINE]);
+        }
+      }
       report.rows.push({ ...label, result: 'duplicate', lead_id: dup.id, reason: dup.pipeline === PIPELINE ? 'already imported' : 'already a lead in the CRM' });
       continue;
     }
