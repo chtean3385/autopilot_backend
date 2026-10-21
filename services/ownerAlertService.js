@@ -16,6 +16,8 @@ const settingsService = require('./settingsService');
 // wrapped in fixed copy — {{1}} carries the whole alert: "<title>: <detail>".
 // Override the name in settings key OWNER_ALERT_TEMPLATE if you approve it under another name.
 async function alertOwner(title, body) {
+  // Muted 2026-10-21 (owner: no WhatsApp alert per client reply). Set OWNER_WHATSAPP_ALERTS=true to re-enable.
+  if (String(process.env.OWNER_WHATSAPP_ALERTS || '').toLowerCase() !== 'true') return { skipped: true, muted: true };
   let phone = await settingsService.getSetting('OWNER_WHATSAPP');
   if (!phone) {
     console.log('[OwnerAlert] OWNER_WHATSAPP not set (Settings → App) — skipping');

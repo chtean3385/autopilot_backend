@@ -2,6 +2,7 @@ const axios = require('axios');
 require('dotenv').config();
 const { isDryRun, dryRunResult } = require('../utils/dryRun');
 const channelHealth = require('../utils/channelHealth');
+const { isWhatsappPaused, PAUSED_RESULT } = require('../utils/waPause');
 
 // Meta error codes that mean the whole WhatsApp account can't send (token, permissions, rate/spam
 // limits, policy block, payment, account locked) — vs. one recipient (not on WhatsApp, outside the
@@ -20,6 +21,7 @@ const WABA_API_URL = `https://graph.facebook.com/${process.env.WABA_API_VERSION 
 
 class WABAService {
   static async sendTemplateMessage(recipientPhone, templateName, parameters = [], headerImageUrl = null) {
+    if (isWhatsappPaused()) return { ...PAUSED_RESULT };
     if (isDryRun()) return dryRunResult('whatsapp-template', `"${templateName}" to ${recipientPhone} params=${JSON.stringify(parameters)}`);
     try {
       const components = [];
@@ -327,6 +329,7 @@ class WABAService {
 
   // Send a template with a pre-built components array (used by sendPersonalizedTemplate)
   static async sendTemplateMessageWithComponents(recipientPhone, templateName, components, language = 'en_US') {
+    if (isWhatsappPaused()) return { ...PAUSED_RESULT };
     if (isDryRun()) return dryRunResult('whatsapp-template', `"${templateName}" to ${recipientPhone} components=${JSON.stringify(components)}`);
     try {
       const payload = {
@@ -365,6 +368,7 @@ class WABAService {
   }
 
   static async sendTextMessage(recipientPhone, text) {
+    if (isWhatsappPaused()) return { ...PAUSED_RESULT };
     if (isDryRun()) return dryRunResult('whatsapp-text', `to ${recipientPhone}: ${String(text).slice(0, 200)}`);
     try {
       const payload = {
@@ -391,6 +395,7 @@ class WABAService {
   // Image by public URL (free-form, so only inside the 24h window). Used by the Dream Stay reply agent
   // to send real product screenshots (services/resortReplyService.js).
   static async sendImageMessage(recipientPhone, imageUrl, caption = '') {
+    if (isWhatsappPaused()) return { ...PAUSED_RESULT };
     if (isDryRun()) return dryRunResult('whatsapp-image', `to ${recipientPhone}: ${imageUrl}`);
     try {
       const response = await axios.post(
