@@ -630,6 +630,11 @@ async function crawlSource(sourceId, { maxPages } = {}) {
         } else {
           const html = await fetchPage(page.url);
           if (!html) throw new Error('fetch failed or non-HTML');
+          // A tiny page with no links and no text is a challenge/stub (idbf.in served a 1.7 KB one
+          // right before it 403'd us), not a listing — count it as a refused fetch, never as "done, 0 found".
+          if (html.length < 2500 && !/<a\s[^>]*href/i.test(html) && loadClean(html)('body').text().trim().length < 40) {
+            throw new Error('empty stub page (site is challenging or blocking the crawler)');
+          }
           if (isIbpShell(html)) {
             // Members aren't in this HTML — read the JSON feed the page itself loads (see above).
             queueFeed(await queueIbpFeedPage(source, ibpFeedUrl(page.url, 1), expandOpts.maxPages));
