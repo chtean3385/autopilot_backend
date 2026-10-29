@@ -584,10 +584,13 @@ async function crawlSource(sourceId, { maxPages } = {}) {
   const limit = maxPages || await intSetting('DIRECTORY_PAGES_PER_TICK', DEFAULT_PAGES_PER_TICK);
   // 'needs_ai' = the rules didn't recognise the page and GPT was unavailable last time; retried
   // only while AI is available, so a missing/out-of-credit key never blocks rule-parsable pages.
+  // Deepest first: in link-following mode listings/pagination stay at depth 0 and the business pages
+  // they link to are depth 1 — crawling by id alone spent whole turns on listings ("found 0 businesses")
+  // while the pages that actually hold the contact details waited behind thousands of listing pages.
   const pending = await pool.query(
     `SELECT id, url, depth FROM directory_crawl_pages
      WHERE source_id=$1 AND (status='pending' OR (status='needs_ai' AND $3))
-     ORDER BY (status='pending') DESC, id LIMIT $2`,
+     ORDER BY (status='pending') DESC, COALESCE(depth, 0) DESC, id LIMIT $2`,
     [source.id, limit, isAiAvailable()]
   );
 

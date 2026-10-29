@@ -38,6 +38,7 @@ const SETTINGS_DEFS = [
   { key: 'CADENCE_NEW_EMAIL_PER_DAY', category: 'Directory Outreach', description: 'New directory leads started on email per day (default 50). Follow-ups are extra, still within sender caps' },
   { key: 'CADENCE_NEW_WA_PER_DAY', category: 'Directory Outreach', description: 'New directory leads started on WhatsApp per day (default 20 — raise slowly to protect the WhatsApp number quality rating)' },
   { key: 'CADENCE_WA_MAX_PER_DAY', category: 'Directory Outreach', description: 'Hard cap on cadence WhatsApp template sends per day, new + follow-ups (default 100)' },
+  { key: 'CADENCE_ENROLL_AFTER', category: 'Directory Outreach', description: 'ISO time (UTC), e.g. 2026-10-29T08:00:00Z. Directory leads created BEFORE this are never started or touched by the cadence (a reply still gets handled). Blank = no cutoff' },
   { key: 'CADENCE_EMAIL_TOUCHES', category: 'Directory Outreach', description: 'Emails per email block before switching to WhatsApp (default 2)' },
   { key: 'CADENCE_WA_TOUCHES', category: 'Directory Outreach', description: 'WhatsApp messages per WhatsApp block before switching to email (default 3)' },
   { key: 'CADENCE_EMAIL_GAP_DAYS', category: 'Directory Outreach', description: 'Days between email touches (default 4)' },

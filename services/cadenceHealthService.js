@@ -33,7 +33,9 @@ async function getHealth() {
 
   if (cfg.enabled) {
     const overdue = (await pool.query(
-      `SELECT COUNT(*)::int AS n FROM lead_cadence WHERE status IN ('active', 'resting') AND next_touch_at < NOW() - INTERVAL '3 hours'`)).rows[0].n;
+      `SELECT COUNT(*)::int AS n FROM lead_cadence lc WHERE lc.status IN ('active', 'resting') AND lc.next_touch_at < NOW() - INTERVAL '3 hours'
+         AND ($1::timestamp IS NULL OR EXISTS (SELECT 1 FROM hotel_leads hl WHERE hl.id = lc.lead_id AND hl.created_at >= $1::timestamp))`,
+      [cfg.enrollAfter])).rows[0].n;
     const window = await isWithinSendWindow();
     if (overdue > 0 && window.allowed) warn('error', 'sending', `${overdue} cadence touch(es) overdue by 3+ hours inside the send window — sending may be stuck (check Brevo authorised IPs, sender caps, pm2 logs)`);
 

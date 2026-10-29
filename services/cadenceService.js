@@ -40,6 +40,8 @@ async function num(key, fallback, { allowZero = false } = {}) {
 async function loadConfig() {
   const restRaw = (await settingsService.getSetting('CADENCE_REST_DAYS')) || '';
   const rest = restRaw.split(',').map((d) => Number.parseInt(d, 10)).filter((d) => d > 0);
+  const enrollAfterRaw = String((await settingsService.getSetting('CADENCE_ENROLL_AFTER')) || '').trim();
+  const enrollAfter = enrollAfterRaw && !Number.isNaN(new Date(enrollAfterRaw).getTime()) ? new Date(enrollAfterRaw).toISOString() : null;
   return {
     enabled: String(await settingsService.getSetting('CADENCE_ENABLED') || '').toLowerCase() === 'true',
     emailTouches: await num('CADENCE_EMAIL_TOUCHES', DEFAULTS.emailTouches),
@@ -51,6 +53,10 @@ async function loadConfig() {
     newEmailPerDay: await num('CADENCE_NEW_EMAIL_PER_DAY', DEFAULTS.newEmailPerDay, { allowZero: true }),
     newWaPerDay: await num('CADENCE_NEW_WA_PER_DAY', DEFAULTS.newWaPerDay, { allowZero: true }),
     waMaxPerDay: await num('CADENCE_WA_MAX_PER_DAY', DEFAULTS.waMaxPerDay, { allowZero: true }),
+    // CADENCE_ENROLL_AFTER (ISO time, UTC): leads created before it are never started or touched by the
+    // cadence (owner 2026-10-29: restart WhatsApp for new leads only). A reply still reaches them via
+    // cadenceReplyService — this only gates the outbound tick. Blank = no cutoff.
+    enrollAfter,
     emailOnlyIfVerified: String(await settingsService.getSetting('CADENCE_EMAIL_ONLY_IF_VERIFIED') ?? '').trim().toLowerCase() !== 'false',
   };
 }
@@ -201,9 +207,10 @@ async function enrollNewLeads(cfg) {
        -- a mobile or an email (verified now or pending) — leads with neither (landline/website only)
        -- must not fill this window ahead of contactable ones
        AND (hl.whatsapp_number ~ '^91[6-9][0-9]{9}$' OR COALESCE(TRIM(hl.email), '') <> '')
+       AND ($2::timestamp IS NULL OR hl.created_at >= $2::timestamp)
      ORDER BY hl.lead_score DESC, hl.id -- hot leads (most complete contact data) start first
      LIMIT $1`,
-    [(remaining.email + remaining.whatsapp) * 3]
+    [(remaining.email + remaining.whatsapp) * 3, cfg.enrollAfter]
   );
 
   const out = { enrolled: 0, email: 0, whatsapp: 0, waitingForVerification: 0 };
@@ -443,9 +450,10 @@ async function runCadence(trigger = 'cron') {
     stats.intake = await enrollNewLeads(cfg);
     const budget = { wa: Math.max(0, cfg.waMaxPerDay - (await waSentToday())) };
     const { rows } = await pool.query(
-      `SELECT * FROM lead_cadence WHERE status IN ('active', 'resting') AND next_touch_at <= NOW()
-       ORDER BY (total_touches = 0) DESC, next_touch_at ASC LIMIT $1`,
-      [TICK_LIMIT]
+      `SELECT lc.* FROM lead_cadence lc WHERE lc.status IN ('active', 'resting') AND lc.next_touch_at <= NOW()
+         AND ($2::timestamp IS NULL OR EXISTS (SELECT 1 FROM hotel_leads hl WHERE hl.id = lc.lead_id AND hl.created_at >= $2::timestamp))
+       ORDER BY (lc.total_touches = 0) DESC, lc.next_touch_at ASC LIMIT $1`,
+      [TICK_LIMIT, cfg.enrollAfter]
     );
     stats.due = rows.length;
     for (const row of rows) {
