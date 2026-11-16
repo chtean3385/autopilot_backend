@@ -452,8 +452,12 @@ async function runCadence(trigger = 'cron') {
     const { rows } = await pool.query(
       `SELECT lc.* FROM lead_cadence lc WHERE lc.status IN ('active', 'resting') AND lc.next_touch_at <= NOW()
          AND ($2::timestamp IS NULL OR EXISTS (SELECT 1 FROM hotel_leads hl WHERE hl.id = lc.lead_id AND hl.created_at >= $2::timestamp))
+         -- Once today's WhatsApp budget is spent, WhatsApp-channel leads can only be deferred (12h) — don't let
+         -- them eat the tick's slots ahead of the email-channel leads that CAN be sent now (2026-11-16: 255 due
+         -- WhatsApp leads queued ahead of 114 due emails kept the whole 40-slot tick busy deferring).
+         AND ($3::int > 0 OR lc.current_channel <> 'whatsapp')
        ORDER BY (lc.total_touches = 0) DESC, lc.next_touch_at ASC LIMIT $1`,
-      [TICK_LIMIT, cfg.enrollAfter]
+      [TICK_LIMIT, cfg.enrollAfter, budget.wa]
     );
     stats.due = rows.length;
     for (const row of rows) {
