@@ -3,6 +3,7 @@ require('dotenv').config();
 const { isDryRun, dryRunResult } = require('../utils/dryRun');
 const channelHealth = require('../utils/channelHealth');
 const { isWhatsappPaused, PAUSED_RESULT } = require('../utils/waPause');
+const pool = require('../config/db');
 
 // Meta error codes that mean the whole WhatsApp account can't send (token, permissions, rate/spam
 // limits, policy block, payment, account locked) — vs. one recipient (not on WhatsApp, outside the
@@ -367,9 +368,46 @@ class WABAService {
     }
   }
 
+  // Meta's 24h customer service window: free-form (non-template) messages are only allowed within 24h
+  // of the lead's LAST inbound message; otherwise Meta accepts the call, then fails delivery with error
+  // 131047 "Re-engagement message" (seen 2026-11: AI replies sent to leads who last wrote 10 days
+  // earlier, e.g. after the OpenAI key outage). → { known, open }. `known` = the number belongs to a
+  // lead (the owner's own number or other non-leads are never blocked here). Fails open on DB error.
+  static async serviceWindow(phone) {
+    try {
+      const digits = String(phone || '').replace(/\D/g, '');
+      if (digits.length < 10) return { known: false, open: true };
+      const { rows } = await pool.query(
+        `SELECT COUNT(*)::int AS leads,
+                COALESCE(BOOL_OR(last_inbound_at > NOW() - INTERVAL '24 hours'), FALSE) AS open
+           FROM hotel_leads
+          WHERE RIGHT(REGEXP_REPLACE(COALESCE(whatsapp_number, ''), '[^0-9]', '', 'g'), 10) = $1`,
+        [digits.slice(-10)]
+      );
+      const known = rows[0].leads > 0;
+      return { known, open: known ? rows[0].open : true };
+    } catch (err) {
+      console.error('[WABA] serviceWindow check failed (allowing send):', err.message);
+      return { known: false, open: true };
+    }
+  }
+
+  static async windowClosedResult(recipientPhone, kind) {
+    const w = await WABAService.serviceWindow(recipientPhone);
+    if (w.known && !w.open) {
+      return {
+        success: false, windowClosed: true,
+        error: `WhatsApp 24h window closed — this lead hasn't messaged in the last 24 hours, so a free-form ${kind} isn't allowed (send an approved template, or wait for them to write again)`,
+      };
+    }
+    return null;
+  }
+
   static async sendTextMessage(recipientPhone, text) {
     if (isWhatsappPaused()) return { ...PAUSED_RESULT };
     if (isDryRun()) return dryRunResult('whatsapp-text', `to ${recipientPhone}: ${String(text).slice(0, 200)}`);
+    const closed = await WABAService.windowClosedResult(recipientPhone, 'message');
+    if (closed) return closed; // never call Meta for a message it will reject; not a channel failure
     try {
       const payload = {
         messaging_product: 'whatsapp',
@@ -397,6 +435,8 @@ class WABAService {
   static async sendImageMessage(recipientPhone, imageUrl, caption = '') {
     if (isWhatsappPaused()) return { ...PAUSED_RESULT };
     if (isDryRun()) return dryRunResult('whatsapp-image', `to ${recipientPhone}: ${imageUrl}`);
+    const closed = await WABAService.windowClosedResult(recipientPhone, 'image');
+    if (closed) return closed;
     try {
       const response = await axios.post(
         `${WABA_API_URL}/${process.env.WABA_PHONE_ID}/messages`,

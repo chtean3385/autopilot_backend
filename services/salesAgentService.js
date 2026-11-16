@@ -442,6 +442,14 @@ async function handleReply(lead, incomingText) {
   }
 
   const sent = await WABAService.sendTextMessage(lead.whatsapp_number, result.text);
+  if (sent.windowClosed) {
+    // Their last message is >24h old (e.g. a reply processed late after an outage): Meta only allows an
+    // approved template now, so a free-form reply would fail with 131047. Hand it to a human instead.
+    await markNeedsAttention(lead.id, 'Replied over 24h ago — WhatsApp only allows a template now; reply when they write again or send a template');
+    await logAgentAction(lead.id, 'whatsapp_window_closed', { detail: { intent, gate }, draftText: result.text, decision: 'queue_human' });
+    await notifyOwner(lead, incomingText, 'Reply not sent — their 24h WhatsApp window has closed');
+    return { skipped: false, queued: true, reason: 'window_closed' };
+  }
   if (!sent.success) throw new Error(sent.error || 'Could not send sales reply');
   await pool.query(`INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
     SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, result.text]);

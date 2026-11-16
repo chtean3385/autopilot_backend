@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS hotel_leads (
     needs_attention BOOLEAN DEFAULT FALSE, -- flagged for a human's eyes; surfaced in the Inbox "Needs Attention" filter (does NOT by itself silence the AI)
     needs_attention_reason TEXT, -- why (e.g. "Asked for a callback", "Pricing question", "Qualified for demo")
     ai_paused BOOLEAN DEFAULT FALSE, -- a human explicitly took over (Inbox "Take over"); the AI stays silent until "Return to AI"
+    last_inbound_at TIMESTAMP, -- last WhatsApp message FROM the lead; free-form replies are only allowed within 24h of it (migrate_last_inbound_at.sql)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

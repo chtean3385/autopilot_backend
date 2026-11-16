@@ -162,6 +162,10 @@ router.post('/whatsapp', async (req, res) => {
 
             const leadId = leadResult.rows[0].id;
 
+            // They just messaged us → Meta's 24h free-form window is open again (WABAService.serviceWindow).
+            await pool.query(`UPDATE hotel_leads SET last_inbound_at = NOW() WHERE id = $1`, [leadId])
+              .catch((e) => console.error('[Webhook] last_inbound_at update failed:', e.message));
+
             // Opt-out detection — mark and never contact again
             // Fix 7: include Unicode right-single-quote (U+2019) that mobile keyboards produce
             const isOptOut = /\bstop\b|not\s+interested|opt.?out|unsubscribe|no\s+thanks|don[’']t\s+contact|do\s+not\s+contact|remove\s+me|hatao|band\s+karo|nahi\s+chahiye/i.test(msgText);

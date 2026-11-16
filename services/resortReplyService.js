@@ -184,6 +184,12 @@ async function handleResortReply(lead, incomingText) {
     .catch((e) => { console.error('[ResortReply] extract failed:', e.message); return { image: null, demo: null }; });
 
   const sent = await WABAService.sendTextMessage(lead.whatsapp_number, result.text);
+  if (sent.windowClosed) {
+    await agentSvc.markNeedsAttention(lead.id, 'Replied over 24h ago — WhatsApp only allows a template now; reply when they write again or send a template');
+    await agentSvc.logAgentAction(lead.id, 'whatsapp_window_closed', { detail: { gate, pipeline: 'resort_crm' }, draftText: result.text, decision: 'queue_human' });
+    await agentSvc.notifyOwner(lead, incomingText, 'Dream Stay lead — reply not sent, their 24h WhatsApp window has closed');
+    return { queued: true, reason: 'window_closed' };
+  }
   if (!sent.success) throw new Error(sent.error || 'Could not send Dream Stay reply');
   await logOut(lead.id, 'reply', sent.messageId, result.text);
   await agentSvc.saveMemory(lead.id, agent.id, { ...memory, ...meta.memory, current_stage: meta.memory?.current_stage || memory.current_stage || 'engage' });

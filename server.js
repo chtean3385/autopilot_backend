@@ -640,6 +640,17 @@ async function initDB() {
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS call_reason TEXT;
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS call_done_at TIMESTAMP;
     CREATE INDEX IF NOT EXISTS idx_leads_call_needed ON hotel_leads(call_needed_at) WHERE call_done_at IS NULL;
+    -- WhatsApp 24h service window (migrate_last_inbound_at.sql): when the lead last messaged us.
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'hotel_leads' AND column_name = 'last_inbound_at') THEN
+        ALTER TABLE hotel_leads ADD COLUMN last_inbound_at TIMESTAMP;
+        UPDATE hotel_leads l SET last_inbound_at = x.last_in
+          FROM (SELECT lead_id, MAX(response_received_at) AS last_in FROM outreach_logs
+                WHERE response_received = TRUE GROUP BY lead_id) x
+          WHERE x.lead_id = l.id;
+      END IF;
+    END $$;
   `);
   console.log('✅ Database tables ready');
 }
