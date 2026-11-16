@@ -24,6 +24,7 @@ const fail = (status, data) => async () => { const e = new Error(`HTTP ${status}
 
 const pool = require('../config/db');
 const channelHealth = require('../utils/channelHealth');
+require('../utils/aiUsage').probeKey = async () => ({ ok: true }); // sendUrgentAlert's OpenAI key probe is a real network call
 const { getHealth, sendUrgentAlert } = require('../services/cadenceHealthService');
 const EmailSenderService = require('../services/emailSenderService');
 const WABAService = require('../services/wabaService');
@@ -43,6 +44,12 @@ const tag = `t${Date.now()}`;
   await pool.query(`DELETE FROM settings WHERE key IN ('HEALTH_LAST_URGENT_ALERT', 'VERIFIER_API_KEY')`);
   await pool.query(`UPDATE email_senders SET status = 'paused'`); // only the sender below counts
   channelHealth._reset();
+  // 2-day stall detector (2026-11-16) flags a quiet system; this test is about specific failures,
+  // so seed fresh activity in every area first and remove it at the end.
+  const seedTag = `seed${Date.now()}`;
+  await pool.query(`INSERT INTO email_logs (direction, subject, body, sent_at) VALUES ('out', $1, 'b', NOW())`, [seedTag]);
+  await pool.query(`INSERT INTO outreach_logs (message_type, sent_at) VALUES ('test_seed', NOW())`);
+  await pool.query(`INSERT INTO ai_usage_logs (purpose, model) VALUES ('test_seed', 'x')`);
 
   // ── email channel ──────────────────────────────────────────────────────────
   const sender = (await pool.query(
@@ -141,6 +148,9 @@ const tag = `t${Date.now()}`;
   await pool.query(`DELETE FROM email_senders WHERE id = $1`, [sender.id]);
   await pool.query(`DELETE FROM settings WHERE key IN ('HEALTH_LAST_URGENT_ALERT', 'VERIFIER_API_KEY')`);
 
+  await pool.query(`DELETE FROM email_logs WHERE subject = $1`, [seedTag]);
+  await pool.query(`DELETE FROM outreach_logs WHERE message_type = 'test_seed'`);
+  await pool.query(`DELETE FROM ai_usage_logs WHERE purpose = 'test_seed'`);
   console.log(failures ? `\n${failures} FAILED` : '\nALL PASSED');
   process.exit(failures ? 1 : 0);
 })().catch((err) => { console.error(err); process.exit(1); });

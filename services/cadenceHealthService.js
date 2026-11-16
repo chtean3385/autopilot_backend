@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const { alertOwner } = require('./ownerAlertService');
-const { isAiAvailable } = require('../utils/aiUsage');
+const aiUsage = require('../utils/aiUsage');
+const { isAiAvailable } = aiUsage;
 const { isWithinSendWindow } = require('../utils/sendWindow');
 const { loadConfig } = require('./cadenceService');
 const settingsService = require('./settingsService');
@@ -13,9 +14,9 @@ const channelHealth = require('../utils/channelHealth');
 async function getHealth() {
   const cfg = await loadConfig();
   const warnings = [];
-  const warn = (level, area, message) => warnings.push({ level, area, message });
+  const warn = (level, area, message, kind) => warnings.push({ level, area, message, ...(kind ? { kind } : {}) });
 
-  await systemChecks(warn);
+  await systemChecks(warn, warnings);
 
   const failedSources = (await pool.query(
     `SELECT name, url, last_error FROM directory_sources WHERE status = 'failed'`)).rows;
@@ -28,7 +29,6 @@ async function getHealth() {
   for (const s of stuckSources) warn('warn', 'directory', `Approved source not crawled for over a day: ${s.name || s.url}`);
 
   const needsAi = (await pool.query(`SELECT COUNT(*)::int AS n FROM directory_crawl_pages WHERE status = 'needs_ai'`)).rows[0].n;
-  if (!isAiAvailable()) warn('error', 'ai', 'OpenAI is out of credit or over the monthly budget — reply drafts, GPT page extraction and template drafts are paused');
   if (needsAi > 0) warn('warn', 'ai', `${needsAi} directory page(s) are waiting for AI extraction (no credit when they were crawled)`);
 
   if (cfg.enabled) {
@@ -80,8 +80,23 @@ const since = (iso) => {
   return h < 1 ? 'under an hour' : h < 48 ? `${Math.round(h)} hours` : `${Math.round(h / 24)} days`;
 };
 
-async function systemChecks(warn) {
+const STALL_HOURS = 48;
+
+async function systemChecks(warn, warnings) {
   const ch = await channelHealth.getAll();
+
+  // OpenAI: expired/invalid key or out of credit (recorded by utils/aiUsage.js on the failed call, or by
+  // the hourly free key probe). Everything that writes — cold emails, WhatsApp replies — dies with it.
+  const aiFailing = channelHealth.isFailing(ch.openai) && ago(ch.openai.lastErrorAt) < 48 * HOUR;
+  if (aiFailing || !isAiAvailable()) {
+    const err = ch.openai?.lastError || '';
+    const what = /expired|invalid|incorrect api key|401|no openai_api_key|403/i.test(err)
+      ? 'OpenAI API key is expired or invalid — create a new key at platform.openai.com and paste it in Settings → OPENAI_API_KEY'
+      : /monthly budget/i.test(err)
+        ? 'OpenAI monthly budget cap reached — raise OPENAI_MONTHLY_BUDGET_USD in Settings'
+        : 'OpenAI is out of credit — add credit at platform.openai.com → Billing';
+    warn('error', 'ai', `${what}. Until fixed NO email can be written, and WhatsApp replies, follow-up picking and page extraction are all stopped${err ? ` (${err.slice(0, 90)})` : ''}`);
+  }
 
   if (channelHealth.isFailing(ch.email) && ago(ch.email.lastErrorAt) < 48 * HOUR) {
     warn('error', 'email', `Email sending is failing (last success ${ch.email.lastOkAt ? since(ch.email.lastOkAt) + ' ago' : 'never'}): ${ch.email.lastError} — check Brevo → Security → Authorised IPs, the sender's API key and Brevo credit`);
@@ -126,6 +141,34 @@ async function systemChecks(warn) {
     warn('error', 'verification', `Email verification (mails.so) is failing: ${ch.verifier.lastError}. ${waiting} lead(s) wait to be verified before they can be emailed — top up mails.so; they're retried every hour, nothing is lost`);
   }
 
+  // 2-day stall detector (owner request 2026-11-16): the checks above only fire on a recorded
+  // *failure*. A part of the system that simply stops doing anything (nothing enrolled, nothing
+  // crawled, a key that died quietly) records nothing — so also flag any area that has been silent
+  // for STALL_HOURS even though it has run before. Reported once per area, skipped when that area
+  // already has a more specific error above.
+  const hasErr = (area) => warnings.some((w) => w.area === area && w.level === 'error');
+  const stall = (await pool.query(
+    `SELECT
+       (SELECT MAX(sent_at) FROM email_logs WHERE direction = 'out' AND error IS NULL) AS email,
+       (SELECT MAX(sent_at) FROM outreach_logs) AS whatsapp,
+       (SELECT MAX(created_at) FROM ai_usage_logs) AS ai,
+       (SELECT MAX(created_at) FROM hotel_leads) AS leads`
+  )).rows[0];
+  const stalled = (iso) => iso && ago(iso.toISOString ? iso.toISOString() : iso) > STALL_HOURS * HOUR;
+  const stallMsg = (name, iso, hint) => `No ${name} for ${since(iso.toISOString ? iso.toISOString() : iso)} (last: ${new Date(iso).toISOString().slice(0, 10)}) — ${hint}`;
+  if (stalled(stall.email) && !hasErr('email')) {
+    warn('error', 'email', stallMsg('email sent', stall.email, 'check that leads are enrolled in a sequence/cadence, a sender is active and not at its cap, and OpenAI works (it writes every email)'), 'stall');
+  }
+  if (stalled(stall.whatsapp) && !hasErr('whatsapp')) {
+    warn('error', 'whatsapp', stallMsg('WhatsApp message sent', stall.whatsapp, 'check follow-ups/cadence are running and the WABA token and templates are fine'), 'stall');
+  }
+  if (stalled(stall.ai) && !hasErr('ai')) {
+    warn('error', 'ai', stallMsg('successful AI (OpenAI) call', stall.ai, 'drafting and email writing may be dead — check the OpenAI key in Settings'), 'stall');
+  }
+  if (stalled(stall.leads)) {
+    warn('warn', 'leads', stallMsg('new leads added', stall.leads, 'lead sources/crawls may have stopped (Lead Sources page)'), 'stall');
+  }
+
   const stuckCampaigns = (await pool.query(
     `SELECT campaign_name FROM campaigns WHERE status = 'scheduled' AND scheduled_end < NOW()`)).rows;
   if (stuckCampaigns.length) {
@@ -137,13 +180,16 @@ async function systemChecks(warn) {
 // waiting for the 18:30 daily round-up. The same problem isn't repeated within 6 hours.
 const URGENT_REPEAT_MS = 6 * HOUR;
 async function sendUrgentAlert() {
+  await aiUsage.probeKey(); // free: catches an expired OpenAI key even when nothing is calling GPT
   const health = await getHealth();
   const errors = health.warnings.filter((w) => w.level === 'error');
   if (!errors.length) return { sent: false };
   const key = errors.map((w) => w.area).sort().join(',');
   let last = {};
   try { last = JSON.parse((await settingsService.getSetting('HEALTH_LAST_URGENT_ALERT')) || '{}'); } catch { /* first run */ }
-  if (last.key === key && Date.now() - (last.at || 0) < URGENT_REPEAT_MS) return { sent: false, repeat: true };
+  // A pure "nothing happened for 2 days" stall is a slow-burn reminder, not a fresh outage: repeat daily, not every 6h.
+  const repeatMs = errors.every((w) => w.kind === 'stall') ? 24 * HOUR : URGENT_REPEAT_MS;
+  if (last.key === key && Date.now() - (last.at || 0) < repeatMs) return { sent: false, repeat: true };
   await alertOwner('CRM problem — needs you', errors.slice(0, 3).map((w) => w.message).join(' | '));
   await settingsService.setSetting('HEALTH_LAST_URGENT_ALERT', JSON.stringify({ key, at: Date.now() }));
   return { sent: true, count: errors.length };

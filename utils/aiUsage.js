@@ -77,6 +77,28 @@ function isBillingError(err) {
     (err?.status === 429 && /credits|quota|billing/i.test(err?.message || ''));
 }
 
+// An expired / revoked / wrong key (401, or 403 "not allowed") is the same kind of account-level
+// outage as running out of credit: every GPT call fails, for every lead. It was NOT recognised
+// before 2026-11-16 (only 429 billing errors were), so an expired key killed email, WhatsApp
+// replies and template picking for 10 days with no warning anywhere.
+function isAuthError(err) {
+  return err?.code === 'invalid_api_key' || err?.status === 401 ||
+    (err?.status === 403 && /api key|permission|not allowed|organization/i.test(err?.message || ''));
+}
+
+function isAiOutageError(err) {
+  return isBillingError(err) || isAuthError(err);
+}
+
+// Persisted (scheduler_status 'health:openai', via utils/channelHealth) so the banner and the owner
+// alert survive restarts and don't expire after the 15-minute in-memory cooldown above.
+function recordOutcome(err) {
+  const channelHealth = require('./channelHealth');
+  if (!err) return channelHealth.markOk('openai');
+  if (isAiOutageError(err)) return channelHealth.markError('openai', `${err.status || err.code || ''} ${err.message || ''}`.trim());
+  return null; // a timeout / bad-JSON / one-off error is not an account outage
+}
+
 function isAiAvailable() {
   return Date.now() >= aiUnavailableUntil;
 }
@@ -94,10 +116,12 @@ async function trackedCompletion(client, params, { purpose, leadId = null } = {}
     if (liveKey && client.apiKey !== liveKey) client.apiKey = liveKey;
     response = await client.chat.completions.create(params);
   } catch (err) {
-    if (isBillingError(err)) aiUnavailableUntil = Date.now() + AI_UNAVAILABLE_COOLDOWN_MS;
+    if (isAiOutageError(err)) aiUnavailableUntil = Date.now() + AI_UNAVAILABLE_COOLDOWN_MS;
+    await recordOutcome(err);
     throw err;
   }
   aiUnavailableUntil = 0;
+  await recordOutcome(null);
   const durationMs = Date.now() - t0;
 
   try {
@@ -125,4 +149,22 @@ async function trackedCompletion(client, params, { purpose, leadId = null } = {}
   return response;
 }
 
-module.exports = { trackedCompletion, computeCost, PRICING, isAiAvailable };
+// Free key-validity check (lists models — no tokens, no cost). Run hourly by the health alert so an
+// expired key is caught even when nothing is calling GPT. Credit exhaustion can't be seen this way
+// (only a real completion shows it), but trackedCompletion records that on the first failed call.
+async function probeKey() {
+  try {
+    const OpenAI = require('openai');
+    const { getSetting } = require('../services/settingsService');
+    const key = (await getSetting('OPENAI_API_KEY')) || process.env.OPENAI_API_KEY;
+    if (!key) { await require('./channelHealth').markError('openai', 'No OPENAI_API_KEY is set'); return { ok: false, error: 'no key' }; }
+    await new OpenAI({ apiKey: key }).models.list();
+    await recordOutcome(null);
+    return { ok: true };
+  } catch (err) {
+    await recordOutcome(err);
+    return { ok: !isAiOutageError(err), error: err.message };
+  }
+}
+
+module.exports = { trackedCompletion, computeCost, PRICING, isAiAvailable, isAiOutageError, probeKey };
