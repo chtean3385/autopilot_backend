@@ -85,7 +85,7 @@ async function getPipeline() {
       WHERE hl.status = 'new' AND hl.needs_attention = FALSE AND hl.cadence_managed = FALSE AND hl.pipeline IS NULL
         AND hl.whatsapp_number IS NOT NULL
         AND EXISTS (SELECT 1 FROM outreach_logs ol WHERE ol.lead_id = hl.id)
-        AND NOT EXISTS (SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE)`),
+        AND NOT EXISTS (SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE AND r.is_auto_reply IS NOT TRUE)`),
     one(`
       SELECT COUNT(*) FILTER (WHERE status = 'scheduled' AND scheduled_start <= NOW() AND scheduled_end > NOW())::int AS live,
              COUNT(*) FILTER (WHERE status = 'scheduled' AND scheduled_start > NOW())::int AS upcoming,

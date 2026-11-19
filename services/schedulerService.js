@@ -1066,6 +1066,7 @@ async function runFollowUps(trigger = 'cron') {
           AND hl.whatsapp_number IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM outreach_logs r WHERE r.lead_id = hl.id AND r.response_received = TRUE
+              AND r.is_auto_reply IS NOT TRUE -- their WhatsApp Business bot isn't a reply
           )
         GROUP BY hl.id
         HAVING MAX(ol.sent_at) <= NOW() - INTERVAL '2 days'

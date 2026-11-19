@@ -38,7 +38,7 @@ router.get('/', async (req, res) => {
         SELECT ol.lead_id, COUNT(*) AS unread_count
         FROM outreach_logs ol
         JOIN hotel_leads hl ON hl.id = ol.lead_id
-        WHERE ol.response_received = true
+        WHERE ol.response_received = true AND ol.is_auto_reply IS NOT TRUE
           AND ol.response_received_at > COALESCE(hl.inbox_last_read_at, '-infinity'::timestamp)
         GROUP BY ol.lead_id
       )
@@ -265,7 +265,7 @@ router.get('/count', async (req, res) => {
       SELECT COUNT(DISTINCT ol.lead_id) AS count
       FROM outreach_logs ol
       JOIN hotel_leads hl ON hl.id = ol.lead_id
-      WHERE ol.response_received = true
+      WHERE ol.response_received = true AND ol.is_auto_reply IS NOT TRUE
         AND ol.response_received_at > COALESCE(hl.inbox_last_read_at, '-infinity'::timestamp)
         AND hl.archived_at IS NULL
     `);

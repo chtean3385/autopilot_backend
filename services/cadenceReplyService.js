@@ -6,7 +6,7 @@ const WABAService = require('./wabaService');
 const settingsService = require('./settingsService');
 const { sendOrQueueReply, logAgentAction } = require('./replyDeliveryService');
 const { alertOwner } = require('./ownerAlertService');
-const { classifyReplyIntent, tooSimilarToPrior } = require('./salesAgentService');
+const { classifyReplyIntent, tooSimilarToPrior, markAutoReply } = require('./salesAgentService');
 const { escapeHtml } = require('../utils/emailRender');
 const { WRITING_RULES } = require('../utils/humanTone');
 
@@ -48,7 +48,7 @@ async function getCrossChannelHistory(leadId) {
        FROM outreach_logs ol LEFT JOIN waba_templates wt ON wt.id = ol.template_id WHERE ol.lead_id = $1
        UNION ALL
        SELECT 'whatsapp', 'in', ol.response_text, COALESCE(ol.response_received_at, ol.sent_at)
-       FROM outreach_logs ol WHERE ol.lead_id = $1 AND ol.response_text IS NOT NULL
+       FROM outreach_logs ol WHERE ol.lead_id = $1 AND ol.response_text IS NOT NULL AND ol.is_auto_reply IS NOT TRUE
      ) h WHERE body IS NOT NULL AND body <> ''
      ORDER BY at ASC
      LIMIT 30`,
@@ -135,6 +135,8 @@ async function handleCadenceReply({ lead, channel, text, subject = null, message
   const { gate, reason } = await classifyReplyIntent({ lead: fresh, message, conversationHistory: history, channel });
 
   if (gate === 'AUTO_REPLY') {
+    // Cadence keeps running (no stopCadence); on WhatsApp also hide it from history/unread/follow-up checks.
+    if (channel === 'whatsapp') await markAutoReply(fresh.id);
     await logAgentAction(fresh.id, 'cadence_auto_reply_ignored', { detail: { channel, message: preview }, decision: 'ignored' });
     return 'auto_reply';
   }

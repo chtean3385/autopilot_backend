@@ -201,7 +201,8 @@ router.post('/whatsapp', async (req, res) => {
               `UPDATE outreach_logs
                SET response_received = true,
                    response_text = $1,
-                   response_received_at = NOW()
+                   response_received_at = NOW(),
+                   is_auto_reply = FALSE -- re-decided by the agent's gate for this new message
                WHERE id = (
                  SELECT id FROM outreach_logs WHERE lead_id = $2
                  ORDER BY sent_at DESC LIMIT 1

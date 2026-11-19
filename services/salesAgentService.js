@@ -160,7 +160,8 @@ function buildContext({ lead, campaign, memory, intent, stage, knowledge, handof
 const HISTORY_LIMIT = 20;
 async function getConversationHistory(leadId) {
   const result = await pool.query(
-    `SELECT COALESCE(ol.message_text, wt.body_text) AS out_text, ol.response_text
+    `SELECT COALESCE(ol.message_text, wt.body_text) AS out_text,
+            CASE WHEN ol.is_auto_reply THEN NULL ELSE ol.response_text END AS response_text
      FROM outreach_logs ol
      LEFT JOIN waba_templates wt ON wt.id = ol.template_id
      WHERE ol.lead_id = $1
@@ -293,18 +294,76 @@ function detectHandoffReason(message) {
   return null;
 }
 
+// A business's own WhatsApp Business greeting/away bot ("Greetings from X", "Welcome to X",
+// "Thank you for contacting X", a menu / "share these details" form). Owner rule 2026-11-19:
+// these are never a real reply — never flag them, never answer them. The regex catches the
+// obvious openers for free; the GPT gate's AUTO_REPLY catches the rest. A message that also
+// says no/stop is left to the gate so an opt-out is never swallowed.
+const AUTO_REPLY_RE = new RegExp([
+  String.raw`\bgreetings\s+from\b`,
+  String.raw`\bwelcome\s+to\s+(?!call|send|contact|share|visit|reach|message|whatsapp|email)`,
+  String.raw`\bthanks?(\s+you)?\s+(so\s+much\s+)?for\s+(contacting|reaching\s+out|connecting\s+with|choosing|messaging|your\s+(message|enquiry|inquiry|interest))`,
+  String.raw`\bwe\s+(have\s+)?received\s+your\s+(message|enquiry|inquiry|query)`,
+  String.raw`\b(we|our\s+team|our\s+executive|someone)\s+(will|'ll|shall)\s+(get\s+back|contact\s+you|respond|reply|revert|connect\s+with\s+you)`,
+  String.raw`\b(currently|presently)\s+(unavailable|closed|away|not\s+available|out\s+of\s+office)`,
+  String.raw`\bthis\s+is\s+an?\s+(automated|auto[-\s]?generated|auto)\b`,
+].join('|'), 'i');
+const OPT_OUT_RE = /\b(not\s+interested|stop|unsubscribe|don'?t\s+(message|contact|call)|remove\s+(me|my\s+number))\b/i;
+function looksLikeAutoReply(message) {
+  const text = String(message || '');
+  return AUTO_REPLY_RE.test(text) && !OPT_OUT_RE.test(text);
+}
+
+// Flags that were raised only because an auto-reply confused the old gate — cleared once we know
+// the message was a bot, so the lead drops out of Needs Attention by itself.
+const AUTO_REPLY_FLAG_REASONS = [
+  'AI could not understand — please reply',
+  'AI could not understand the reply',
+  'AI would only repeat itself — needs a human',
+  'AI has nothing new to add — needs a human',
+];
+
+// Marks the latest inbound on this lead as the business's auto-responder: hidden from the AI's
+// history, not counted as unread, never a "reply" for follow-ups. webhook.js already moved the lead
+// to 'responded'; undo that when this is the only kind of "reply" they've sent and we never
+// answered them, so the normal follow-up cadence still reaches a human.
+async function markAutoReply(leadId) {
+  await pool.query(
+    `UPDATE outreach_logs SET is_auto_reply = TRUE
+     WHERE id = (SELECT id FROM outreach_logs WHERE lead_id = $1 AND response_received = TRUE
+                 ORDER BY response_received_at DESC NULLS LAST LIMIT 1)`,
+    [leadId]
+  );
+  await pool.query(
+    `UPDATE hotel_leads SET status = 'new', updated_at = NOW()
+     WHERE id = $1 AND status = 'responded'
+       AND NOT EXISTS (SELECT 1 FROM outreach_logs r WHERE r.lead_id = $1 AND r.response_received = TRUE AND r.is_auto_reply IS NOT TRUE)
+       AND NOT EXISTS (SELECT 1 FROM outreach_logs r WHERE r.lead_id = $1 AND r.message_type = 'reply')`,
+    [leadId]
+  );
+  await pool.query(
+    `UPDATE hotel_leads SET needs_attention = FALSE, needs_attention_reason = NULL, updated_at = NOW()
+     WHERE id = $1 AND needs_attention = TRUE AND needs_attention_reason = ANY($2)`,
+    [leadId, AUTO_REPLY_FLAG_REASONS]
+  );
+}
+
 // Fixed, always-on safety gate — one cheap GPT call that decides what to DO with an inbound
 // reply BEFORE any draft is attempted. Separate from detectIntent() (which classifies against
 // the agent's own configured funnel intents for stage/knowledge selection); this rubric never
 // depends on per-agent configuration. The AI still replies on HANDOFF — the customer is never
 // left waiting — but the lead also surfaces for a human and the owner is pinged.
 const REPLY_GATES = ['HANDOFF', 'NOT_INTERESTED', 'UNSURE', 'ROUTINE', 'AUTO_REPLY'];
-// channel 'email' (directory cadence replies, cadenceReplyService.js) reuses the same rubric for
-// email and adds AUTO_REPLY (out-of-office responders aren't a real reply). WhatsApp unchanged.
+// AUTO_REPLY (both channels): the business's own bot — email out-of-office, or a WhatsApp Business
+// greeting/away message. Never flagged, never answered.
 async function classifyReplyIntent({ lead, message, conversationHistory, channel = 'whatsapp' }) {
+  if (looksLikeAutoReply(message)) return { gate: 'AUTO_REPLY', reason: 'business auto-responder' };
   const history = (conversationHistory || []).slice(-10)
     .map(t => `${t.direction === 'in' ? 'Lead' : 'Us'}: ${t.body}`).join('\n');
   const isEmail = channel === 'email';
+  const autoReplyRule = isEmail
+    ? '\n- AUTO_REPLY: an automated out-of-office / vacation / "we received your email" responder, not written by a person.'
+    : '\n- AUTO_REPLY: the business\'s own WhatsApp Business auto-responder, not a person answering us. Typical: "Greetings from <business>", "Welcome to <business>", "Thank you for contacting us", "we will get back to you", an away/closed-hours notice, a menu of options or packages, a list of services/destinations/rooms, an address or business-hours card, or a form asking US to share name/city/dates/requirements. It does not respond to anything we actually said. When a message looks like a canned business greeting or brochure, pick AUTO_REPLY, not UNSURE.';
   try {
     const res = await trackedCompletion(client, {
       model: 'gpt-4o-mini', max_tokens: 60, response_format: { type: 'json_object' },
@@ -314,14 +373,13 @@ async function classifyReplyIntent({ lead, message, conversationHistory, channel
 - HANDOFF: shows buying interest, asks about price/quote/cost, asks to be called, wants a demo/meeting, asks for help or support, raises a problem or complaint, or asks something only a salesperson should answer. When unsure between HANDOFF and ROUTINE, pick HANDOFF.
 - NOT_INTERESTED: a clear no — "not interested", "stop", "don't message me".
 - UNSURE: unclear, gibberish, a wrong number, or a language you cannot read.
-- ROUTINE: a simple question answerable from product knowledge, a mild objection, "who is this", "not right now", small talk.${isEmail ? '\n- AUTO_REPLY: an automated out-of-office / vacation / "we received your email" responder, not written by a person.' : ''}` },
+- ROUTINE: a simple question answerable from product knowledge, a mild objection, "who is this", "not right now", small talk.${autoReplyRule}` },
         { role: 'user', content: `Conversation so far:\n${history || '(none)'}\n\nLead's latest reply:\n${message}` },
       ],
     }, { purpose: 'sales_agent_reply_gate', leadId: lead.id });
     const parsed = json(res.choices[0].message.content, {});
-    const allowed = isEmail ? REPLY_GATES : REPLY_GATES.filter(g => g !== 'AUTO_REPLY');
     return {
-      gate: allowed.includes(parsed.gate) ? parsed.gate : 'UNSURE',
+      gate: REPLY_GATES.includes(parsed.gate) ? parsed.gate : 'UNSURE',
       reason: String(parsed.reason || '').slice(0, 60),
     };
   } catch (err) {
@@ -378,11 +436,18 @@ async function handleReply(lead, incomingText) {
 
   // Safety gate first — buying signal / pricing / callback / help, or a message we can't
   // read, pulls in a human. The deterministic regex is a cheap pre-check for the obvious ones.
-  const deterministicHandoff = detectHandoffReason(incomingText);
+  // Auto-replies first: business bots often say "call us on …", which must not read as a callback request.
+  const deterministicHandoff = looksLikeAutoReply(incomingText) ? null : detectHandoffReason(incomingText);
   const { gate, reason: gateReason } = deterministicHandoff
     ? { gate: 'HANDOFF', reason: deterministicHandoff }
     : await classifyReplyIntent({ lead, message: incomingText, conversationHistory });
 
+  if (gate === 'AUTO_REPLY') {
+    // Their WhatsApp Business bot, not a person: no flag, no owner ping, no reply to a bot.
+    await markAutoReply(lead.id);
+    await logAgentAction(lead.id, 'whatsapp_auto_reply_ignored', { detail: { message: String(incomingText).slice(0, 200), reason: gateReason }, decision: 'ignored' });
+    return { skipped: true, reason: 'auto_reply' };
+  }
   if (gate === 'NOT_INTERESTED') {
     await pool.query(`UPDATE hotel_leads SET status='not_interested', updated_at=NOW() WHERE id=$1`, [lead.id]);
     await logAgentAction(lead.id, 'whatsapp_not_interested', { detail: { message: incomingText }, decision: 'not_interested' });
@@ -485,4 +550,5 @@ module.exports = {
   markNeedsAttention, notifyOwner, getMemory, saveMemory,
   // Reused by cadenceReplyService.js (directory leads) — same gate, same never-repeat check.
   classifyReplyIntent, tooSimilarToPrior, detectHandoffReason, getConversationHistory,
+  looksLikeAutoReply, markAutoReply,
 };
