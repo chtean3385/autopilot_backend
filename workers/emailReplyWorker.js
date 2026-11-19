@@ -176,6 +176,14 @@ async function handleIncomingMessage(sender, { fromAddress, subject, text, messa
     [lead.id, sender.id, leadSeq?.sequence_id || null, subject, text, messageId, date || new Date()]
   );
 
+  // Opportunity Hunter leads (one application email each): the owner handles every reply personally —
+  // mark the opportunity replied, alert the owner, never let the AI answer.
+  if (lead.pipeline === 'opportunity') {
+    await require('../services/opportunityHunterService').handleReply(lead, { subject, text, sender });
+    console.log(`[ReplyWorker] Opportunity lead ${lead.id} replied — owner alerted`);
+    return;
+  }
+
   // Directory leads: the cross-channel cadence owns them — stop both channels, alert the owner,
   // and route the draft through approval (see services/cadenceReplyService.js).
   if (lead.cadence_managed) {

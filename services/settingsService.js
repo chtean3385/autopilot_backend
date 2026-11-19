@@ -55,7 +55,12 @@ const SETTINGS_DEFS = [
   { key: 'WA_TEMPLATE_MAX_SUBMIT_PER_DAY', category: 'Directory Outreach', description: 'Max templates submitted to Meta per day (default 15) — stays well inside Meta template creation limits' },
   { key: 'RESORT_PIPELINE_ENABLED',  category: 'Resort CRM',         description: 'Master switch for the Dream Stay (resort CRM) ad-lead WhatsApp pipeline. Default false = nothing is sent' },
   { key: 'RESORT_NEW_PER_DAY',       category: 'Resort CRM',         description: 'New ad leads that get their first WhatsApp per day (default 20). Best leads first: wants demo, then "immediately"' },
-  { key: 'RESORT_GAP_DAYS',          category: 'Resort CRM',         description: 'Days before the 2nd and 3rd WhatsApp when there is no reply (default "2,4"). After the 3rd: no_response' },
+  { key: 'OPP_HUNTER_SENDER_ID',     category: 'Opportunity Hunter', description: 'Mailbox (email_senders id) every opportunity application is sent from. Picked once on the Opportunities page' },
+  { key: 'OPP_HUNTER_MODE',          category: 'Opportunity Hunter', description: '"draft" (default) = every application waits in the Drafts box for you to Send; "auto" = sent automatically (8am-9pm IST)' },
+  { key: 'OPP_HUNTER_DAILY_CAP',     category: 'Opportunity Hunter', description: 'Max applications sent automatically per day in auto mode (default 20). Manual Send clicks are not capped' },
+  { key: 'OPP_HUNTER_MIN_SCORE',     category: 'Opportunity Hunter', description: 'Minimum 0-100 score for a post to become an opportunity (default 55). Below it the post is archived as Skipped' },
+  { key: 'OPP_READER_ENABLED',       category: 'Opportunity Hunter', description: 'true = the WhatsApp group/channel reader connects on server start (set by Connect / Disconnect on the Opportunities page)' },
+  { key: 'RESORT_GAP_DAYS',         category: 'Resort CRM',         description: 'Days before the 2nd and 3rd WhatsApp when there is no reply (default "2,4"). After the 3rd: no_response' },
 ];
 
 async function getSetting(key) {

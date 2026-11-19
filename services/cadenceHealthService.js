@@ -135,6 +135,12 @@ async function systemChecks(warn, warnings) {
     }
   }
 
+  // Opportunity Hunter's WhatsApp group/channel reader (only once the owner switched it on).
+  if (channelHealth.isFailing(ch.wa_reader) && String(await require('./settingsService').getSetting('OPP_READER_ENABLED')).toLowerCase() === 'true'
+      && ago(ch.wa_reader.lastErrorAt) > 15 * 60 * 1000 && ago(ch.wa_reader.lastErrorAt) < 48 * HOUR) {
+    warn('error', 'opportunities', `WhatsApp group reader is not connected: ${ch.wa_reader.lastError} — open Opportunities → Sources and click Connect (scan the QR if asked)`);
+  }
+
   if (channelHealth.isFailing(ch.verifier)) {
     const waiting = (await pool.query(
       `SELECT COUNT(*)::int AS n FROM hotel_leads WHERE email <> '' AND email_status IN ('unknown', 'found')`)).rows[0].n;
