@@ -26,7 +26,11 @@ const hunter = require('./opportunityHunterService');
 const AUTH_DIR = process.env.OPP_READER_AUTH_DIR || path.join(os.homedir(), '.autoagent-wa-reader');
 const CHANNEL_POLL_MS = 10 * 60 * 1000;
 const JOIN_GAP_MS = 20 * 1000;            // joins are spaced out — bursts of joins look like spam to WhatsApp
-const MAX_POST_AGE_MS = 3 * 24 * 3600 * 1000; // history synced on login: ignore posts older than 3 days
+const MAX_POST_AGE_DAYS = 10;
+const MAX_POST_AGE_MS = MAX_POST_AGE_DAYS * 24 * 3600 * 1000; // read back this far (history sync, channel pull, group backfill)
+const CHANNEL_PAGE = 100;                 // posts per channel request
+const CHANNEL_MAX_PAGES = 10;             // safety cap when paging back through a busy channel
+const GROUP_BACKFILL_COUNT = 50;          // messages per on-demand group history request
 
 const state = { status: 'off', qr: null, me: null, error: null, connectedAt: null, lastMessageAt: null };
 let sock = null;
@@ -38,6 +42,7 @@ let joining = false;
 let stopping = false;
 let sourcesByJid = new Map();
 let sourcesLoadedAt = 0;
+const backfilledGroups = new Set(); // group jids we've already asked the phone for older history (this process)
 
 function log(...a) { console.log('[WAReader]', ...a); }
 
@@ -79,6 +84,34 @@ async function handleIncoming(msg) {
   if (id) {
     state.lastMessageAt = new Date().toISOString();
     channelHealth.markOk('wa_reader');
+  }
+  if (jid.endsWith('@g.us')) backfillGroup(jid, msg.key, ts).catch((e) => log('group backfill:', e.message));
+  return id;
+}
+
+// Groups: ask the linked phone for the messages before `key` (WhatsApp's on-demand history sync).
+// The answer arrives later as a 'messaging-history.set' event, which goes through handleIncoming.
+// Once per group per process; the spare phone must be online. WhatsApp only has what this number
+// could see, so nothing from before the number joined the group.
+async function backfillGroup(jid, key, tsMs) {
+  if (backfilledGroups.has(jid) || !sock || state.status !== 'connected' || isDryRun()) return;
+  backfilledGroups.add(jid);
+  if (typeof sock.fetchMessageHistory !== 'function') return;
+  await sock.fetchMessageHistory(GROUP_BACKFILL_COUNT,
+    { remoteJid: jid, id: key.id, fromMe: !!key.fromMe, participant: key.participant }, tsMs);
+  log(`asked phone for ${GROUP_BACKFILL_COUNT} older messages in ${jid}`);
+}
+
+// On connect: for every watched group we already hold messages from, backfill before the oldest one.
+async function backfillKnownGroups() {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT ON (m.chat_jid) m.chat_jid, m.wa_message_id, m.received_at
+       FROM opportunity_messages m JOIN opportunity_sources s ON s.jid = m.chat_jid
+      WHERE s.kind = 'group' AND s.active AND m.received_at > NOW() - ($1 || ' days')::interval
+      ORDER BY m.chat_jid, m.received_at ASC`, [String(MAX_POST_AGE_DAYS)]);
+  for (const r of rows) {
+    await backfillGroup(r.chat_jid, { id: r.wa_message_id, fromMe: false }, new Date(r.received_at).getTime())
+      .catch((e) => log(`backfill ${r.chat_jid}:`, e.message));
   }
 }
 
@@ -149,23 +182,71 @@ function findMessageNodes(node, out = []) {
   return out;
 }
 
+function decodeChannelNodes(proto, res) {
+  const out = [];
+  for (const node of findMessageNodes(res)) {
+    const pt = node.content.find((c) => c.tag === 'plaintext');
+    if (!pt?.content) continue;
+    try {
+      const buf = typeof pt.content === 'string' ? Buffer.from(pt.content, 'binary') : Buffer.from(pt.content);
+      out.push({
+        id: node.attrs?.message_id || node.attrs?.server_id || node.attrs?.id, // id order = live delivery's → dedupes
+        serverId: Number(node.attrs?.server_id) || null,
+        t: Number(node.attrs?.t) || Math.floor(Date.now() / 1000),
+        message: proto.Message.decode(buf),
+      });
+    } catch { /* undecodable post — skip it */ }
+  }
+  return out;
+}
+
+// A channel's posts, paging back until MAX_POST_AGE_DAYS (or the channel's start). Uses the
+// 'messages' query (the actual post list). Baileys 7's newsletterFetchMessages sends
+// 'message_updates', which mostly returns view/reaction updates — kept only as a fallback.
+async function fetchChannelPosts(proto, jid) {
+  const byId = new Map();
+  const cutoff = Math.floor((Date.now() - MAX_POST_AGE_MS) / 1000);
+  let before = null;
+  for (let page = 0; page < CHANNEL_MAX_PAGES; page++) {
+    let res;
+    try {
+      res = await sock.query({
+        tag: 'iq',
+        attrs: { id: sock.generateMessageTag(), type: 'get', xmlns: 'newsletter', to: '@s.whatsapp.net' },
+        content: [{ tag: 'messages', attrs: { type: 'jid', jid, count: String(CHANNEL_PAGE), ...(before ? { before: String(before) } : {}) } }],
+      });
+    } catch (err) {
+      log(`channel ${jid}: messages query failed on page ${page + 1} (${err.message})`);
+      break;
+    }
+    const posts = decodeChannelNodes(proto, res);
+    const fresh = posts.filter((p) => p.id && !byId.has(p.id));
+    fresh.forEach((p) => byId.set(p.id, p));
+    const oldest = posts.reduce((a, p) => (p.serverId && (!a || p.serverId < a.serverId) ? p : a), null);
+    if (!fresh.length || !oldest || posts.length < CHANNEL_PAGE || oldest.t < cutoff) break;
+    before = oldest.serverId;
+  }
+  try {
+    const res = await sock.newsletterFetchMessages(jid, CHANNEL_PAGE);
+    decodeChannelNodes(proto, res).forEach((p) => { if (p.id && !byId.has(p.id)) byId.set(p.id, p); });
+  } catch (err) {
+    if (!byId.size) throw err;
+  }
+  return [...byId.values()];
+}
+
 async function pollChannels() {
   if (state.status !== 'connected' || !sock) return;
   const { proto } = await loadBaileys();
   const { rows } = await pool.query(`SELECT * FROM opportunity_sources WHERE kind = 'channel' AND status = 'joined' AND active AND jid IS NOT NULL`);
   for (const src of rows) {
     try {
-      const res = await sock.newsletterFetchMessages(src.jid, 20);
-      for (const node of findMessageNodes(res)) {
-        const pt = node.content.find((c) => c.tag === 'plaintext');
-        if (!pt?.content) continue;
-        const buf = typeof pt.content === 'string' ? Buffer.from(pt.content, 'binary') : Buffer.from(pt.content);
-        const message = proto.Message.decode(buf);
-        await handleIncoming({
-          key: { remoteJid: src.jid, id: node.attrs?.message_id || node.attrs?.server_id || node.attrs?.id, fromMe: false }, // id order = live delivery's → dedupes
-          message, messageTimestamp: Number(node.attrs?.t) || Math.floor(Date.now() / 1000),
-        });
+      const posts = await fetchChannelPosts(proto, src.jid);
+      let added = 0;
+      for (const p of posts) {
+        if (await handleIncoming({ key: { remoteJid: src.jid, id: p.id, fromMe: false }, message: p.message, messageTimestamp: p.t })) added++;
       }
+      log(`channel ${src.name || src.jid}: ${posts.length} posts fetched, ${added} new`);
       await pool.query(`UPDATE opportunity_sources SET last_polled_at = NOW() WHERE id = $1`, [src.id]);
     } catch (err) {
       log(`poll channel ${src.name || src.jid} failed:`, err.message);
@@ -195,7 +276,8 @@ async function connect() {
     logger: pino({ level: 'silent' }),
     browser: B.Browsers.ubuntu('Chrome'),
     markOnlineOnConnect: false,
-    syncFullHistory: false,
+    syncFullHistory: true,                 // full history on (re)link; only watched sources ≤ MAX_POST_AGE_DAYS are kept
+    shouldSyncHistoryMessage: () => true,
     generateHighQualityLinkPreview: false,
   });
 
@@ -219,6 +301,7 @@ async function connect() {
       clearInterval(pollTimer);
       pollTimer = setInterval(() => pollChannels().catch((e) => log('poll:', e.message)), CHANNEL_POLL_MS);
       setTimeout(() => pollChannels().catch(() => {}), 30 * 1000);
+      setTimeout(() => backfillKnownGroups().catch((e) => log('backfillKnownGroups:', e.message)), 60 * 1000);
     }
     if (u.connection === 'close') {
       clearInterval(pollTimer);
@@ -245,6 +328,14 @@ async function connect() {
       reconnectTimer = setTimeout(() => connect().catch((e) => log('reconnect:', e.message)), code === 515 ? 1000 : reconnectDelay);
       reconnectDelay = Math.min(reconnectDelay * 2, 5 * 60 * 1000);
     }
+  });
+  // History batches (on link, and the answers to fetchMessageHistory) — were ignored before.
+  sock.ev.on('messaging-history.set', async ({ messages }) => {
+    let n = 0;
+    for (const m of messages || []) {
+      try { if (await handleIncoming(m)) n++; } catch (err) { log('history message failed:', err.message); }
+    }
+    if (n) log(`history sync: ${n} new posts from watched sources`);
   });
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const m of messages || []) {
