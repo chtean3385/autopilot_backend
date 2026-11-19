@@ -22,8 +22,13 @@ router.get('/', wrap(async (req, res) => {
   const where = (TAB_WHERE[req.query.tab] || TAB_WHERE.drafts).replace(/\bstatus\b/g, 'o.status');
   const limit = Math.min(Number.parseInt(req.query.limit, 10) || 200, 500);
   const { rows } = await pool.query(
-    `SELECT o.*, es.label AS sender_label, es.from_email AS sender_email
+    `SELECT o.*, es.label AS sender_label, es.from_email AS sender_email,
+            el.delivered_at, el.opened_at, el.bounced_at, el.open_count
      FROM opportunities o LEFT JOIN email_senders es ON es.id = o.sender_id
+     LEFT JOIN LATERAL (
+       SELECT delivered_at, opened_at, bounced_at, open_count FROM email_logs
+       WHERE lead_id = o.lead_id AND direction = 'out' AND o.sent_at IS NOT NULL AND sent_at >= o.sent_at - INTERVAL '1 minute'
+       ORDER BY sent_at ASC LIMIT 1) el ON TRUE
      WHERE ${where} ORDER BY (o.status = 'replied') DESC, COALESCE(o.sent_at, o.created_at) DESC LIMIT $1`, [limit]);
   res.json(rows);
 }));
@@ -57,12 +62,18 @@ router.get('/config', wrap(async (req, res) => {
     mode: String((await getSetting('OPP_HUNTER_MODE')) || 'draft').toLowerCase() === 'auto' ? 'auto' : 'draft',
     daily_cap: Number(await getSetting('OPP_HUNTER_DAILY_CAP')) || 20,
     min_score: Number.parseInt(await getSetting('OPP_HUNTER_MIN_SCORE'), 10) || 55,
+    copy_to: String((await getSetting('OPP_HUNTER_COPY_TO')) || ''),
     senders,
   });
 }));
 
 router.put('/config', wrap(async (req, res) => {
-  const { sender_id, mode, daily_cap, min_score } = req.body || {};
+  const { sender_id, mode, daily_cap, min_score, copy_to } = req.body || {};
+  if (copy_to !== undefined) {
+    const v = String(copy_to || '').trim();
+    if (v && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return res.status(400).json({ error: 'Not a valid email address' });
+    await setSetting('OPP_HUNTER_COPY_TO', v);
+  }
   if (sender_id !== undefined) {
     const s = (await pool.query(`SELECT id FROM email_senders WHERE id = $1`, [sender_id])).rows[0];
     if (!s) return res.status(400).json({ error: 'Unknown mailbox' });

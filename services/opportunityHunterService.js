@@ -453,6 +453,7 @@ async function sendOpportunity(id, { trigger = 'manual' } = {}) {
       `UPDATE opportunities SET status = 'sent', lead_id = $2, sender_id = $3, sent_at = NOW(), error = NULL, updated_at = NOW() WHERE id = $1`,
       [id, leadId, sender.id]);
     await pool.query(`UPDATE hotel_leads SET status = 'contacted', updated_at = NOW() WHERE id = $1 AND status = 'new'`, [leadId]);
+    await sendOwnerCopy(sender, { to: opp.email, subject: opp.draft_subject, signed, unsubscribeUrl });
     await logAgentAction(leadId, 'opportunity_email_sent', {
       detail: { opportunityId: id, subject: opp.draft_subject, to: opp.email, trigger, dryRun: !!result.dryRun },
       draftText: opp.draft_body, score: null, decision: 'send',
@@ -461,6 +462,24 @@ async function sendOpportunity(id, { trigger = 'manual' } = {}) {
   } catch (err) {
     console.error(`[OppHunter] send ${id} failed:`, err.message);
     return fail(err.message);
+  }
+}
+
+// Owner's own copy of each application (settings OPP_HUNTER_COPY_TO). A separate send, not a BCC,
+// because the client's email carries the open pixel: a BCC copy opened in the owner's inbox would
+// mark the client as "opened". Never fails the application; not logged in email_logs.
+async function sendOwnerCopy(sender, { to, subject, signed, unsubscribeUrl }) {
+  try {
+    const copyTo = String((await getSetting('OPP_HUNTER_COPY_TO')) || '').trim();
+    if (!copyTo || copyTo.toLowerCase() === String(to).toLowerCase()) return;
+    const note = `[Copy for you: this application was sent to ${to} from ${sender.from_email}]
+
+`;
+    const { html, text } = renderEmailBody(note + signed, unsubscribeUrl, {}, { visibleFooter: false });
+    const r = await EmailSenderService.send(sender, { to: copyTo, subject: `[Sent] ${subject}`, html, text });
+    if (!r.success) console.warn(`[OppHunter] copy to owner failed: ${r.error}`);
+  } catch (err) {
+    console.warn('[OppHunter] copy to owner failed:', err.message);
   }
 }
 
