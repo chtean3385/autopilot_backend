@@ -69,7 +69,10 @@ const EXPECT = { naman: 'draft', bench: 'manual', pocketfm: 'draft', woo: 'draft
   check(!prefilter('ok thanks').pass, 'pre-filter drops short chatter');
   check(!prefilter('Good morning everyone, have a wonderful and blessed day ahead 🌞🌞🌞').pass, 'pre-filter drops greetings');
   check(prefilter(POSTS.pocketfm).pass, 'pre-filter keeps a real request');
-  check(/Full-time/.test(hardSkipReason('Hiring full time developer, freelance ok') || ''), 'full-time skipped even with "freelance"');
+  check(/Full-time/.test(hardSkipReason('Hiring full time React developer for our team, send CV') || ''), 'full-time only → skipped');
+  check(hardSkipReason('Hiring: Full-Stack UI/UX Designer & Developer — Freelance or Full-Time. Remote.') === null, '"Freelance or Full-Time" not hard-skipped');
+  check(hardSkipReason('Engagement: Full-Time / Freelance / Contract (Based on role & fit). Work Mode: Remote / Flexible') === null, '"Full-Time / Freelance / Contract" not hard-skipped');
+  check(/Office|onsite/i.test(hardSkipReason('Freelance or full-time, onsite in Pune') || ''), 'freelance + onsite still skipped');
   check(/Work from office/.test(hardSkipReason(POSTS.office) || ''), 'work from office skipped');
   check(hardSkipReason(POSTS.naman) === null, 'remote freelance post not hard-skipped');
   check(hardSkipReason(POSTS.woo) === null, '"join our growing startup" + freelance not hard-skipped');

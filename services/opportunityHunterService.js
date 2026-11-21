@@ -80,13 +80,15 @@ function prefilter(text) {
   return { pass: true };
 }
 
-// Owner's skip rule (2026-11-19): anything that says full-time / office / in-house / onsite / hybrid, or
-// is plainly an employment vacancy, is skipped — even if it also says freelance. A physical work
-// location (city/address) is judged by the AI (work_location.type = 'office') since "Location: Remote"
-// must not trip it.
+// Owner's skip rule (2026-11-19): anything that says office / in-house / onsite / hybrid, or is plainly
+// an employment vacancy, is skipped. Full-time / part-time skips ONLY when the post offers no
+// freelance / contract / project-based option (changed 2026-11-21: "Full-Time / Freelance / Contract"
+// and "Freelance or Full-Time" remote posts are leads). A physical work location (city/address) is
+// judged by the AI (work_location.type = 'office') since "Location: Remote" must not trip it.
+const FLEX_OPTION_RE = /\bfreelanc\w*|\bcontract(ual|s)?\b|\bproject[\s-]?based\b/i;
 const HARD_SKIP = [
-  [/\bfull[\s-]?time\b/i, 'Full-time role'],
-  [/\bpart[\s-]?time\b/i, 'Part-time role'],
+  [/\bfull[\s-]?time\b/i, 'Full-time role', { unlessFlex: true }],
+  [/\bpart[\s-]?time\b/i, 'Part-time role', { unlessFlex: true }],
   [/\bin[\s-]?house\b/i, 'In-house role'],
   [/\bwork(ing)?\s+from\s+(the\s+|our\s+)?([\w-]+\s+){0,2}office\b|\bWFO\b/i, 'Work from office'],
   [/\b(at|from|in)\s+(our|the)\s+([\w-]+\s+){0,2}office\b|\boffice\s+location\b|\bon[\s-]?site\b|\bonsite\b/i, 'Office / onsite work'],
@@ -96,7 +98,9 @@ const HARD_SKIP = [
   [/\binternship\b|\bintern\b/i, 'Internship'],
 ];
 function hardSkipReason(text) {
-  for (const [re, reason] of HARD_SKIP) {
+  const flex = FLEX_OPTION_RE.test(String(text));
+  for (const [re, reason, opts] of HARD_SKIP) {
+    if (opts?.unlessFlex && flex) continue;
     const m = String(text).match(re);
     if (m) return `${reason} ("${m[0].trim()}")`;
   }
@@ -120,7 +124,7 @@ We ONLY take freelance / project-based work (a client needs something built, fix
 
 engagement_type:
 - "freelance": the post explicitly hires a freelancer / contract / project-based.
-- "project": someone needs a deliverable built or fixed (website, app, store, App Store approval…), even if the title says "Hiring", when the work has an end point.
+- "project": someone needs a deliverable built or fixed (website, app, store, App Store approval…), even if the title says "Hiring", when the work has an end point. Also a company looking for an agency / freelancer on retainer or a long-term agency partnership for a service Dreams provides (this is client work, NOT "not_opportunity").
 - "staff_augmentation": a company/vendor wants a "bench resource" / contract developer supplied (remote).
 - "job_vacancy": hiring an employee — e.g. "X is hiring a React Native Developer", a years-of-experience band, fixed shift/working hours, salary/CTC, "send your CV for the position", joining date — with NO freelance/project/contract wording. When a post has explicit freelance/project wording, that wins over a generic job-description layout.
 - "not_opportunity": not a request for work (people offering their own services, job seekers, courses, spam, news, MLM).
