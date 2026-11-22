@@ -246,14 +246,16 @@ class EmailSenderService {
     return !last || Date.now() - new Date(last).getTime() >= gap * 60000;
   }
 
-  static async pickSenderForRotation() {
+  // { ignorePacing } = a human clicked "Send now" (routes/leads.js): one deliberate send may skip the
+  // EMAIL_SENDER_MIN_GAP_MINUTES spacing. Paused mailboxes and the daily cap are never skipped.
+  static async pickSenderForRotation({ ignorePacing = false } = {}) {
     await this.resetStaleCounters();
     const result = await pool.query(`SELECT * FROM email_senders WHERE status = 'active' ORDER BY id`);
     const excluded = await this.coldExcludedIds();
     const eligible = [];
     for (const s of result.rows) {
       if (excluded.has(s.id) || !this.hasCapacity(s)) continue;
-      if (await this.pacedOk(s)) eligible.push(s);
+      if (ignorePacing || await this.pacedOk(s)) eligible.push(s);
     }
     if (eligible.length === 0) return null;
 
@@ -299,7 +301,7 @@ class EmailSenderService {
   // Only if the mailbox was deleted does the lead go back into rotation.
   // { strict: false } (human-triggered proposals/estimates, replies to a lead who wrote back) keeps
   // the old behaviour: prior mailbox if active regardless of cap, else any active sender.
-  static async getSenderForLead(leadId, { strict = true } = {}) {
+  static async getSenderForLead(leadId, { strict = true, ignorePacing = false } = {}) {
     await this.resetStaleCounters();
     const priorId = await this.getPriorSenderId(leadId);
     const prior = priorId ? await this.getById(priorId) : null;
@@ -311,10 +313,10 @@ class EmailSenderService {
 
     if (prior) {
       if (prior.status !== 'active' || !this.hasCapacity(prior)) return null;
-      if (!(await this.pacedOk(prior))) return null; // its mailbox sent within the min gap — wait
+      if (!ignorePacing && !(await this.pacedOk(prior))) return null; // its mailbox sent within the min gap — wait
       return prior;
     }
-    return this.pickSenderForRotation();
+    return this.pickSenderForRotation({ ignorePacing });
   }
 
   // The ONE place SMTP connection options are built. send() and verifySmtp() both use it, so a check

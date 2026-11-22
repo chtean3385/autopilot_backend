@@ -503,7 +503,8 @@ async function processRow(row, sequenceCapTracker, { manual = false } = {}) {
 
   // First email: next sender in the 10-per-mailbox rotation. Follow-ups: the same mailbox as the
   // first email — if it's paused or full today the lead waits rather than switching mailbox.
-  const sender = await EmailSenderService.getSenderForLead(leadId);
+  // A manual send (Leads → Send now) may skip the mailbox spacing gap, never the cap or a pause.
+  const sender = await EmailSenderService.getSenderForLead(leadId, { ignorePacing: manual });
   if (!sender) {
     console.log(`[SequenceEmail] No sender capacity for lead ${leadId} (its mailbox is full/paused, or all senders are) — retrying in 1h`);
     // Push it back so waiting follow-ups don't fill every tick's LIMIT batch and starve leads

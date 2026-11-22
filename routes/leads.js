@@ -8,8 +8,6 @@ const { findEmail } = require('../services/enrichmentService');
 const { getOrCreateResearch } = require('../services/leadResearchService');
 const pool = require('../config/db');
 const { verifyEmail, statusForVerification } = require('../services/emailVerifierService');
-const SuppressionService = require('../services/suppressionService');
-const FreshResend = require('../services/freshResendService');
 const { getFreshStartAt } = require('../utils/freshStart');
 const router = express.Router();
 
@@ -285,50 +283,19 @@ router.get('/', async (req, res) => {
   }
 });
 
-// "Send now" (Leads page, Email tab). Never skips a safety check: suppression, mailbox pause and daily
-// cap, verified address, research for AI-written emails, replied/opted-out leads.
-//  1. Lead waiting for its fresh-start re-send → its original first email, same text, same mailbox.
-//  2. Lead in an active sequence → that sequence's next step right now (AI-written, research required).
-//  3. Directory lead whose cadence is on email → its next email touch at the next 10-minute run.
-//  Otherwise → the reason it can't be emailed.
+// "Send now" (Leads page, Email tab) → services/sendNowService.js. Always 200 with a plain-English result:
+// { sent: true, channel: 'email', to, subject, sender, message } or { sent: false, reason }. Email only,
+// never WhatsApp; never skips a safety check; refuses a repeat send within 10 minutes / the same day.
+// ok/message are kept for older frontends.
 router.post('/:id/send-now', async (req, res) => {
   const leadId = Number(req.params.id);
   try {
-    const lead = (await pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId])).rows[0];
-    if (!lead) return res.status(404).json({ ok: false, message: 'Lead not found' });
-    if (!lead.email) return res.json({ ok: false, message: 'This lead has no email address.' });
-    if (['not_interested', 'opted_out'].includes(lead.status)) return res.json({ ok: false, message: `Not sent: the lead is marked ${lead.status.replace('_', ' ')}.` });
-    if (await SuppressionService.isSuppressed(lead.email)) return res.json({ ok: false, message: 'Not sent: this address unsubscribed or bounced.' });
-
-    const [resendRow] = await FreshResend.listEligible({ leadId });
-    if (resendRow) {
-      const r = await FreshResend.resendOne(resendRow, { manual: true });
-      if (r.ok) return res.json({ ok: true, message: `Original first email re-sent from ${r.from}.` });
-      const why = { mailbox_paused: 'its mailbox is paused', mailbox_full_today: "its mailbox reached today's cap", send_failed: `the mail server refused it (${r.error})`, suppressed: 'the address is suppressed', original_mailbox_missing: 'its original mailbox no longer exists' };
-      return res.json({ ok: false, message: `Not sent: ${why[r.reason] || r.reason}.` });
-    }
-
-    if (lead.email_status !== 'verified') return res.json({ ok: false, message: `Not sent: the email is "${lead.email_status || 'not checked'}", not verified.` });
-
-    const seq = (await pool.query(`SELECT id FROM lead_sequences WHERE lead_id = $1 AND status = 'active' LIMIT 1`, [leadId])).rows[0];
-    if (seq) {
-      const { runSequenceForLead } = require('../workers/sequenceEmailWorker');
-      const r = await runSequenceForLead(leadId);
-      return res.json({ ok: r.outcome === 'sent', message: r.message || r.outcome });
-    }
-
-    if (lead.cadence_managed) {
-      const c = (await pool.query(`SELECT status, current_channel FROM lead_cadence WHERE lead_id = $1`, [leadId])).rows[0];
-      if (c && ['active', 'resting'].includes(c.status) && c.current_channel === 'email') {
-        await pool.query(`UPDATE lead_cadence SET next_touch_at = NOW(), status = 'active', updated_at = NOW() WHERE lead_id = $1`, [leadId]);
-        return res.json({ ok: true, message: 'Queued: its email goes out at the next run (within 10 minutes, 9 am to 6 pm Mon to Sat).' });
-      }
-      return res.json({ ok: false, message: `Not sent: this directory lead's schedule is ${c ? `${c.status} on ${c.current_channel || 'no channel'}` : 'not started'}, not on email.` });
-    }
-    return res.json({ ok: false, message: 'Not sent: the lead is not in any email sequence. Enroll it in a sequence first.' });
+    const r = await require('../services/sendNowService').sendNow(leadId);
+    console.log(`[Leads send-now] lead ${leadId}: ${r.sent ? `sent to ${r.to} from ${r.sender}` : r.reason}`);
+    res.status(r.notFound ? 404 : 200).json({ ...r, ok: r.sent, message: r.sent ? r.message : r.reason });
   } catch (err) {
     console.error('[Leads send-now]', err.message);
-    res.status(500).json({ ok: false, message: err.message });
+    res.status(500).json({ sent: false, ok: false, reason: `Not sent: ${err.message}`, message: `Not sent: ${err.message}` });
   }
 });
 

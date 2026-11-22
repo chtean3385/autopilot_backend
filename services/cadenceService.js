@@ -274,7 +274,9 @@ async function priorMessagesForComposer(leadId) {
   return rows.reverse();
 }
 
-async function sendEmailTouch(lead, row, isFinalTouch) {
+// manual = a human clicked "Send now": skips the mailbox spacing gap and the fresh-start "re-sends go
+// first" wait. Never skips research, the quality bar, a paused mailbox or the daily cap.
+async function sendEmailTouch(lead, row, isFinalTouch, { manual = false } = {}) {
   // Never a generic email: wait for researchWorker (website, or the email's company domain). emailUsable()
   // already rules out leads that can't be researched; this guards a lead whose research is still running.
   const hasSite = Boolean(researchSiteFor(lead));
@@ -282,7 +284,7 @@ async function sendEmailTouch(lead, row, isFinalTouch) {
   if (!research && hasSite) return { wait: 'awaiting_research', hours: 2 };
   if (!research && !(await allowNoWebsiteEmail())) return { wait: 'awaiting_research', hours: 24 };
   // Same mailbox as this lead's first email; waits if that mailbox is paused or full today.
-  const sender = await EmailSenderService.getSenderForLead(lead.id);
+  const sender = await EmailSenderService.getSenderForLead(lead.id, { ignorePacing: manual });
   if (!sender) return { wait: 'no_sender_capacity', hours: 3 };
 
   const emailTouchesSoFar = (await pool.query(
@@ -293,7 +295,7 @@ async function sendEmailTouch(lead, row, isFinalTouch) {
   // (services/freshResendService.js), so the re-sends go out first.
   const FreshResend = require('./freshResendService');
   if (await FreshResend.isLeadWaiting(lead.id)) return { wait: 'fresh_resend_own', hours: 6 };
-  if (emailTouchesSoFar === 0 && await FreshResend.isPending()) return { wait: 'fresh_resend_first', hours: 6 };
+  if (!manual && emailTouchesSoFar === 0 && await FreshResend.isPending()) return { wait: 'fresh_resend_first', hours: 6 };
 
   // Composer stages: 0 = first ever email, 1 = follow-up, 2 = polite last note (only the very last touch).
   const stepNumber = isFinalTouch ? 2 : (emailTouchesSoFar === 0 ? 0 : 1);
@@ -351,8 +353,8 @@ async function sendEmailTouch(lead, row, isFinalTouch) {
      VALUES ($1, $2, 'out', $3, $4, $5, $6, NOW())`,
     [lead.id, sender.id, composed.subject, html, sendResult.messageId, trackingToken]
   );
-  await logAction(lead.id, 'cadence_email_sent', { subject: composed.subject, senderId: sender.id, cycle: row.cycle, score: finalQualityScore }, 'send', composed.body);
-  return { sent: true };
+  await logAction(lead.id, 'cadence_email_sent', { subject: composed.subject, senderId: sender.id, cycle: row.cycle, score: finalQualityScore, manual }, 'send', composed.body);
+  return { sent: true, subject: composed.subject, sender, dryRun: Boolean(sendResult.dryRun) };
 }
 
 // "Maulik Patel" → "Maulik"; "Shri Girishbhai S. Shah" → "Girishbhai". When the name starts with an
@@ -384,7 +386,25 @@ async function sendWhatsappTouch(lead, row, template) {
   return { sent: true };
 }
 
+// Leads being touched right now, by the tick or by a manual "Send now" — the other one skips them, so a
+// click during a tick can never email the same lead twice.
+const inFlight = new Set();
+
 async function processRow(row, cfg, budget) {
+  if (inFlight.has(row.lead_id)) return 'skipped:in_flight';
+  inFlight.add(row.lead_id);
+  try {
+    // Re-read: the tick selected this row before it got here; a manual send may have touched it since.
+    const fresh = (await pool.query(
+      `SELECT *, (next_touch_at > NOW() + INTERVAL '1 minute') AS not_due_yet FROM lead_cadence WHERE lead_id = $1`, [row.lead_id])).rows[0];
+    if (!fresh || !['active', 'resting'].includes(fresh.status) || fresh.not_due_yet) return 'skipped:state_changed';
+    return await processRowLocked(fresh, cfg, budget);
+  } finally {
+    inFlight.delete(row.lead_id);
+  }
+}
+
+async function processRowLocked(row, cfg, budget) {
   const lead = (await pool.query('SELECT * FROM hotel_leads WHERE id = $1', [row.lead_id])).rows[0];
   if (!lead || !lead.cadence_managed) { await stopCadence(row.lead_id, 'stopped', 'not_cadence_managed'); return 'stopped'; }
 
@@ -502,6 +522,67 @@ async function runCadence(trigger = 'cron') {
   return stats;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Manual "Send now" (Leads page → services/sendNowService.js): this directory lead's next EMAIL touch,
+// right now. Never WhatsApp (the button is email-only, and WHATSAPP_OUTREACH_ENABLED=false means we
+// start no WhatsApp at all). Skips the send window and mailbox spacing (a deliberate human action);
+// never skips opt-outs, replies, research, the 4.5 quality bar, a paused mailbox or the daily cap.
+// After the send the cadence carries on from it: the next touch is planned as after any email touch.
+// Returns { sent, subject, sender } or { sent: false, code, wait? } — the caller words the reason.
+// ---------------------------------------------------------------------------------------------
+const MANUAL_BLOCK_STOP_REASONS = /opt|unsub|not_interested|replied|lead_(responded|interested|not_interested|opted_out|dead)/i;
+
+async function sendEmailNow(leadId) {
+  if (inFlight.has(leadId)) return { sent: false, code: 'in_flight' };
+  inFlight.add(leadId);
+  try {
+    const lead = (await pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId])).rows[0];
+    if (!lead || !lead.cadence_managed) return { sent: false, code: 'not_cadence' };
+    if (!ELIGIBLE_LEAD_STATUSES.includes(lead.status)) return { sent: false, code: 'lead_status' };
+    const row = (await pool.query('SELECT * FROM lead_cadence WHERE lead_id = $1', [leadId])).rows[0];
+    if (row?.status === 'replied') return { sent: false, code: 'replied' };
+    if (row && ['stopped', 'dead'].includes(row.status) && MANUAL_BLOCK_STOP_REASONS.test(row.stop_reason || '')) {
+      return { sent: false, code: 'stopped_optout', stopReason: row.stop_reason };
+    }
+    if (!(await emailUsable(lead))) return { sent: false, code: 'email_not_usable' };
+
+    const cfg = await loadConfig();
+    const base = row || { lead_id: leadId, cycle: 1, total_touches: 0, touches_on_channel: 0, status: 'active' };
+    // Switching onto email (from WhatsApp, a stopped row, or no row yet) starts a fresh email block.
+    const onEmail = base.current_channel === 'email' && ['active', 'resting'].includes(base.status);
+    const state = onEmail ? { ...base } : {
+      ...base, current_channel: 'email', touches_on_channel: 0, status: 'active', stop_reason: null,
+      cycle_start_channel: (base.total_touches || 0) === 0 || !base.cycle_start_channel ? 'email' : base.cycle_start_channel,
+    };
+    const strictEmail = await emailUsable(lead, { strict: true });
+    const usable = {
+      email: true,
+      whatsapp: (await whatsappOutreachOn()) && !(cfg.emailOnlyIfVerified && strictEmail) && waUsable(lead, row),
+    };
+    const plan = planAfterTouch(state, 'email', usable, cfg);
+    const result = await sendEmailTouch(lead, state, plan.status === 'dead', { manual: true });
+    if (!result.sent) return { sent: false, code: result.wait || result.channelBroken || 'unknown' };
+
+    if (!row) {
+      await pool.query(
+        `INSERT INTO lead_cadence (lead_id, current_channel, first_channel, cycle_start_channel, status, started_at)
+         VALUES ($1, 'email', 'email', 'email', 'active', NOW()) ON CONFLICT (lead_id) DO NOTHING`, [leadId]);
+    }
+    if (row?.status === 'dead') {
+      // Finished cadence: the manual email is a one-off, the cadence stays finished.
+      await pool.query(`UPDATE lead_cadence SET last_touch_at = NOW(), last_channel = 'email', updated_at = NOW() WHERE lead_id = $1`, [leadId]);
+    } else {
+      await saveState(leadId, { ...plan, wa_unusable: row?.wa_unusable });
+      if (plan.status === 'dead') {
+        await pool.query(`UPDATE hotel_leads SET status = 'no_response', updated_at = NOW() WHERE id = $1 AND status = 'new'`, [leadId]);
+      }
+    }
+    return { sent: true, subject: result.subject, sender: result.sender, dryRun: result.dryRun };
+  } finally {
+    inFlight.delete(leadId);
+  }
+}
+
 // Meta reports a template as 'failed' asynchronously (webhook), after the cadence already counted the
 // touch. Owner's rule (2026-10-10): one failed WhatsApp = never WhatsApp that lead again. Most failures
 // are Meta's per-recipient marketing cap (131049 "healthy ecosystem engagement"), "undeliverable" (not
@@ -556,4 +637,4 @@ async function flagForCall(leadId, reason) {
   await logAction(leadId, 'call_list_flagged', { reason }, 'call');
 }
 
-module.exports = { runCadence, planAfterTouch, enrollNewLeads, loadConfig, firstName, DEFAULTS, handleWhatsappSendFailed, flagForCall };
+module.exports = { runCadence, planAfterTouch, enrollNewLeads, loadConfig, firstName, DEFAULTS, handleWhatsappSendFailed, flagForCall, sendEmailNow, emailUsable };

@@ -146,6 +146,11 @@ async function resendOne(row, { manual = false } = {}) {
   if (sender.status !== 'active') return { ok: false, reason: 'mailbox_paused', wait: true };
   if (!EmailSenderService.hasCapacity(sender)) return { ok: false, reason: 'mailbox_full_today', wait: true };
   if (!manual && !(await EmailSenderService.pacedOk(sender))) return { ok: false, reason: 'mailbox_spacing', wait: true };
+  // A manual "Send now" and the tick can pick the same lead at once — never two emails within 10 minutes.
+  const recent = (await pool.query(
+    `SELECT 1 FROM email_logs WHERE lead_id = $1 AND direction = 'out' AND error IS NULL
+       AND COALESCE(sent_at, created_at) > NOW() - INTERVAL '10 minutes' LIMIT 1`, [row.lead_id])).rows[0];
+  if (recent) return { ok: false, reason: 'recently_sent', wait: true };
 
   const token = generateTrackingToken();
   const html = retokenize(row.body, row.tracking_token, token);
@@ -176,7 +181,7 @@ async function resendOne(row, { manual = false } = {}) {
 // Cron tick: inside the send window, at most one re-send per mailbox per tick (spacing does the rest).
 async function runTick() {
   if (!(await enabled())) return { skipped: 'disabled' };
-  if (!(await isWithinSendWindow())) return { skipped: 'outside_window' };
+  if (!(await isWithinSendWindow()).allowed) return { skipped: 'outside_window' }; // returns an object, not a boolean
   const rows = await listEligible({ limit: 500 });
   const out = { eligible: rows.length, sent: 0, waiting: 0, failed: 0, reasons: {} };
   const usedThisTick = new Set();
