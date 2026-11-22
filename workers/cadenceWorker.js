@@ -9,7 +9,8 @@ const { sendUrgentAlert, sendDailyHealthAlert, sendWeeklySummary } = require('..
 // whatever cadence touches are due (one channel per lead, never both). Does nothing unless
 // CADENCE_ENABLED=true, and only inside the IST send window (utils/sendWindow.js). Catch-up safe:
 // it queries "next_touch_at <= NOW()", so missed ticks just send on the next one.
-schedule.scheduleJob('*/15 * * * *', () => {
+// Every 10 min (was 15) — same pacing reason as sequenceEmailWorker.js (50/mailbox/day across 9–18 IST).
+schedule.scheduleJob('*/10 * * * *', () => {
   track('cadence', () => runCadence('cron')).catch((err) => console.error('[Cadence] tick failed:', err.message));
 });
 // Daily 10:05 IST: write, score and submit WhatsApp templates for every directory niche. Runs as soon

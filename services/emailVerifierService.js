@@ -6,9 +6,22 @@ const channelHealth = require('../utils/channelHealth');
 // Response shape: { data: { result: 'deliverable'|'undeliverable'|'risky'|'unknown', ... }, error: string|null }
 const MAILS_SO_BASE_URL = 'https://api.mails.so/v1';
 
-// Only 'deliverable' is trusted to enter a sequence — keeps bounce rate under the <3% target.
-function isValidResult(result) {
-  return result === 'deliverable';
+// 'deliverable' is trusted. Since 2026-11-22 so is 'risky' when the only reason is a catch-all domain:
+// most Indian small-business mail (shared hosting, Yahoo) accepts every address, so mails.so can't confirm
+// the mailbox — but a sample re-check showed these are real, sendable addresses, and blocking them hid
+// ~half the email leads. 'unknown' (server didn't answer) is retried later; 'undeliverable' is blocked.
+const CATCH_ALL_REASONS = new Set(['catch_all', 'accept_all', 'catchall']);
+function isValidResult(result, reason) {
+  if (result === 'deliverable') return true;
+  return result === 'risky' && (!reason || CATCH_ALL_REASONS.has(String(reason).toLowerCase()));
+}
+
+// email_status for a verifyEmail() answer. null = verifier unreachable, leave the status alone.
+function statusForVerification(v) {
+  if (!v || v.status === 'error') return null;
+  if (v.valid) return 'verified';
+  if (v.status === 'unknown') return 'unknown'; // retried by workers/emailVerificationWorker.js
+  return 'unverifiable';
 }
 
 // Free-mail providers reject non-existent recipients at SMTP time, so an address that
@@ -19,7 +32,7 @@ const FREE_MAIL_AUTO_VERIFY = /@(gmail\.com|googlemail\.com)$/i;
 // Normalized shape so MillionVerifier/Hunter can be swapped in behind the same interface.
 async function verifyEmail(email) {
   if (FREE_MAIL_AUTO_VERIFY.test(String(email).trim())) {
-    return { valid: true, status: 'deliverable', source: 'freemail_auto' };
+    return { valid: true, status: 'deliverable', reason: 'freemail_auto', source: 'freemail_auto' };
   }
 
   const apiKey = await getSetting('VERIFIER_API_KEY');
@@ -41,8 +54,9 @@ async function verifyEmail(email) {
     });
 
     const result = response.data?.data?.result || 'unknown';
+    const reason = response.data?.data?.reason || null;
     channelHealth.markOk('verifier');
-    return { valid: isValidResult(result), status: result };
+    return { valid: isValidResult(result, reason), status: result, reason };
   } catch (error) {
     console.error('[EmailVerifier] verifyEmail error:', error.response?.data || error.message);
     // providerDown: mails.so itself can't answer (no credit, bad key, outage, network) — says nothing
@@ -58,4 +72,4 @@ async function verifyEmail(email) {
   }
 }
 
-module.exports = { verifyEmail };
+module.exports = { verifyEmail, statusForVerification, isValidResult };

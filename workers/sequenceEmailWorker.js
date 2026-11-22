@@ -17,6 +17,8 @@ const { checkSpamContent } = require('../utils/spamCheck');
 const { generateTrackingToken, buildClickUrl, buildPixelUrl } = require('../utils/emailTracking');
 const { getThreadHeaders } = require('../utils/emailThreading');
 const { isWithinSendWindow } = require('../utils/sendWindow');
+const { getFreshStartAt } = require('../utils/freshStart');
+const FreshResend = require('../services/freshResendService');
 const { getSetting } = require('../services/settingsService');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -55,11 +57,13 @@ async function fetchPortfolioItems() {
 // instead of composing each step blind. `body` in email_logs is the rendered HTML (footer,
 // pixel, links included) — stripHtmlToText below reduces it to a short plain excerpt.
 async function fetchPriorSentEmails(leadId) {
+  const since = await getFreshStartAt(); // older mail never arrived — not "prior" for the writer
   const result = await pool.query(
     `SELECT subject, body FROM email_logs
      WHERE lead_id = $1 AND direction = 'out' AND sequence_id IS NOT NULL AND error IS NULL
+       AND ($3::timestamp IS NULL OR COALESCE(sent_at, created_at) >= $3::timestamp)
      ORDER BY COALESCE(sent_at, created_at) DESC LIMIT $2`,
-    [leadId, PRIOR_EMAILS_LIMIT]
+    [leadId, PRIOR_EMAILS_LIMIT, since]
   );
   return result.rows.reverse();
 }
@@ -382,10 +386,23 @@ async function composeAndSendColdEmail({ leadId, lead, leadEmail, stepNumber, se
   return { sendResult, composed, html, trackingToken, finalQualityScore };
 }
 
-async function processRow(row, sequenceCapTracker) {
+async function processRow(row, sequenceCapTracker, { manual = false } = {}) {
   const leadSequenceId = row.id;
   const leadId = row.lead_id;
   const sequenceId = row.sequence_id;
+
+  // Fresh start (services/freshResendService.js): while leads are still waiting for their original
+  // first email to be re-sent, brand-new first emails wait, so the re-sends go out first. Pushed back
+  // (not just skipped) so these rows don't fill every tick's batch ahead of follow-ups.
+  // ...and a lead still waiting for its own re-send gets nothing else first (not even a follow-up).
+  if (!manual && await FreshResend.isLeadWaiting(leadId)) {
+    await pool.query(`UPDATE lead_sequences SET next_run_at = NOW() + INTERVAL '6 hours', updated_at = NOW() WHERE id = $1`, [leadSequenceId]);
+    return 'deferred';
+  }
+  if (!manual && row.current_step === 0 && await FreshResend.isPending()) {
+    await pool.query(`UPDATE lead_sequences SET next_run_at = NOW() + INTERVAL '6 hours', updated_at = NOW() WHERE id = $1`, [leadSequenceId]);
+    return 'deferred';
+  }
 
   if (row.email_status === 'bounced' || row.email_status === 'unsubscribed') {
     console.log(`[SequenceEmail] Lead ${leadId} email_status=${row.email_status} — stopping sequence`);
@@ -705,7 +722,7 @@ async function runSequenceForLead(leadId) {
     // Empty cap tracker → processRow never sees a sequence-cap entry, so the daily cap is bypassed.
     // The research gate still applies here — a manual "Run Now" bypasses timing, not the
     // requirement that a lead with a website be researched before it gets emailed.
-    const outcome = await processRow(row, new Map());
+    const outcome = await processRow(row, new Map(), { manual: true });
 
     const stats = { due: 1, sent: 0, stopped: 0, capacitySkip: 0, noSender: 0, awaitingResearch: 0, awaitingDelivery: 0, deferred: 0, failed: 0, leadId };
     if (outcome === 'sent') stats.sent = 1;
@@ -743,7 +760,9 @@ async function runSequenceForLead(leadId) {
   }
 }
 
-schedule.scheduleJob('*/15 * * * *', () => track('email_sequences', () => runSequenceWorker('cron'), { record: false }).catch(() => {}));
+// Every 10 min (was 15): with EMAIL_SENDER_MIN_GAP_MINUTES each mailbox sends at most ~1 per tick, so
+// 6 ticks/hour × 9 window hours ≈ 54 ≥ a 50/day cap (owner 2026-11-22: 50/mailbox/day, spread out).
+schedule.scheduleJob('*/10 * * * *', () => track('email_sequences', () => runSequenceWorker('cron'), { record: false }).catch(() => {}));
 
 console.log('📧 Sequence email worker started - checks every 15 minutes');
 

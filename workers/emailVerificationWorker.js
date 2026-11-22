@@ -1,7 +1,7 @@
 const schedule = require('node-schedule');
 const pool = require('../config/db');
 const { track } = require('../utils/jobTracker');
-const { verifyEmail } = require('../services/emailVerifierService');
+const { verifyEmail, statusForVerification } = require('../services/emailVerifierService');
 const { getSetting } = require('../services/settingsService');
 const SequenceService = require('../services/sequenceService');
 
@@ -80,15 +80,17 @@ async function runVerificationPass() {
         continue;
       }
 
-      const newStatus = verification.valid ? 'verified' : 'unverifiable';
-      if (verification.valid) verified++; else unverifiable++;
+      // 'unknown' (mail server didn't answer) stays 'unknown' and is retried; only a real
+      // non-catch-all negative answer becomes 'unverifiable' (emailVerifierService.statusForVerification).
+      const newStatus = statusForVerification(verification);
+      if (newStatus === 'verified') verified++; else if (newStatus === 'unverifiable') unverifiable++;
       await pool.query(
         `UPDATE hotel_leads
-         SET email_status = $1,
+         SET email_status = $1, email_verify_result = $3, email_verify_reason = $4,
              email_verify_attempts = COALESCE(email_verify_attempts, 0) + 1,
              last_verify_attempt_at = NOW(), updated_at = NOW()
          WHERE id = $2`,
-        [newStatus, lead.id]
+        [newStatus, lead.id, verification.status, verification.reason ? String(verification.reason).slice(0, 60) : null]
       );
 
       await sleep(DELAY_BETWEEN_CALLS_MS);

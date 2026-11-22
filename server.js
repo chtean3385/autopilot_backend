@@ -251,6 +251,8 @@ async function initDB() {
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_source VARCHAR(50);
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_verify_attempts INT DEFAULT 0;
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS last_verify_attempt_at TIMESTAMP;
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_verify_result VARCHAR(20);
+    ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS email_verify_reason VARCHAR(60);
     -- workers/researchWorker.js retry bookkeeping (database/migrate_research_worker_and_open_tracking.sql)
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS research_attempts INT DEFAULT 0;
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS last_research_attempt_at TIMESTAMP;
@@ -782,6 +784,7 @@ require('./workers/emailVerificationWorker');
 require('./workers/playbookInsightsWorker');
 require('./workers/directoryCrawlWorker');
 require('./workers/cadenceWorker');
+require('./workers/freshResendWorker');
 require('./workers/resortPipelineWorker');
 require('./workers/opportunityWorker');
 require('./services/schedulerService');

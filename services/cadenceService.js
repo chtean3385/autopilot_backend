@@ -8,6 +8,7 @@ const { getCachedResearch, researchSiteFor, RESEARCH_MAX_ATTEMPTS } = require('.
 const { isWithinSendWindow } = require('../utils/sendWindow');
 const { stopCadence } = require('./cadenceReplyService');
 const { WRITING_RULES } = require('../utils/humanTone');
+const { getFreshStartAt } = require('../utils/freshStart');
 
 // Directory outreach step 3 (_docs/directory-outreach-plan.md): the cross-channel cadence. The ONLY
 // thing that sends cold messages to cadence_managed (directory) leads — campaigns, WhatsApp
@@ -250,15 +251,17 @@ async function enrollNewLeads(cfg) {
 // One touch
 // ---------------------------------------------------------------------------------------------
 async function priorMessagesForComposer(leadId) {
+  const since = await getFreshStartAt(); // emails before the fresh start never arrived (utils/freshStart.js)
   const { rows } = await pool.query(
     `SELECT * FROM (
        SELECT subject, body, COALESCE(sent_at, created_at) AS at FROM email_logs
        WHERE lead_id = $1 AND direction = 'out' AND error IS NULL
+         AND ($2::timestamp IS NULL OR COALESCE(sent_at, created_at) >= $2::timestamp)
        UNION ALL
        SELECT '(WhatsApp message)', COALESCE(ol.message_text, wt.body_text), ol.sent_at
        FROM outreach_logs ol LEFT JOIN waba_templates wt ON wt.id = ol.template_id WHERE ol.lead_id = $1
      ) m WHERE body IS NOT NULL ORDER BY at DESC LIMIT 6`,
-    [leadId]
+    [leadId, since]
   );
   return rows.reverse();
 }
@@ -273,8 +276,15 @@ async function sendEmailTouch(lead, row, isFinalTouch) {
   if (!sender) return { wait: 'no_sender_capacity', hours: 3 };
 
   const emailTouchesSoFar = (await pool.query(
-    `SELECT COUNT(*)::int AS n FROM email_logs WHERE lead_id = $1 AND direction = 'out' AND error IS NULL`, [lead.id]
+    `SELECT COUNT(*)::int AS n FROM email_logs WHERE lead_id = $1 AND direction = 'out' AND error IS NULL
+       AND ($2::timestamp IS NULL OR COALESCE(sent_at, created_at) >= $2::timestamp)`, [lead.id, await getFreshStartAt()]
   )).rows[0].n;
+  // Fresh start: a lead's first email waits while original-email re-sends are still pending
+  // (services/freshResendService.js), so the re-sends go out first.
+  const FreshResend = require('./freshResendService');
+  if (await FreshResend.isLeadWaiting(lead.id)) return { wait: 'fresh_resend_own', hours: 6 };
+  if (emailTouchesSoFar === 0 && await FreshResend.isPending()) return { wait: 'fresh_resend_first', hours: 6 };
+
   // Composer stages: 0 = first ever email, 1 = follow-up, 2 = polite last note (only the very last touch).
   const stepNumber = isFinalTouch ? 2 : (emailTouchesSoFar === 0 ? 0 : 1);
 

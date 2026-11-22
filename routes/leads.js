@@ -7,7 +7,10 @@ const { parseLeadsFile } = require('../services/importService');
 const { findEmail } = require('../services/enrichmentService');
 const { getOrCreateResearch } = require('../services/leadResearchService');
 const pool = require('../config/db');
-const { verifyEmail } = require('../services/emailVerifierService');
+const { verifyEmail, statusForVerification } = require('../services/emailVerifierService');
+const SuppressionService = require('../services/suppressionService');
+const FreshResend = require('../services/freshResendService');
+const { getFreshStartAt } = require('../utils/freshStart');
 const router = express.Router();
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -233,9 +236,13 @@ router.get('/', async (req, res) => {
 
     const limitP = addParam(limit);
     const offsetP = addParam(offset);
+    // Email columns (Leads page, Email tab): what was sent since the fresh start (EMAIL_FRESH_START_AT,
+    // utils/freshStart.js) and when. Mail before it never arrived, so it's counted separately.
+    const sinceP = addParam(await getFreshStartAt());
 
     const query = `
       SELECT hl.*,
+        em.mail_sent, em.mail_last_sent_at, em.mail_last_opened_at, em.mail_opened, em.mail_old_undelivered, em.mail_via_brevo, em.mail_replied, lc.stop_reason AS cadence_stop_reason,
         (SELECT STRING_AGG(lg.name, ', ' ORDER BY lg.name)
          FROM lead_group_members lgm
          JOIN lead_groups lg ON lg.id = lgm.group_id
@@ -253,6 +260,18 @@ router.get('/', async (req, res) => {
         lc.status AS cadence_status, lc.current_channel AS cadence_channel, lc.next_touch_at AS cadence_next_at
       FROM hotel_leads hl
       LEFT JOIN lead_cadence lc ON lc.lead_id = hl.id
+      LEFT JOIN LATERAL (
+        SELECT
+          COUNT(*) FILTER (WHERE ${sinceP}::timestamp IS NULL OR COALESCE(l.sent_at, l.created_at) >= ${sinceP}::timestamp)::int AS mail_sent,
+          MAX(COALESCE(l.sent_at, l.created_at)) FILTER (WHERE ${sinceP}::timestamp IS NULL OR COALESCE(l.sent_at, l.created_at) >= ${sinceP}::timestamp) AS mail_last_sent_at,
+          COUNT(l.opened_at) FILTER (WHERE ${sinceP}::timestamp IS NULL OR COALESCE(l.sent_at, l.created_at) >= ${sinceP}::timestamp)::int AS mail_opened,
+          MAX(l.opened_at) FILTER (WHERE ${sinceP}::timestamp IS NULL OR COALESCE(l.sent_at, l.created_at) >= ${sinceP}::timestamp) AS mail_last_opened_at,
+          COUNT(*) FILTER (WHERE ${sinceP}::timestamp IS NOT NULL AND COALESCE(l.sent_at, l.created_at) < ${sinceP}::timestamp AND es.provider <> 'brevo')::int AS mail_old_undelivered,
+          BOOL_OR(es.provider = 'brevo') AS mail_via_brevo,
+          EXISTS (SELECT 1 FROM email_logs ri WHERE ri.lead_id = hl.id AND ri.direction = 'in') AS mail_replied
+        FROM email_logs l LEFT JOIN email_senders es ON es.id = l.sender_id
+        WHERE l.lead_id = hl.id AND l.direction = 'out' AND l.error IS NULL
+      ) em ON TRUE
       ${where}
       ORDER BY ${channel === 'call' ? 'hl.call_needed_at DESC,' : ''} hl.lead_score DESC, hl.created_at DESC
       LIMIT ${limitP} OFFSET ${offsetP}
@@ -263,6 +282,53 @@ router.get('/', async (req, res) => {
   } catch (err) {
     console.error('[Leads GET]', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// "Send now" (Leads page, Email tab). Never skips a safety check: suppression, mailbox pause and daily
+// cap, verified address, research for AI-written emails, replied/opted-out leads.
+//  1. Lead waiting for its fresh-start re-send → its original first email, same text, same mailbox.
+//  2. Lead in an active sequence → that sequence's next step right now (AI-written, research required).
+//  3. Directory lead whose cadence is on email → its next email touch at the next 10-minute run.
+//  Otherwise → the reason it can't be emailed.
+router.post('/:id/send-now', async (req, res) => {
+  const leadId = Number(req.params.id);
+  try {
+    const lead = (await pool.query('SELECT * FROM hotel_leads WHERE id = $1', [leadId])).rows[0];
+    if (!lead) return res.status(404).json({ ok: false, message: 'Lead not found' });
+    if (!lead.email) return res.json({ ok: false, message: 'This lead has no email address.' });
+    if (['not_interested', 'opted_out'].includes(lead.status)) return res.json({ ok: false, message: `Not sent: the lead is marked ${lead.status.replace('_', ' ')}.` });
+    if (await SuppressionService.isSuppressed(lead.email)) return res.json({ ok: false, message: 'Not sent: this address unsubscribed or bounced.' });
+
+    const [resendRow] = await FreshResend.listEligible({ leadId });
+    if (resendRow) {
+      const r = await FreshResend.resendOne(resendRow, { manual: true });
+      if (r.ok) return res.json({ ok: true, message: `Original first email re-sent from ${r.from}.` });
+      const why = { mailbox_paused: 'its mailbox is paused', mailbox_full_today: "its mailbox reached today's cap", send_failed: `the mail server refused it (${r.error})`, suppressed: 'the address is suppressed', original_mailbox_missing: 'its original mailbox no longer exists' };
+      return res.json({ ok: false, message: `Not sent: ${why[r.reason] || r.reason}.` });
+    }
+
+    if (lead.email_status !== 'verified') return res.json({ ok: false, message: `Not sent: the email is "${lead.email_status || 'not checked'}", not verified.` });
+
+    const seq = (await pool.query(`SELECT id FROM lead_sequences WHERE lead_id = $1 AND status = 'active' LIMIT 1`, [leadId])).rows[0];
+    if (seq) {
+      const { runSequenceForLead } = require('../workers/sequenceEmailWorker');
+      const r = await runSequenceForLead(leadId);
+      return res.json({ ok: r.outcome === 'sent', message: r.message || r.outcome });
+    }
+
+    if (lead.cadence_managed) {
+      const c = (await pool.query(`SELECT status, current_channel FROM lead_cadence WHERE lead_id = $1`, [leadId])).rows[0];
+      if (c && ['active', 'resting'].includes(c.status) && c.current_channel === 'email') {
+        await pool.query(`UPDATE lead_cadence SET next_touch_at = NOW(), status = 'active', updated_at = NOW() WHERE lead_id = $1`, [leadId]);
+        return res.json({ ok: true, message: 'Queued: its email goes out at the next run (within 10 minutes, 9 am to 6 pm Mon to Sat).' });
+      }
+      return res.json({ ok: false, message: `Not sent: this directory lead's schedule is ${c ? `${c.status} on ${c.current_channel || 'no channel'}` : 'not started'}, not on email.` });
+    }
+    return res.json({ ok: false, message: 'Not sent: the lead is not in any email sequence. Enroll it in a sequence first.' });
+  } catch (err) {
+    console.error('[Leads send-now]', err.message);
+    res.status(500).json({ ok: false, message: err.message });
   }
 });
 
@@ -509,14 +575,15 @@ router.post('/verify-emails', async (req, res) => {
         results.push({ id: lead.id, email: lead.email, result: 'error' });
         continue;
       }
-      const newStatus = verification.valid ? 'verified' : 'unverifiable';
-      counts[newStatus]++;
+      const newStatus = statusForVerification(verification);
+      counts[newStatus] = (counts[newStatus] || 0) + 1;
       await pool.query(
         `UPDATE hotel_leads
-         SET email_status = $1, email_verify_attempts = COALESCE(email_verify_attempts, 0) + 1,
+         SET email_status = $1, email_verify_result = $3, email_verify_reason = $4,
+             email_verify_attempts = COALESCE(email_verify_attempts, 0) + 1,
              last_verify_attempt_at = NOW(), updated_at = NOW()
          WHERE id = $2`,
-        [newStatus, lead.id]
+        [newStatus, lead.id, verification.status, verification.reason ? String(verification.reason).slice(0, 60) : null]
       );
       if (newStatus === 'unverifiable') {
         const stopped = await pool.query(

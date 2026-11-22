@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS hotel_leads (
     email_source VARCHAR(50), -- scraped | domain_list | import | hunter | snov | linkedin
     email_verify_attempts INT DEFAULT 0, -- hourly re-verification worker attempt counter (max 3)
     last_verify_attempt_at TIMESTAMP,
+    email_verify_result VARCHAR(20), -- mails.so answer: deliverable|risky|unknown|undeliverable (migrate_email_verify_result.sql)
+    email_verify_reason VARCHAR(60), -- mails.so reason, e.g. catch_all, invalid_domain
     research_attempts INT DEFAULT 0, -- workers/researchWorker.js retry counter (max RESEARCH_MAX_ATTEMPTS)
     last_research_attempt_at TIMESTAMP,
     status VARCHAR(50) DEFAULT 'new', -- 'new', 'interested', 'demo_qualified', 'responded', 'no_response'

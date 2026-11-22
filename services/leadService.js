@@ -1,5 +1,5 @@
 const pool = require('../config/db');
-const { verifyEmail } = require('./emailVerifierService');
+const { verifyEmail, statusForVerification } = require('./emailVerifierService');
 
 class LeadService {
   // Add leads (bulk) — skips duplicates by email (when present) or hotel_name + city.
@@ -27,29 +27,33 @@ class LeadService {
         }
 
         let emailStatus = lead.email_status || (lead.email ? 'found' : 'unknown');
+        let verifyResult = null;
+        let verifyReason = null;
         if (lead.channel === 'email' && lead.email) {
           const verification = await verifyEmail(lead.email);
           // 'error' means the verifier couldn't be reached / isn't configured — leave it
           // as 'unknown' rather than falsely branding it undeliverable. Only an explicit
-          // non-deliverable result from the provider earns 'unverifiable'.
-          emailStatus = verification.status === 'error'
-            ? 'unknown'
-            : (verification.valid ? 'verified' : 'unverifiable');
+          // non-deliverable (non-catch-all) result from the provider earns 'unverifiable'.
+          emailStatus = statusForVerification(verification) || 'unknown';
+          if (verification.status !== 'error') {
+            verifyResult = verification.status;
+            verifyReason = verification.reason ? String(verification.reason).slice(0, 60) : null;
+          }
         }
 
         const result = await pool.query(
           `INSERT INTO hotel_leads
              (hotel_name, owner_name, email, whatsapp_number, city, source, status,
               channel, website, email_status, email_source, phone, business_category, cadence_managed, niche,
-              enroll_sequence_id)
-           VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 'new'), $8, $9, $10, $11, $12, $13, $14, $15, $16)
+              enroll_sequence_id, email_verify_result, email_verify_reason)
+           VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 'new'), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
            RETURNING id, hotel_name`,
           [lead.hotel_name, lead.owner_name || '', lead.email || '',
            lead.whatsapp_number || '', lead.city || '', lead.source || 'manual', lead.status || null,
            lead.channel || 'whatsapp', lead.website || '',
            emailStatus, lead.email_source || null, lead.phone || null,
            lead.business_category || null, Boolean(lead.cadence_managed), lead.niche || null,
-           lead.enroll_sequence_id || null]
+           lead.enroll_sequence_id || null, verifyResult, verifyReason]
         );
         if (result.rows.length > 0) inserted.push({ ...result.rows[0], email_status: emailStatus });
       }

@@ -19,11 +19,15 @@ function normalizeMessageId(id) {
 // thread is targeted (sequence follow-ups threading onto the conversation so far). A lead
 // with no logged messages yet (step-0 cold email) gets null headers — a genuinely new thread.
 async function getThreadHeaders(leadId, inReplyTo = null) {
+  // Mail before EMAIL_FRESH_START_AT never reached the lead (utils/freshStart.js) — don't thread onto it.
+  const { getFreshStartAt } = require('./freshStart');
+  const since = await getFreshStartAt();
   const result = await pool.query(
     `SELECT provider_message_id FROM email_logs
      WHERE lead_id = $1 AND provider_message_id IS NOT NULL
+       AND ($2::timestamp IS NULL OR COALESCE(sent_at, created_at) >= $2::timestamp)
      ORDER BY COALESCE(sent_at, created_at) ASC`,
-    [leadId]
+    [leadId, since]
   );
   const ids = [...new Set(result.rows.map(r => normalizeMessageId(r.provider_message_id)).filter(Boolean))];
   const target = normalizeMessageId(inReplyTo) || ids[ids.length - 1] || null;

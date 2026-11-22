@@ -4,6 +4,7 @@ const WABAService = require('../services/wabaService');
 const { getSetting } = require('../services/settingsService');
 const { getPipeline } = require('../services/pipelineService');
 const router = express.Router();
+const { getFreshStartAt } = require('../utils/freshStart');
 
 // Overview stats + per-campaign breakdown
 router.get('/', async (req, res) => {
@@ -91,6 +92,9 @@ router.get('/health', async (req, res) => {
 // Email channel analytics: per-sender-domain health, per-sequence funnel, agent activity feed
 router.get('/email', async (req, res) => {
   try {
+    // Counts start at EMAIL_FRESH_START_AT (owner 2026-11-22: the broken Oct–Nov SMTP sends are left
+    // out of the report; the rows stay in email_logs). Blank setting = all time.
+    const since = await getFreshStartAt();
     const [senderHealthRes, sequenceFunnelRes, activityFeedRes] = await Promise.all([
       pool.query(`
         SELECT
@@ -106,9 +110,10 @@ router.get('/email', async (req, res) => {
           COUNT(*) FILTER (WHERE el.direction = 'out' AND el.bounced_at IS NOT NULL)::int AS bounced
         FROM email_senders es
         LEFT JOIN email_logs el ON el.sender_id = es.id
+          AND ($1::timestamp IS NULL OR COALESCE(el.sent_at, el.created_at) >= $1::timestamp)
         GROUP BY es.id, es.label, es.from_email, es.sending_domain, es.provider, es.status
         ORDER BY es.created_at DESC
-      `),
+      `, [since]),
       pool.query(`
         WITH log_stats AS (
           SELECT sequence_id,
@@ -119,6 +124,7 @@ router.get('/email', async (req, res) => {
             COUNT(*) FILTER (WHERE direction = 'out' AND opened_at IS NOT NULL)::int AS opened,
             COUNT(*) FILTER (WHERE direction = 'in')::int                      AS replied
           FROM email_logs
+          WHERE ($1::timestamp IS NULL OR COALESCE(sent_at, created_at) >= $1::timestamp)
           GROUP BY sequence_id
         ),
         enrollment_stats AS (
@@ -143,7 +149,7 @@ router.get('/email', async (req, res) => {
         LEFT JOIN log_stats ls ON ls.sequence_id = s.id
         LEFT JOIN enrollment_stats en ON en.sequence_id = s.id
         ORDER BY s.created_at DESC
-      `),
+      `, [since]),
       pool.query(`
         SELECT aa.id, aa.lead_id, aa.action, aa.detail, aa.score, aa.decision, aa.created_at, hl.hotel_name
         FROM agent_actions aa
@@ -154,6 +160,7 @@ router.get('/email', async (req, res) => {
     ]);
 
     res.json({
+      since,
       senderHealth: senderHealthRes.rows,
       sequenceFunnel: sequenceFunnelRes.rows,
       activityFeed: activityFeedRes.rows,

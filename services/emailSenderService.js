@@ -223,10 +223,38 @@ class EmailSenderService {
   // from sender A, then the next 10 from B, … in id order, wrapping around. A sender that is paused
   // or out of today's capacity is skipped. Each call takes one slot, so only call it when about to
   // send. Position is kept in settings key EMAIL_ROTATION_STATE ({ senderId, count }).
+  // Mailboxes kept out of the cold-email rotation (settings COLD_EMAIL_EXCLUDE_SENDER_IDS, comma ids).
+  // Owner 2026-11-22: the Brevo mailbox (id 1) is for Opportunity applications and alerts, not cold
+  // outreach. Follow-ups to a lead already emailed from an excluded mailbox still use it (sticky).
+  static async coldExcludedIds() {
+    const raw = String((await getSetting('COLD_EMAIL_EXCLUDE_SENDER_IDS')) || '');
+    return new Set(raw.split(',').map((x) => Number.parseInt(x.trim(), 10)).filter(Number.isFinite));
+  }
+
+  // Spacing between cold sends from one mailbox (settings EMAIL_SENDER_MIN_GAP_MINUTES, 0/blank = off).
+  // Spreads a 50/day cap across the send window instead of bursting it at 9 am — a burst from a fresh
+  // mailbox is a spam signal.
+  static async pacedOk(sender) {
+    const gap = Number.parseInt(await getSetting('EMAIL_SENDER_MIN_GAP_MINUTES'), 10);
+    if (!Number.isFinite(gap) || gap <= 0) return true;
+    const { rows } = await pool.query(
+      `SELECT MAX(COALESCE(sent_at, created_at)) AS last FROM email_logs
+       WHERE sender_id = $1 AND direction = 'out' AND error IS NULL`,
+      [sender.id]
+    );
+    const last = rows[0]?.last;
+    return !last || Date.now() - new Date(last).getTime() >= gap * 60000;
+  }
+
   static async pickSenderForRotation() {
     await this.resetStaleCounters();
     const result = await pool.query(`SELECT * FROM email_senders WHERE status = 'active' ORDER BY id`);
-    const eligible = result.rows.filter(s => this.hasCapacity(s));
+    const excluded = await this.coldExcludedIds();
+    const eligible = [];
+    for (const s of result.rows) {
+      if (excluded.has(s.id) || !this.hasCapacity(s)) continue;
+      if (await this.pacedOk(s)) eligible.push(s);
+    }
     if (eligible.length === 0) return null;
 
     const batch = Number.parseInt(await getSetting('EMAIL_ROTATION_BATCH'), 10) || ROTATION_BATCH_DEFAULT;
@@ -283,9 +311,48 @@ class EmailSenderService {
 
     if (prior) {
       if (prior.status !== 'active' || !this.hasCapacity(prior)) return null;
+      if (!(await this.pacedOk(prior))) return null; // its mailbox sent within the min gap — wait
       return prior;
     }
     return this.pickSenderForRotation();
+  }
+
+  // The ONE place SMTP connection options are built. send() and verifySmtp() both use it, so a check
+  // proves what real sending does.
+  // name = the EHLO greeting. Without it nodemailer falls back to os.hostname(), which on the VPS is a
+  // dot-less short name, so it greeted as "[127.0.0.1]" and webhostbox's outbound filter (cloudfilter.net)
+  // silently dropped every mail: 757 SMTP sends 2026-10-07 to 11-22, none delivered. Proven 2026-11-22 with
+  // a same-minute A/B test. Never remove `name`; scripts/test_smtp_ehlo.js guards it.
+  static smtpTransportOptions(cfg) {
+    const name = String(process.env.SMTP_EHLO_NAME || 'bot.dreamstechnology.in').trim();
+    return {
+      name,
+      host: cfg.host,
+      port: cfg.port,
+      secure: EmailSenderService.tlsForPort(cfg.port, cfg.secure ?? Number(cfg.port) === 465),
+      auth: { user: cfg.user, pass: cfg.pass },
+    };
+  }
+
+  // Connects and logs in exactly like send() (no email sent) and reports the EHLO greeting the server saw.
+  static async verifySmtp(sender) {
+    const cfg = typeof sender.smtp_config === 'string' ? JSON.parse(sender.smtp_config) : (sender.smtp_config || {});
+    const lines = [];
+    const capture = (...a) => { const m = a.filter((x) => typeof x === 'string').join(' '); if (/EHLO/i.test(m)) lines.push(m); };
+    const opts = {
+      ...EmailSenderService.smtpTransportOptions(cfg),
+      connectionTimeout: 20000,
+      logger: { info: capture, debug: capture, warn: () => {}, error: () => {}, trace: () => {}, fatal: () => {}, level: () => {} },
+      debug: true,
+    };
+    let ok = true;
+    let error = null;
+    try { await nodemailer.createTransport(opts).verify(); } catch (err) { ok = false; error = err.message; }
+    const ehlo = (lines.find((l) => /EHLO\s+\S/i.test(l)) || '').replace(/^.*EHLO\s+/i, '').trim();
+    return {
+      ok, error, host: cfg.host, port: cfg.port, secure: opts.secure, ehlo,
+      badGreeting: !ehlo || /127\.0\.0\.1|localhost/i.test(ehlo),
+    };
   }
 
   // Optional extras beyond the body:
@@ -325,17 +392,7 @@ class EmailSenderService {
         messageId = response.data.messageId;
       } else if (sender.provider === 'smtp') {
         const cfg = typeof sender.smtp_config === 'string' ? JSON.parse(sender.smtp_config) : (sender.smtp_config || {});
-        const transporter = nodemailer.createTransport({
-          // EHLO name. Without it nodemailer falls back to os.hostname(), which on the VPS is a
-          // dot-less short name, so it greets as "[127.0.0.1]". webhostbox's outbound filter
-          // (cloudfilter.net) silently dropped every such mail: 757 SMTP sends Oct–Nov 2026, 0 opens.
-          // Proven 2026-11-22: same mailbox, same minute, [127.0.0.1] never arrived; this name → Gmail inbox.
-          name: process.env.SMTP_EHLO_NAME || 'bot.dreamstechnology.in',
-          host: cfg.host,
-          port: cfg.port,
-          secure: EmailSenderService.tlsForPort(cfg.port, cfg.secure ?? Number(cfg.port) === 465),
-          auth: { user: cfg.user, pass: cfg.pass },
-        });
+        const transporter = nodemailer.createTransport(EmailSenderService.smtpTransportOptions(cfg));
         const info = await transporter.sendMail({
           from: `"${sender.from_name || sender.label}" <${sender.from_email}>`,
           to,

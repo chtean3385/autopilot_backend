@@ -12,9 +12,9 @@ const { getRunning } = require('../utils/jobTracker');
 // services/schedulerService.js — they only drive the "next run" clock shown in the UI.
 const IST = 'Asia/Kolkata';
 const JOBS = [
-  { key: 'cadence', cron: '*/15 * * * *', every: 'Every 15 min' },
+  { key: 'cadence', cron: '*/10 * * * *', every: 'Every 10 min' },
   { key: 'resort_pipeline', cron: '7,22,37,52 * * * *', every: 'Every 15 min' },
-  { key: 'email_sequences', cron: '*/15 * * * *', every: 'Every 15 min' },
+  { key: 'email_sequences', cron: '*/10 * * * *', every: 'Every 10 min' },
   { key: 'whatsapp_followups', cron: '0 12 * * *', tz: IST, every: 'Daily 12:00 pm' },
   { key: 'campaigns', cron: '*/5 * * * *', every: 'Every 5 min' },
   { key: 'agent_tasks', cron: '* * * * *', every: 'Every minute' },
