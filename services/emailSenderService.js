@@ -326,6 +326,11 @@ class EmailSenderService {
       } else if (sender.provider === 'smtp') {
         const cfg = typeof sender.smtp_config === 'string' ? JSON.parse(sender.smtp_config) : (sender.smtp_config || {});
         const transporter = nodemailer.createTransport({
+          // EHLO name. Without it nodemailer falls back to os.hostname(), which on the VPS is a
+          // dot-less short name, so it greets as "[127.0.0.1]". webhostbox's outbound filter
+          // (cloudfilter.net) silently dropped every such mail: 757 SMTP sends Oct–Nov 2026, 0 opens.
+          // Proven 2026-11-22: same mailbox, same minute, [127.0.0.1] never arrived; this name → Gmail inbox.
+          name: process.env.SMTP_EHLO_NAME || 'bot.dreamstechnology.in',
           host: cfg.host,
           port: cfg.port,
           secure: EmailSenderService.tlsForPort(cfg.port, cfg.secure ?? Number(cfg.port) === 465),
