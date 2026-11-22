@@ -152,11 +152,13 @@ async function handleResortReply(lead, incomingText) {
     ? `\n\nA demo is ALREADY BOOKED for ${state.demo_slot}. Don't ask for a slot again — answer their message; if they want to change it, ask for the new date and time.`
     : '';
 
+  const stages = await agentSvc.getStages(agent.id);
+  const currentStage = agentSvc.matchStage(stages, memory.current_stage) || stages[0] || null;
   const extraContext =
     `${formText(lead)}\nToday is ${istTodayText()} (India time).` +
     `\n\nProduct knowledge — the ONLY facts you may state:\n${knowledge.map((k) => `### ${k.title}\n${k.content}`).join('\n\n')}` +
     `\n\nScreenshots we can attach separately (the system decides; you may say "sharing a screenshot" only if the lead asked to see the software): ${Object.values(SCREENSHOTS).map((s) => s.label).join(', ')}.` +
-    gateNote + demoNote +
+    gateNote + demoNote + agentSvc.stageListText(stages, currentStage) +
     `\n\nEVERY message already sent to this lead is below. NEVER repeat one or lightly reword it. If you have nothing new to say, return an empty "text":\n` +
     (priorOutbound.length ? priorOutbound.map((m) => `- ${m}`).join('\n') : '(none yet)');
 
@@ -192,7 +194,7 @@ async function handleResortReply(lead, incomingText) {
   }
   if (!sent.success) throw new Error(sent.error || 'Could not send Dream Stay reply');
   await logOut(lead.id, 'reply', sent.messageId, result.text);
-  await agentSvc.saveMemory(lead.id, agent.id, { ...memory, ...meta.memory, current_stage: meta.memory?.current_stage || memory.current_stage || 'engage' });
+  await agentSvc.saveMemory(lead.id, agent.id, { ...memory, ...meta.memory, current_stage: (agentSvc.matchStage(stages, meta.memory?.current_stage) || currentStage)?.stage_key || 'engage' });
   await agentSvc.logAgentAction(lead.id, 'whatsapp_reply_sent', { detail: { gate, pipeline: 'resort_crm', image: turn.image }, draftText: result.text, decision: gate.toLowerCase() });
 
   if (turn.image) {

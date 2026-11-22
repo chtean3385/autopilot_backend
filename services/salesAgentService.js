@@ -113,16 +113,34 @@ async function detectIntent({ agent, leadId, message, memory }) {
   return { intent: allowed.has(parsed.intent) ? parsed.intent : DEFAULT_INTENT, confidence: Number(parsed.confidence) || 0 };
 }
 
-async function getStage(agentId, memory, intent) {
-  const result = await pool.query(
+async function getStages(agentId) {
+  return (await pool.query(
     `SELECT * FROM agent_stage_rules WHERE agent_id = $1 AND active = TRUE ORDER BY stage_order`, [agentId]
-  );
-  const stages = result.rows;
-  if (!stages.length) return null;
-  const current = stages.find(s => s.stage_key === memory.current_stage);
-  if (current) return current;
+  )).rows;
+}
+
+// The drafter returns memory.current_stage as free text. Until 2026-11-22 it was never shown the
+// configured keys, so it wrote the stage NAME ("Find Decision Maker"), the prompt's own placeholder
+// ("configured stage key") or invented keys, and getStage() never matched: every conversation sat in
+// stage 1 forever. Accept a key or a name (any case); anything else is not a stage.
+function matchStage(stages, value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (!v || !stages?.length) return null;
+  return stages.find(s => s.stage_key.toLowerCase() === v || String(s.stage_name || '').toLowerCase() === v) || null;
+}
+
+// The funnel shown to the drafter, so it can move the lead forward with a real key.
+function stageListText(stages, current) {
+  if (!stages?.length) return '';
+  return '\n\nFunnel stages (in order). Set memory.current_stage to exactly one of these keys: keep the current one, or move to the next once its objective is met:\n'
+    + stages.map(s => `- ${s.stage_key}${current && s.stage_key === current.stage_key ? ' (CURRENT)' : ''}: ${s.stage_name} — ${s.objective}`).join('\n');
+}
+
+async function getStage(agentId, memory, intent, stages = null) {
+  const list = stages || await getStages(agentId);
+  if (!list.length) return null;
   // First configured stage is the safe initial state; stage advancement is a structured model output.
-  return stages[0];
+  return matchStage(list, memory.current_stage) || list[0];
 }
 
 async function getKnowledge(agentId, stageKey, intent) {
@@ -468,7 +486,8 @@ async function handleReply(lead, incomingText) {
     await logAgentAction(lead.id, 'whatsapp_sequence_stopped', { detail: { reason: 'stop_intent' }, decision: 'stop' });
     return { skipped: true, reason: 'stop' };
   }
-  const stage = await getStage(agent.id, memory, intent);
+  const stages = await getStages(agent.id);
+  const stage = await getStage(agent.id, memory, intent, stages);
   const knowledge = await getKnowledge(agent.id, stage?.stage_key, intent);
   // On HANDOFF the AI still replies (so the lead isn't left waiting) but must stay in its
   // lane: acknowledge, promise a personal follow-up, don't quote prices or commit to anything.
@@ -476,6 +495,7 @@ async function handleReply(lead, incomingText) {
     ? `\n\nThis lead asked for something a human teammate will handle personally (pricing, a call, a demo, or support). Reply warmly in 1-2 sentences: acknowledge exactly what they asked, and tell them a team member will personally follow up with them very shortly. Answer only what is factually in the knowledge above. Do NOT quote prices, discounts, or timelines, and do NOT promise anything specific.`
     : '';
   const extraContext = buildContext({ lead, campaign, memory, intent, stage, knowledge, handoffReason: null })
+    + stageListText(stages, stage)
     + handoffGuard
     + `\n\nEVERY message already sent to this lead is below. NEVER repeat one or lightly reword it. `
     + `If everything worth saying has already been said, return an empty string for "text" and we will bring in a human:\n`
@@ -518,7 +538,7 @@ async function handleReply(lead, incomingText) {
   if (!sent.success) throw new Error(sent.error || 'Could not send sales reply');
   await pool.query(`INSERT INTO outreach_logs (lead_id, campaign_id, template_id, waba_message_id, message_type, message_text, sent_at)
     SELECT $1, campaign_id, template_id, $2, 'reply', $3, NOW() FROM outreach_logs WHERE lead_id=$1 ORDER BY sent_at DESC LIMIT 1`, [lead.id, sent.messageId, result.text]);
-  await saveMemory(lead.id, agent.id, { ...memory, ...meta.memory, current_stage: meta.memory?.current_stage || stage?.stage_key || memory.current_stage });
+  await saveMemory(lead.id, agent.id, { ...memory, ...meta.memory, current_stage: (matchStage(stages, meta.memory?.current_stage) || stage)?.stage_key || memory.current_stage });
   await pool.query(`UPDATE outreach_logs SET lead_status_after=$1, qualified_for_demo=$2 WHERE id=(SELECT id FROM outreach_logs WHERE lead_id=$3 AND response_received=TRUE ORDER BY response_received_at DESC NULLS LAST LIMIT 1)`, [(meta.status || 'continue').toLowerCase(), meta.status === 'QUALIFIED', lead.id]);
   await logAgentAction(lead.id, 'whatsapp_reply_sent', { detail: { intent, gate, stage: stage?.stage_key || null }, draftText: result.text, decision: (meta.status || 'continue').toLowerCase() });
 
@@ -547,7 +567,7 @@ async function handleReply(lead, incomingText) {
 module.exports = {
   handleReply, logAgentAction, resolveAgent,
   // Reused by resortReplyService.js (Dream Stay ad leads).
-  markNeedsAttention, notifyOwner, getMemory, saveMemory,
+  markNeedsAttention, notifyOwner, getMemory, saveMemory, getStages, matchStage, stageListText,
   // Reused by cadenceReplyService.js (directory leads) — same gate, same never-repeat check.
   classifyReplyIntent, tooSimilarToPrior, detectHandoffReason, getConversationHistory,
   looksLikeAutoReply, markAutoReply,
