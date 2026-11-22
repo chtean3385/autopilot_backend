@@ -96,7 +96,11 @@ router.get('/email', async (req, res) => {
         SELECT
           es.id, es.label, es.from_email, es.sending_domain, es.provider, es.status,
           COUNT(*) FILTER (WHERE el.direction = 'out')::int                              AS sent,
-          COUNT(*) FILTER (WHERE el.direction = 'out' AND el.error IS NULL)::int          AS delivered,
+          COUNT(*) FILTER (WHERE el.direction = 'out' AND el.error IS NULL)::int          AS accepted,
+          -- Delivered = proof it arrived: Brevo's delivered webhook, or our own open pixel loaded.
+          -- "Accepted by the SMTP server" is NOT delivery (2026-11-22: 757 SMTP mails accepted, none arrived).
+          COUNT(*) FILTER (WHERE el.direction = 'out' AND el.error IS NULL
+                             AND (el.delivered_at IS NOT NULL OR el.opened_at IS NOT NULL))::int AS delivered,
           COUNT(*) FILTER (WHERE el.direction = 'out' AND el.opened_at IS NOT NULL)::int  AS opened,
           COUNT(*) FILTER (WHERE el.direction = 'in')::int                                AS replied,
           COUNT(*) FILTER (WHERE el.direction = 'out' AND el.bounced_at IS NOT NULL)::int AS bounced
@@ -109,7 +113,10 @@ router.get('/email', async (req, res) => {
         WITH log_stats AS (
           SELECT sequence_id,
             COUNT(*) FILTER (WHERE direction = 'out')::int                     AS sent,
-            COUNT(*) FILTER (WHERE direction = 'out' AND error IS NULL)::int   AS delivered,
+            COUNT(*) FILTER (WHERE direction = 'out' AND error IS NULL)::int   AS accepted,
+            COUNT(*) FILTER (WHERE direction = 'out' AND error IS NULL
+                               AND (delivered_at IS NOT NULL OR opened_at IS NOT NULL))::int AS delivered,
+            COUNT(*) FILTER (WHERE direction = 'out' AND opened_at IS NOT NULL)::int AS opened,
             COUNT(*) FILTER (WHERE direction = 'in')::int                      AS replied
           FROM email_logs
           GROUP BY sequence_id
@@ -128,7 +135,9 @@ router.get('/email', async (req, res) => {
           COALESCE(en.dead, 0)             AS dead,
           COALESCE(en.waiting_estimate, 0) AS waiting_estimate,
           COALESCE(ls.sent, 0)             AS sent,
+          COALESCE(ls.accepted, 0)         AS accepted,
           COALESCE(ls.delivered, 0)        AS delivered,
+          COALESCE(ls.opened, 0)           AS opened,
           COALESCE(ls.replied, 0)          AS replied
         FROM sequences s
         LEFT JOIN log_stats ls ON ls.sequence_id = s.id
