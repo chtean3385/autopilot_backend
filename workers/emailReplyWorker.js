@@ -238,7 +238,7 @@ async function pollSenderMailbox(sender) {
   const imapClient = new ImapFlow({
     host: cfg.host,
     port: cfg.port || 993,
-    secure: cfg.secure ?? cfg.port !== 143,
+    secure: EmailSenderService.tlsForPort(cfg.port, cfg.secure ?? Number(cfg.port) !== 143),
     auth: { user: cfg.user, pass: cfg.pass },
     logger: false,
   });

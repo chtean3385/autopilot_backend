@@ -44,18 +44,38 @@ class EmailSenderService {
         data.label,
         data.provider || 'brevo',
         data.api_key || null,
-        data.smtp_config ? JSON.stringify(data.smtp_config) : null,
+        data.smtp_config ? JSON.stringify(EmailSenderService.normalizeMailConfig(data.smtp_config)) : null,
         data.from_name || null,
         data.from_email,
         data.sending_domain || null,
         data.daily_cap ?? 20,
         data.warmup_started_at || null,
-        data.imap_config ? JSON.stringify(data.imap_config) : null,
+        data.imap_config ? JSON.stringify(EmailSenderService.normalizeMailConfig(data.imap_config)) : null,
         data.status || null,
         data.signature ? String(data.signature).trim() : null,
       ]
     );
     return result.rows[0];
+  }
+
+  // Ports 465 (SMTPS) and 993 (IMAPS) are SSL from the first byte; 587/25 (SMTP) and 143 (IMAP)
+  // start plain and upgrade with STARTTLS. A mismatched "secure" flag can never connect — it shows up
+  // as "Greeting never received" / "Failed to receive greeting" — so the port decides.
+  static tlsForPort(port, secure) {
+    const p = Number(port);
+    if (p === 465 || p === 993) return true;
+    if (p === 587 || p === 25 || p === 143) return false;
+    return !!secure;
+  }
+
+  static normalizeMailConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return cfg;
+    const out = { ...cfg };
+    if (out.port !== undefined && out.port !== '') out.port = Number(out.port);
+    out.secure = this.tlsForPort(out.port, out.secure);
+    if (typeof out.host === 'string') out.host = out.host.trim();
+    if (typeof out.user === 'string') out.user = out.user.trim();
+    return out;
   }
 
   static async update(id, data) {
@@ -72,9 +92,13 @@ class EmailSenderService {
     // round-trips the real secret back into the form, so an untouched password field always
     // submits blank. Without this merge, saving ANY change to a sender (even just the label)
     // would silently wipe its stored IMAP/SMTP password.
+    // Also: an edit from the form doesn't carry imap_config.lastUid (the reply-detection watermark);
+    // dropping it would make the reply poller rescan the whole inbox from UID 1.
     let existing = null;
-    const needsExisting = (data.imap_config && !data.imap_config.pass) || (data.smtp_config && !data.smtp_config.pass) || data.api_key === '';
+    const needsExisting = data.imap_config || (data.smtp_config && !data.smtp_config.pass) || data.api_key === '';
     if (needsExisting) existing = await this.getById(id);
+    if (data.smtp_config) data = { ...data, smtp_config: EmailSenderService.normalizeMailConfig(data.smtp_config) };
+    if (data.imap_config) data = { ...data, imap_config: EmailSenderService.normalizeMailConfig(data.imap_config) };
 
     if (data.label !== undefined) set('label', data.label);
     if (data.provider !== undefined) set('provider', data.provider);
@@ -96,9 +120,14 @@ class EmailSenderService {
     if (data.warmup_started_at !== undefined) set('warmup_started_at', data.warmup_started_at);
     if (data.imap_config !== undefined) {
       let imapConfig = data.imap_config;
+      const existingImap = typeof existing?.imap_config === 'string' ? JSON.parse(existing.imap_config || '{}') : (existing?.imap_config || {});
       if (imapConfig && !imapConfig.pass) {
-        const existingImap = typeof existing?.imap_config === 'string' ? JSON.parse(existing.imap_config || '{}') : (existing?.imap_config || {});
         imapConfig = { ...imapConfig, pass: existingImap.pass };
+      }
+      // Keep the watermark when it's still the same mailbox (same user); a different mailbox starts fresh.
+      if (imapConfig && imapConfig.lastUid === undefined && existingImap.lastUid
+          && String(imapConfig.user || '').toLowerCase() === String(existingImap.user || '').toLowerCase()) {
+        imapConfig = { ...imapConfig, lastUid: existingImap.lastUid };
       }
       set('imap_config', imapConfig ? JSON.stringify(imapConfig) : null);
     }
@@ -299,7 +328,7 @@ class EmailSenderService {
         const transporter = nodemailer.createTransport({
           host: cfg.host,
           port: cfg.port,
-          secure: cfg.secure ?? cfg.port === 465,
+          secure: EmailSenderService.tlsForPort(cfg.port, cfg.secure ?? Number(cfg.port) === 465),
           auth: { user: cfg.user, pass: cfg.pass },
         });
         const info = await transporter.sendMail({

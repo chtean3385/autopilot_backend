@@ -93,8 +93,8 @@ router.post('/:id/test-send', async (req, res) => {
     let route = 'Brevo API';
     if (sender.provider === 'smtp') {
       const c = typeof sender.smtp_config === 'string' ? JSON.parse(sender.smtp_config || '{}') : (sender.smtp_config || {});
-      const secure = c.secure ?? Number(c.port) === 465;
-      route = `SMTP ${c.host}:${c.port} (${secure ? 'SSL' : 'STARTTLS/plain'})`;
+      const secure = EmailSenderService.tlsForPort(c.port, c.secure ?? Number(c.port) === 465);
+      route = `SMTP ${c.host}:${c.port} (${secure ? 'SSL' : 'STARTTLS'})`;
     }
     const when = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST';
     const line = `Test email from ${sender.from_email} via ${route}, sent ${when}. If this landed in Spam, mail from this mailbox is likely going to spam for clients too.`;
