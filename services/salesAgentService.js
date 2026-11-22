@@ -491,12 +491,20 @@ async function handleReply(lead, incomingText) {
   const knowledge = await getKnowledge(agent.id, stage?.stage_key, intent);
   // On HANDOFF the AI still replies (so the lead isn't left waiting) but must stay in its
   // lane: acknowledge, promise a personal follow-up, don't quote prices or commit to anything.
+  // Eval 2026-11-22: the old "only say a teammate will follow up" wording threw away the agent's own
+  // scripted answers (pricing line, demo booking) and left the lead with no next step. The owner is
+  // alerted either way; the reply should still answer and keep the conversation moving.
   const handoffGuard = gate === 'HANDOFF'
-    ? `\n\nThis lead asked for something a human teammate will handle personally (pricing, a call, a demo, or support). Reply warmly in 1-2 sentences: acknowledge exactly what they asked, and tell them a team member will personally follow up with them very shortly. Answer only what is factually in the knowledge above. Do NOT quote prices, discounts, or timelines, and do NOT promise anything specific.`
+    ? `\n\nThis lead asked for something a teammate also handles personally (pricing, a call, a demo, or support); the owner has been alerted. Still reply like the agent would: use the agent's own scripted answer for this situation from the knowledge (e.g. the pricing answer, never with a number), then ONE easy next step, usually asking which day and time suits them for the call or demo. If they already gave a day and time, confirm it in one line. Do NOT quote prices, discounts or timelines, and do NOT promise anything the knowledge doesn't support.`
+    : '';
+  // Job seekers, vendors and fellow agencies (eval 2026-11-22: the drafter kept pitching them).
+  const notBuyerGuard = intent === 'NOT_A_BUYER'
+    ? `\n\nThis person is NOT a potential client (job seeker, freelancer, vendor, or a company selling the same service). Reply with ONE short, polite closing line only: no question, no pitch, no follow-up ask. If they asked about jobs, point them to the Jobs page on dreamstechnology.in. Set status to NOT_INTERESTED.`
     : '';
   const extraContext = buildContext({ lead, campaign, memory, intent, stage, knowledge, handoffReason: null })
     + stageListText(stages, stage)
     + handoffGuard
+    + notBuyerGuard
     + `\n\nEVERY message already sent to this lead is below. NEVER repeat one or lightly reword it. `
     + `If everything worth saying has already been said, return an empty string for "text" and we will bring in a human:\n`
     + (priorOutbound.length ? priorOutbound.map(m => `- ${m}`).join('\n') : '(none yet)');
