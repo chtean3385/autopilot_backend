@@ -86,12 +86,23 @@ router.post('/:id/test-send', async (req, res) => {
   try {
     const sender = await EmailSenderService.getById(req.params.id);
     if (!sender) return res.status(404).json({ success: false, error: 'Sender not found' });
-    const to = req.body.to || sender.from_email;
+    const to = String(req.body.to || sender.from_email).trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ success: false, error: 'Invalid recipient address' });
+    // Same send() every real email uses. The body names the mailbox and route so the owner can tell
+    // which test arrived (and which didn't) when testing several mailboxes.
+    let route = 'Brevo API';
+    if (sender.provider === 'smtp') {
+      const c = typeof sender.smtp_config === 'string' ? JSON.parse(sender.smtp_config || '{}') : (sender.smtp_config || {});
+      const secure = c.secure ?? Number(c.port) === 465;
+      route = `SMTP ${c.host}:${c.port} (${secure ? 'SSL' : 'STARTTLS/plain'})`;
+    }
+    const when = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST';
+    const line = `Test email from ${sender.from_email} via ${route}, sent ${when}. If this landed in Spam, mail from this mailbox is likely going to spam for clients too.`;
     const result = await EmailSenderService.send(sender, {
       to,
-      subject: 'Test email from ' + (sender.label || sender.from_email),
-      html: '<p>This is a test email to verify your email sender configuration.</p>',
-      text: 'This is a test email to verify your email sender configuration.',
+      subject: `Test email from ${sender.label || sender.from_email}`,
+      html: `<p>${line}</p>`,
+      text: line,
     });
     res.json(result);
   } catch (err) {
