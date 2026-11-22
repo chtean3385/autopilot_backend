@@ -1,7 +1,7 @@
 const OpenAI = require('openai');
 const pool = require('../config/db');
 const { trackedCompletion } = require('../utils/aiUsage');
-const { SCORING_RUBRIC } = require('../utils/humanTone');
+const { SCORING_RUBRIC, EMAIL_SCORING_RUBRIC } = require('../utils/humanTone');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -185,19 +185,19 @@ function buildColdEmailScorePrompt(stepNumber) {
   const { stageNote, fiveLooksLike } = stepNumber === 0
     ? {
         stageNote: 'This is a FIRST cold outreach email (no prior emails sent to this lead).',
-        fiveLooksLike: 'under 60 words, opens with a specific question about THIS business (not "I hope..." or an introduction), frames the value as the owner\'s outcome in plain words, and ends with one easy yes/no question',
+        fiveLooksLike: '80-130 words of simple Indian English: one line on who is writing (Dreams Technology, Gandhinagar), then a SPECIFIC reason for writing to THIS business (their website/products and one real gap), one clear offer that fixes that gap and brings them more enquiries/orders/sales, and an easy ask such as reply "yes" for a sample',
       }
     : stepNumber === 1
       ? {
           stageNote: 'This is FOLLOW-UP #1 in an outreach sequence — it must read as a genuinely new, short touch, not a rehash of earlier emails in the same thread.',
-          fiveLooksLike: '2-3 short sentences, offers ONE new useful idea or example relevant to their industry (different from the first email) without saying it is a follow-up, and ends with one easy yes/no question',
+          fiveLooksLike: '2-3 short sentences (40-70 words): a brief reminder of what we wrote about, ONE new useful point specific to their business (different from the first email), and the easy ask again in new words',
         }
       : {
           stageNote: `This is the LAST email (touch #${stepNumber + 1}) in an outreach sequence — a short, polite break-up note.`,
-          fiveLooksLike: 'at most 2 sentences, politely says there has been no reply so the timing probably isn\'t right, and asks one easy question like whether to close their file or reconnect later — no new pitch',
+          fiveLooksLike: 'at most 2 sentences, politely says we will not disturb them again and they can reply any time in future — no new pitch',
         };
   return `You are a strict quality reviewer for cold/follow-up sales emails sent by Dreams Technology, a software company in India, to busy Indian business owners. ${stageNote}
-Score the draft from 1 (bad) to 5 (excellent). A 5 reads like a quick personal note from a founder: ${fiveLooksLike}. Score 2 or lower if it has any of: a pleasantry opener ("I hope this finds you well", "I wanted to reach out"), "circling back"/"just following up", tech or marketing jargon (CRM, GA4, integration, solution, streamline, enhance, leverage), criticism of their website, a demo pitch, more than ~80 words, or generic filler that could be sent to any business. For follow-ups, also score low if it repeats an earlier email's subject/angle/wording.
+Score the draft from 1 (bad) to 5 (excellent). A 5 reads like a quick personal note from a founder: ${fiveLooksLike}. Score 2 or lower if it has any of: a pleasantry opener ("I hope this finds you well", "I wanted to reach out"), "circling back"/"just following up", tech or marketing jargon (CRM, GA4, integration, solution, streamline, enhance, leverage), criticism of their website, a demo pitch, more than ~150 words, no clear reason for writing to this specific business, or generic filler that could be sent to any business. A one-line self-introduction is expected, not a pleasantry. For follow-ups, also score low if it repeats an earlier email's subject/angle/wording.
 Respond with ONLY a JSON object: {"score": <1-5 integer>, "feedback": "short reason, especially if below 4"}.`;
 }
 
@@ -225,8 +225,7 @@ async function scoreColdEmail({ leadId, lead, subject, body, stepNumber, strict 
   const userContent = `${buildLeadContext(lead)}\n\nSubject: ${subject}\n\nBody:\n${body}` +
     (strict ? `\n\nVerified facts about this draft (computed by code — always correct, never contradict them):\n${coldEmailFacts(body)}` : '');
   const system = strict
-    ? `${buildColdEmailScorePrompt(stepNumber).replace(/Respond with ONLY a JSON object:[\s\S]*$/, '')}\n${SCORING_RUBRIC}\n` +
-      'An opening question and a closing yes/no question are the intended structure, not "two questions". ' +
+    ? `${buildColdEmailScorePrompt(stepNumber).replace(/Respond with ONLY a JSON object:[\s\S]*$/, '')}\n${EMAIL_SCORING_RUBRIC}\n` +
       'Only deduct for a problem you can quote word-for-word from the draft; if you cannot quote it, it is not there. ' +
       'Respond with ONLY a JSON object: {"issues": [{"quote": "exact words from the draft", "problem": "..."}], "score": <0.0-5.0, one decimal>, "feedback": "what would make it read more personal and human"}. ' +
       'An empty issues list means the score is 5.0.'

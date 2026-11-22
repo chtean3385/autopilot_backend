@@ -110,47 +110,91 @@ const GENERIC_SUBJECT_EXAMPLES = [
   'Transform Your Business Management',
 ];
 
-// Directory cadence emails (humanTone) — the generic stage notes below told the writer to say "what we
-// do, framed as THEIR outcome (more customers, fewer missed inquiries)" and end on "Worth a 10-minute
-// call?", which the strict human-tone scorer marks down as vague/salesy every time: drafts sat at 2-3.5
-// against the 4.5 bar and nothing went out for two days (2026-10-08 → 10-10). These notes ask for the
-// one concrete thing we'd set up instead, so a first draft can actually reach 5.
-const HUMAN_TONE_BANNED = ['we help businesses', 'businesses like yours', 'capture inquiries', 'capture enquiries',
-  'convert', 'more customers', 'more sales', 'grow your', 'modern tools', 'quick chat', '10-minute call',
-  'worth a call', 'discuss', 'something you\'re dealing with', 'something you\'re facing', 'touch base'];
+// Rewritten 2026-11-23 on the owner's review of a real first email ("When a buyer asks Rasman
+// Technologies for an electric motor quote, how do you usually respond...?"): the owner could not tell
+// who was writing or WHY, and the 55-word question-first format read like US cold email. Indian owners
+// expect: who we are, why we are writing to THEM (what we actually found on their website/listing),
+// one concrete offer tied to that finding, and an easy reply. Simple Indian English, ~80-130 words.
+// The research (website facts, products, locations) is the reason for writing, so it is shown in full.
+const SALES_WORDS_BANNED = ['solution', 'leverage', 'streamline', 'unlock', 'elevate', 'boost', 'seamless',
+  'cutting-edge', 'digital transformation', 'next level', 'CRM', 'ERP', 'analytics', 'lead capture', 'leads',
+  'conversion', 'engagement', 'optimize', 'enhance', 'synergy', 'touch base', 'circle back', 'I hope this',
+  'I wanted to reach out', 'I came across'];
 
-function humanToneStageNote(stepNumber) {
-  const banned = `\nNever use these phrases (they read as sales copy): ${HUMAN_TONE_BANNED.map(p => `"${p}"`).join(', ')}.`;
-  if (stepNumber === 0) {
-    return `This is the FIRST email. After "Hi <first name>," write exactly 3 short lines, 30-55 words in total:\n` +
-      `1. One question about a real, everyday moment in THEIR trade, naming their business or one of their actual ` +
-      `products from the research (e.g. "When a plant asks Jet Fibre for a quote on a spiral tank, does it usually ` +
-      `come in by phone, email or WhatsApp?"). Do NOT start with "I".\n` +
-      `2. One plain sentence on the ONE concrete thing Chetan's team would set up for exactly that moment, in the ` +
-      `owner's own words, and what it saves them (e.g. "We set up simple things like a quote request page that ` +
-      `drops each enquiry straight into your WhatsApp, so none sit unanswered over a busy week."). A concrete ` +
-      `thing tied to the same product/moment as line 1, never a vague promise.\n` +
-      `3. One short, low-pressure yes/no question that names their business and that same moment (e.g. "Would ` +
-      `something like that help with tank quotes at Jet Fibre?").\n` +
-      `Only lines 1 and 3 are questions.${banned}`;
-  }
-  if (stepNumber === 1) {
-    return `This is FOLLOW-UP 1. After "Hi <first name>," write 2 short sentences, 20-40 words in total:\n` +
-      `1. ONE new, concrete idea for one of their actual products from the research, different from the earlier ` +
-      `email, stated plainly (e.g. "A small page showing your spiral tank sizes with a WhatsApp button next to each ` +
-      `one tends to get buyers asking for a quote straight away."). Do NOT start with "I". Never invent a story, ` +
-      `client, result or statistic ("I heard of a company that...", "they say it made a huge difference").\n` +
-      `2. One short yes/no question naming their business, e.g. "Would that be useful at Jet Fibre?"\n` +
-      `That last sentence is the ONLY question in the email. Do NOT say "following up", "circling back" or ` +
-      `"checking in". Never offer a website redesign or mention SEO.${banned}`;
-  }
-  return `This is the LAST email. At most 2 sentences, e.g. "Haven't heard back, so I'll assume the timing isn't ` +
-    `right. Should I close your file, or is it worth reconnecting in a few months?" Adapt it to their business. No pitch.${banned}`;
+// "Mr.Ashwani Kr. Vaish" → "Ashwani". Owner names from directories carry titles and initials; the old
+// prompt said "Hi <first name>" and got "Hi Mr.Ashwani Kr. Vaish".
+function cleanFirstName(raw) {
+  const words = String(raw || '').replace(/[.,]/g, ' ').split(/\s+/).filter(Boolean)
+    .filter(w => !/^(mr|mrs|ms|miss|dr|shri|shree|smt|sri|er|ca|prof|m\/s)$/i.test(w));
+  const first = words.find(w => w.length > 1 && /^[A-Za-z]/.test(w));
+  if (!first || /^(sales|admin|info|contact|office|manager|owner|team|accounts|hr|support)$/i.test(first)) return null;
+  return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
 }
 
-const HUMAN_TONE_SUBJECT_RULE = `\nThe subject names the everyday moment from line 1 in plain words, like a ` +
-  `colleague's note (e.g. "spiral tank quotes at jet fibre", "dye catalogue requests"). Never use the words ` +
-  `lead, leads, capture, management, tools, solution, growth or marketing in the subject.`;
+function siteHost(lead) {
+  const raw = String(lead?.website || '').trim();
+  if (!raw) return null;
+  try { return new URL(/^https?:\/\//i.test(raw) ? raw : `http://${raw}`).hostname.replace(/^www\./, ''); } catch { return null; }
+}
+
+// Plain-language facts the email may state as "what we noticed". Only booleans the crawler actually
+// recorded as false become "not found"; null/unknown is never turned into a claim.
+function websiteFindings(research, lead) {
+  const t = research?.technology || {};
+  const host = siteHost(lead);
+  const out = [];
+  if (host) {
+    if (t.forms === false) out.push(`No enquiry/contact form found on ${host} (a buyer cannot send a requirement online)`);
+    if (t.whatsapp === false) out.push(`No WhatsApp chat button on ${host}`);
+    if (t.cms === 'WordPress' && /woocommerce/i.test(t.maturity_note || '')) out.push(`${host} runs on WordPress with WooCommerce (so an enquiry form or product enquiry button can be added to the existing site, no rebuild needed)`);
+    else if (t.cms) out.push(`${host} is built on ${t.cms}`);
+    if (Array.isArray(t.payment_gateways) && t.payment_gateways.length === 0 && /woocommerce|shop|store/i.test(t.maturity_note || '')) out.push(`No online payment option seen on ${host}`);
+  }
+  return out;
+}
+
+function stageNoteFor(stepNumber, { hasResearch, host, trade, city, firstName }) {
+  // "Vinodbhai" / "Hetalben" already carry the honorific; adding "ji" doubles it.
+  const greet = firstName ? `"Hello ${firstName}${/(bhai|ben|behen|ji)$/i.test(firstName) ? '' : ' ji'},"` : '"Hello,"';
+  if (stepNumber === 0) {
+    return `This is the FIRST email to this business. Start with ${greet} then write 4 short paragraphs, 80-130 words in total (not counting the greeting):\n` +
+      `1. WHO WE ARE, one sentence: "I am writing from Dreams Technology, a website and software company in Gandhinagar." (You may adapt slightly, e.g. "We make websites and business software for companies in Gujarat.")\n` +
+      `2. WHY WE ARE WRITING TO THEM, 1-2 sentences, the most important part. Be SPECIFIC: name their website (or where we saw them), at least one of their real products, and the ONE real gap from the research below. A reader must see this email could only have been written to them. ` +
+      (hasResearch && host
+        ? `Say it plainly, e.g. "I checked ${host}. You show a good range of <their real products>, but I could not find a simple enquiry form where a buyer can send their requirement." `
+        : host
+          ? `We have no findings about ${host}, so say where we saw them, e.g. "I saw your business listed as a ${trade}${city ? ` in ${city}` : ''}." Never claim you checked their website or found anything on it. `
+          : `THEY HAVE NO WEBSITE on record. Say where we saw them and that we could not find a website, e.g. "I saw your business listed as a ${trade}${city ? ` in ${city}` : ''}, but I could not find a website for your business." NEVER mention "your website", "your site", or adding anything to an existing site; the offer is a simple business website. `) +
+      `Then one plain line on why that matters for THEIR buyers (e.g. "Many buyers today don't call; they want to send details online and get a quote.").\n` +
+      `3. THE OFFER, 1-2 sentences: the ONE service that fixes exactly that gap (see HOW TO PICK THE OFFER), and how it helps them get more enquiries, orders and sales. E.g. "We can add an enquiry form to your existing website with your product list. Every enquiry comes to your WhatsApp and email, so no buyer is missed and you get more orders." No list of services.\n` +
+      `4. THE ASK, one sentence, easy and low-pressure: e.g. "If you want, reply 'yes' and I will send a short sample of how it will look on your site." Prefer a reply-yes ask over asking for a call.\n` +
+      `At most ONE question mark in the whole email (the ask may be a statement).\n` +
+      `The example sentences above show the IDEA only. Write it in your own words for THIS business; never copy an example sentence word for word, because hundreds of businesses get these emails and each must read as written for them.`;
+  }
+  if (stepNumber === 1) {
+    return `This is a FOLLOW-UP to our first email (shown below). Start with ${greet} then 2-3 short sentences, 40-70 words:\n` +
+      `1. Remind them in a few words what we wrote about, e.g. "I wrote to you last week about an enquiry form for ${host || 'your website'}."\n` +
+      `2. Add ONE new, useful point that is different from the first email and true for their business from the research (another product of theirs, another finding, or a simple example of how it would work for them). Never invent a client, story, result or number.\n` +
+      `3. The same easy ask in new words (reply "yes" for a sample/examples). At most one question mark.`;
+  }
+  return `This is the LAST email. Start with ${greet} then at most 2 short sentences, polite and simple, e.g. "I have not heard back, so I will not disturb you again. If you need any website or software work in future, just reply to this email." No new pitch.`;
+}
+
+// Owner 2026-11-23: "offer our services where they are lacking; always frame it as helping their growth
+// and revenue — everyone needs sales, that is the Indian market." Gap found → our service → sales benefit.
+const GAP_TO_OFFER = `HOW TO PICK THE OFFER: match the ONE gap you state to the service that fixes it, and always say how it brings them more enquiries, more orders and more sales (business owners in India care about sales and growth):
+- No enquiry form / buyers can't send a requirement online → an enquiry form or "Get a quote" button on their existing site; every enquiry reaches their WhatsApp and email, so no buyer is missed and more enquiries turn into orders.
+- No WhatsApp button → a WhatsApp chat button on every product page; buyers message them directly, which brings more enquiries.
+- Shop/WooCommerce but no online payment or ordering → online ordering with payment, so they take orders and advance payments 24x7.
+- Old, slow or not mobile-friendly site → a fresh, fast mobile-friendly website that shows their products properly and builds buyer trust, so more visitors become enquiries.
+- Not found on Google / poor visibility → SEO and Google Business Profile, so buyers searching for their products in their city find them first.
+- No website at all → a simple business website with products and an enquiry button, so buyers who search online can find and contact them.
+- Many enquiries handled on phone/WhatsApp by hand → simple software that keeps every enquiry and follow-up in one place, so no order is lost.
+Say the benefit in plain words ("more enquiries", "more orders", "more sales", "grow your business online"). Never promise numbers or guaranteed results.`;
+
+const HUMAN_TONE_SUBJECT_RULE = `\nSubject: 3-7 plain words about the finding or offer for THEM, lowercase is fine, ` +
+  `e.g. "enquiry form on rasman.in", "whatsapp enquiries for jet fibre tanks". Never use the words lead, leads, ` +
+  `capture, management, tools, solution, growth or marketing.`;
 
 function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research, priorEmails, feedback, lead, { humanTone = false } = {}) {
   const portfolioText = portfolioItems.length
@@ -162,87 +206,59 @@ function buildSystemPrompt(stepNumber, portfolioItems, playbookContext, research
   const notesText = ReplyQualityService.buildPlaybookNotesText(playbookContext?.notes);
 
   const painPoints = Array.isArray(research?.pain_points) ? research.pain_points : [];
-  const recommendedServices = Array.isArray(research?.recommended_services) ? research.recommended_services : [];
   const emailAngles = Array.isArray(research?.email_angles) ? research.email_angles : [];
   const products = Array.isArray(research?.business?.products) ? research.business.products : [];
   const markets = Array.isArray(research?.business?.markets) ? research.business.markets : [];
-  const { angle: angleForStep, others: otherAngles } = selectAngleForStep(emailAngles, stepNumber);
-  const hasRealResearch = painPoints.length > 0 || recommendedServices.length > 0 || emailAngles.length > 0;
+  const locations = Array.isArray(research?.business?.locations) ? research.business.locations : [];
+  const { angle: angleForStep } = selectAngleForStep(emailAngles, stepNumber);
+  const findings = websiteFindings(research, lead);
+  const hasRealResearch = painPoints.length > 0 || products.length > 0 || findings.length > 0 || Boolean(research?.summary);
   const industry = (lead?.business_category || '').trim();
+  const trade = (lead?.niche || industry || 'business').trim();
+  const host = siteHost(lead);
+  const firstName = cleanFirstName(lead?.owner_name);
 
-  // Three branches: real per-lead website research (best case) → CRM-only industry fallback
-  // (lead has no website at all — a lead whose research permanently failed is stopped by the gate
-  // in processRow since 2026-10-07 and never reaches here) → bare minimum if neither exists. The middle branch is what used to be missing: a lead with no research previously fell
-  // straight through to a bare "sell a software demo" prompt with zero lead-specific grounding,
-  // which is exactly what produced the generic emails this whole rewrite is fixing.
   const researchText = hasRealResearch
-    ? `\n\nWebsite research on THIS SPECIFIC lead (scraped from their own site — this is what makes ` +
-      `the email specific instead of generic; the subject line AND the body must each use at least ` +
-      `one real detail below):\n` +
-      (painPoints.length ? `Pain points observed: ${painPoints.join('; ')}\n` : '') +
-      (products.length ? `Products/services they offer: ${products.join('; ')}\n` : '') +
-      (markets.length ? `Markets they serve: ${markets.join('; ')}\n` : '') +
-      (recommendedServices.length && !humanTone ? `Relevant Dreams Technology services to weave in: ${recommendedServices.join('; ')}\n` : '') +
-      (angleForStep ? `The specific angle to lead with in THIS email: ${angleForStep}\n` : '') +
-      (otherAngles.length ? `Other angles reserved for other emails in this sequence — do NOT use these here: ${otherAngles.join('; ')}\n` : '') +
-      `Every claim you make about their business must trace back to something in this research — never invent details beyond it.`
+    ? `\n\nWHAT WE FOUND ABOUT THIS BUSINESS (from our research on their own website; this is the reason we are writing — use it):\n` +
+      (research?.summary ? `About them: ${research.summary}\n` : '') +
+      (products.length ? `Their products/services: ${products.join(', ')}\n` : '') +
+      (locations.length ? `Their locations: ${locations.join(', ')}\n` : '') +
+      (markets.length ? `Markets: ${markets.join(', ')}\n` : '') +
+      (findings.length ? `Website findings you MAY state as fact:\n${findings.map(f => `- ${f}`).join('\n')}\n` : '') +
+      (painPoints.length ? `Gaps our analyst noted (translate into plain words a shop owner uses; never say CRM, analytics, lead capture or engagement): ${painPoints.join('; ')}\n` : '') +
+      (angleForStep ? `Suggested angle for this email: ${angleForStep}\n` : '') +
+      `Only state things listed here. Never invent details about their business.`
     : industry
-      ? `\n\nNo website research is available for this lead (no site to crawl, or the crawl/analysis ` +
-        `permanently failed) — you must still make this email SPECIFIC TO THEIR INDUSTRY using only ` +
-        `this CRM fact: Industry/category: "${industry}"${lead?.city ? `, City: ${lead.city}` : ''}. ` +
-        `Reference something concretely true of how a "${industry}" business actually runs day to day ` +
-        `(what they juggle — bookings/orders, walk-ins, staff schedules, follow-ups, records — pick ` +
-        `whatever is genuinely plausible for THIS industry) so the email reads as written for them, not ` +
-        `as an industry-agnostic template. Do NOT claim to have looked at their website or found anything ` +
-        `on it — none was available, and inventing a website detail would be a fabrication.`
-      : `\n\nNo research or industry data is available for this lead — do not invent business details. ` +
-        `Keep the email short and ask a genuinely open question about how they currently handle ` +
-        `bookings, records, or customer follow-ups, instead of pitching a generic feature list.`;
+      ? `\n\nNo website research is available. CRM facts only: business "${lead?.hotel_name || ''}", trade "${industry}"${lead?.city ? `, city ${lead.city}` : ''}. ` +
+        `Make the email specific to how a "${industry}" business gets and answers buyer enquiries, without claiming you looked at their website.`
+      : `\n\nNo research or industry data is available. Do not invent business details; keep it short and simple.`;
 
   const priorEmailsText = buildPriorEmailsText(priorEmails);
 
-  const subjectRules = `\n\nSubject line rules: it must reference something concrete and specific to ` +
-    `this lead — their industry, their business name, or the angle/pain point above — never a ` +
-    `generic template. Never write a subject resembling any of these (too generic, could be sent ` +
-    `to any business): ${GENERIC_SUBJECT_EXAMPLES.map(s => `"${s}"`).join(', ')}. It must also differ ` +
-    `from every subject already sent, listed below if any.` + (humanTone ? HUMAN_TONE_SUBJECT_RULE : '');
+  const subjectRules = `\n\nSubject line rules: specific to THIS business (their name, website, product or the finding), never a ` +
+    `generic template like ${GENERIC_SUBJECT_EXAMPLES.map(s => `"${s}"`).join(', ')}. It must differ from every subject already sent.` +
+    HUMAN_TONE_SUBJECT_RULE;
 
-  // Reworked 2026-10-07 after ~6k sends got a 27% open but 0.3% reply rate: the old "warm intro
-  // sentence first" structure reliably produced "I hope this message finds you well…" openers and
-  // 80-120 word mini-pitches that people opened and ignored. Now: open on a question about THEIR
-  // business, one outcome line, one yes/no ask — under 60 words. MAX_SEQUENCE_EMAILS caps it at 3.
-  const stageNote = humanTone ? humanToneStageNote(stepNumber) : stepNumber === 0
-    ? `This is the FIRST email. Exactly 3 short lines:\n` +
-      `1. A specific question about how THEIR business handles something, grounded in the research/industry ` +
-      `detail below (e.g. "When a contractor asks Kirit Pumps for a quote on a bitumen pump, how does your team ` +
-      `make sure someone follows up?"). Do NOT start the email with "I".\n` +
-      `2. One sentence on what we do, framed as THEIR outcome (more customers, fewer missed inquiries, less manual ` +
-      `work) — not as our product or services.\n` +
-      `3. One easy yes/no question, e.g. "Worth a 10-minute call?" or "Is this something you're dealing with?"`
-    : stepNumber === 1
-      ? `This is FOLLOW-UP 1. Max 2-3 short sentences. Do NOT say you are "following up", "circling back" or ` +
-        `"checking in" — instead give ONE new, genuinely useful idea or example relevant to their industry ` +
-        `(different from the earlier email), then one easy yes/no question.`
-      : `This is the LAST email. Max 2 sentences, e.g. "Haven't heard back, so I'll assume the timing isn't ` +
-        `right. Should I close your file, or is it worth reconnecting in a few months?" Adapt it to their business.`;
+  const stageNote = stageNoteFor(stepNumber, { hasResearch: hasRealResearch && findings.length > 0, host, trade, city: lead?.city, firstName });
 
   const feedbackNote = feedback
     ? `\n\nA previous draft needs improvement: ${feedback} Rewrite addressing this while keeping the message natural.`
     : '';
 
-  return `You write cold emails for Chetan, founder of Dreams Technology (a software company in Gandhinagar, India), to an Indian business owner. Write like a busy founder typing a quick personal note — not like marketing.
+  return `You write emails from Dreams Technology (a website and software company in Gandhinagar, Gujarat) to the owner of an Indian business. The reader is a busy Indian business owner. They must understand in 10 seconds who is writing, why we are writing to THEM, and what we offer.
 
 ${stageNote}
 
-Hard rules:
-- Body under 60 words (follow-ups even shorter). Plain text, no links, no bullet points, no exclamation marks.
-- Simple everyday English a busy owner reads in 10 seconds. NO tech or marketing words: CRM, ERP, GA4, API, integrate/integration, solution(s), streamline, leverage, enhance, optimize, cohesive, seamless, digital transformation.
-- NEVER write: "I hope this message finds you well", "I hope you're doing well", "I wanted to reach out", "circle back", "just following up", "we specialize in", "free demo", "I noticed your website lacks/doesn't have".
-- Don't criticise their website or business; ask about it instead.
-- Never mention you are an AI. Never invent facts about their business beyond what's given below.
-- Subject: 2-5 words, lowercase, reads like a note from a colleague (e.g. "quote follow-ups at kirit pumps"). No title case, no hype.${portfolioText}${playbookText}${notesText}${researchText}${priorEmailsText}${subjectRules}${feedbackNote}
+Language and tone:
+- Simple Indian English, the way a polite Gujarati business person writes to another business: short sentences, everyday words, respectful ("ji" in the greeting is good). Not American sales style.
+- Plain text. No links, no bullet points, no exclamation marks, no emojis, no em dashes.
+- Never use: ${SALES_WORDS_BANNED.map(p => `"${p}"`).join(', ')}.
+- Polite, never pushy. Never criticise their business; state a finding neutrally ("I could not find…") and move to the offer.
+- Never mention you are an AI. Never invent facts, clients, numbers or results.
 
-Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between lines/paragraphs. Start the body with "Hi <first name>," if the owner's name is known, otherwise "Hi,". Do NOT add a sign-off, signature, P.S. or unsubscribe line — those are appended automatically.`;
+${GAP_TO_OFFER}${portfolioText}${playbookText}${notesText}${researchText}${priorEmailsText}${subjectRules}${feedbackNote}
+
+Respond with ONLY a JSON object: {"subject": "...", "body": "..."} where body is plain text with "\\n\\n" between paragraphs. Do NOT add a sign-off, signature, P.S. or unsubscribe line — those are added automatically.`;
 }
 
 // guidance (optional): extra writing rules appended to the system prompt (directory cadence passes
@@ -375,7 +391,7 @@ async function composeAndSendColdEmail({ leadId, lead, leadEmail, stepNumber, se
   // opt-out, backed by the List-Unsubscribe headers EmailSenderService.send() sets.
   const signature = await EmailSenderService.signatureFor(sender);
   const fullBody = `${composed.body}\n\n${signature}\n\n` +
-    `P.S. Not relevant? Just reply "stop" or "not interested" and I won't write again.`;
+    `If this is not useful for you, just reply "no" and we will not email you again.`;
 
   const { html, text } = renderEmailBody(fullBody, unsubscribeUrl, tracking, { visibleFooter: false });
   const sendResult = await EmailSenderService.send(sender, {
