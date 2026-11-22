@@ -54,7 +54,7 @@ router.get('/summary', wrap(async (req, res) => {
 // Mailbox (picked once), mode, caps.
 router.get('/config', wrap(async (req, res) => {
   const senders = (await pool.query(
-    `SELECT id, label, from_email, status, daily_cap, sent_today,
+    `SELECT id, label, from_email, provider, status, daily_cap, sent_today,
             (imap_config IS NOT NULL AND COALESCE(imap_config::jsonb->>'host', '') <> '') AS has_imap
      FROM email_senders ORDER BY id`)).rows;
   res.json({
@@ -113,6 +113,12 @@ router.put('/:id', wrap(async (req, res) => {
 
 router.post('/:id/send', wrap(async (req, res) => {
   const r = await hunter.sendOpportunity(Number(req.params.id), { trigger: 'manual' });
+  res.status(r.ok ? 200 : 400).json(r);
+}));
+
+// Resend a sent application from another mailbox. body: { sender_id }
+router.post('/:id/resend', wrap(async (req, res) => {
+  const r = await hunter.resendOpportunity(Number(req.params.id), Number(req.body?.sender_id));
   res.status(r.ok ? 200 : 400).json(r);
 }));
 

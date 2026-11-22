@@ -434,38 +434,84 @@ async function sendOpportunity(id, { trigger = 'manual' } = {}) {
         [name, opp.email, opp.phone || null, PIPELINE])).rows[0].id;
     }
 
-    const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(opp.email)}`;
-    const openTracking = String((await getSetting('EMAIL_OPEN_TRACKING')) ?? '').trim().toLowerCase() !== 'false';
-    const trackingToken = openTracking ? generateTrackingToken() : null;
-    const signed = `${opp.draft_body.trim()}\n\n${await EmailSenderService.signatureFor(sender)}`;
-    // Personal note: no visible unsubscribe footer, no click-rewritten links (List-Unsubscribe header stays).
-    const { html, text } = renderEmailBody(signed, unsubscribeUrl, trackingToken ? { pixelUrl: buildPixelUrl(trackingToken) } : {}, { visibleFooter: false });
-    const result = await EmailSenderService.send(sender, { to: opp.email, subject: opp.draft_subject, html, text, unsubscribeUrl });
-
-    if (!result.success) {
-      await pool.query(
-        `INSERT INTO email_logs (lead_id, sender_id, direction, subject, body, error, sent_at) VALUES ($1, $2, 'out', $3, $4, $5, NOW())`,
-        [leadId, sender.id, opp.draft_subject, html, result.error]);
+    const d = await deliverApplication(opp, sender, leadId);
+    if (!d.ok) {
       await pool.query(`UPDATE opportunities SET lead_id = $2, sender_id = $3 WHERE id = $1`, [id, leadId, sender.id]);
-      return fail(`Send failed: ${result.error}`);
+      return fail(`Send failed: ${d.error}`);
     }
-    await pool.query(
-      `INSERT INTO email_logs (lead_id, sender_id, direction, subject, body, provider_message_id, tracking_token, sent_at)
-       VALUES ($1, $2, 'out', $3, $4, $5, $6, NOW())`,
-      [leadId, sender.id, opp.draft_subject, html, result.messageId, trackingToken]);
     await pool.query(
       `UPDATE opportunities SET status = 'sent', lead_id = $2, sender_id = $3, sent_at = NOW(), error = NULL, updated_at = NOW() WHERE id = $1`,
       [id, leadId, sender.id]);
     await pool.query(`UPDATE hotel_leads SET status = 'contacted', updated_at = NOW() WHERE id = $1 AND status = 'new'`, [leadId]);
-    await sendOwnerCopy(sender, { to: opp.email, subject: opp.draft_subject, signed, unsubscribeUrl });
     await logAgentAction(leadId, 'opportunity_email_sent', {
-      detail: { opportunityId: id, subject: opp.draft_subject, to: opp.email, trigger, dryRun: !!result.dryRun },
+      detail: { opportunityId: id, subject: opp.draft_subject, to: opp.email, trigger, dryRun: d.dryRun },
       draftText: opp.draft_body, score: null, decision: 'send',
     });
-    return { ok: true, leadId, dryRun: !!result.dryRun };
+    return { ok: true, leadId, dryRun: d.dryRun };
   } catch (err) {
     console.error(`[OppHunter] send ${id} failed:`, err.message);
     return fail(err.message);
+  }
+}
+
+// Render, send, log to email_logs and send the owner's copy — shared by first send and resend.
+async function deliverApplication(opp, sender, leadId) {
+  const unsubscribeUrl = `${getBackendUrl()}/unsubscribe?token=${SuppressionService.generateToken(opp.email)}`;
+  const openTracking = String((await getSetting('EMAIL_OPEN_TRACKING')) ?? '').trim().toLowerCase() !== 'false';
+  const trackingToken = openTracking ? generateTrackingToken() : null;
+  const signed = `${opp.draft_body.trim()}\n\n${await EmailSenderService.signatureFor(sender)}`;
+  // Personal note: no visible unsubscribe footer, no click-rewritten links (List-Unsubscribe header stays).
+  const { html, text } = renderEmailBody(signed, unsubscribeUrl, trackingToken ? { pixelUrl: buildPixelUrl(trackingToken) } : {}, { visibleFooter: false });
+  const result = await EmailSenderService.send(sender, { to: opp.email, subject: opp.draft_subject, html, text, unsubscribeUrl });
+  if (!result.success) {
+    await pool.query(
+      `INSERT INTO email_logs (lead_id, sender_id, direction, subject, body, error, sent_at) VALUES ($1, $2, 'out', $3, $4, $5, NOW())`,
+      [leadId, sender.id, opp.draft_subject, html, result.error]);
+    return { ok: false, error: result.error };
+  }
+  await pool.query(
+    `INSERT INTO email_logs (lead_id, sender_id, direction, subject, body, provider_message_id, tracking_token, sent_at)
+     VALUES ($1, $2, 'out', $3, $4, $5, $6, NOW())`,
+    [leadId, sender.id, opp.draft_subject, html, result.messageId, trackingToken]);
+  await sendOwnerCopy(sender, { to: opp.email, subject: opp.draft_subject, signed, unsubscribeUrl });
+  return { ok: true, dryRun: !!result.dryRun };
+}
+
+// Send an already-sent application again from another mailbox (e.g. the first mailbox's server
+// accepted it but never delivered). Only 'sent' — a 'replied' one obviously arrived. The row stays
+// 'sent'; sender_id/sent_at move to the resend so the list shows the new mailbox and its tracking.
+async function resendOpportunity(id, senderId) {
+  const opp = await getById(id);
+  if (!opp) return { ok: false, error: 'Not found' };
+  if (opp.status !== 'sent') return { ok: false, error: opp.status === 'replied' ? 'They already replied — no need to resend' : 'Only sent applications can be resent' };
+  if (!opp.email || !opp.lead_id) return { ok: false, error: 'No email address on this opportunity' };
+  await EmailSenderService.resetStaleCounters();
+  const sender = await EmailSenderService.getById(senderId);
+  if (!sender) return { ok: false, error: 'Pick a mailbox to resend from' };
+  if (sender.status !== 'active') return { ok: false, error: `Mailbox "${sender.label}" is paused` };
+  if (!EmailSenderService.hasCapacity(sender)) return { ok: false, error: `Mailbox "${sender.label}" reached today's sending cap` };
+  if (await SuppressionService.isSuppressed(opp.email)) return { ok: false, error: 'This address unsubscribed / bounced since' };
+
+  // Claim so a double click can't send twice.
+  const claimed = await pool.query(`UPDATE opportunities SET status = 'sending', updated_at = NOW() WHERE id = $1 AND status = 'sent' RETURNING id`, [id]);
+  if (!claimed.rows[0]) return { ok: false, error: 'Already being resent' };
+  try {
+    const d = await deliverApplication(opp, sender, opp.lead_id);
+    if (!d.ok) {
+      await pool.query(`UPDATE opportunities SET status = 'sent', updated_at = NOW() WHERE id = $1`, [id]);
+      return { ok: false, error: `Resend failed: ${d.error}` };
+    }
+    await pool.query(
+      `UPDATE opportunities SET status = 'sent', sender_id = $2, sent_at = NOW(), error = NULL, updated_at = NOW() WHERE id = $1`, [id, sender.id]);
+    await logAgentAction(opp.lead_id, 'opportunity_email_resent', {
+      detail: { opportunityId: id, subject: opp.draft_subject, to: opp.email, fromSenderId: opp.sender_id, toSenderId: sender.id, dryRun: d.dryRun },
+      draftText: opp.draft_body, score: null, decision: 'send',
+    });
+    return { ok: true, dryRun: d.dryRun, sender: { id: sender.id, label: sender.label, from_email: sender.from_email } };
+  } catch (err) {
+    await pool.query(`UPDATE opportunities SET status = 'sent', updated_at = NOW() WHERE id = $1 AND status = 'sending'`, [id]);
+    console.error(`[OppHunter] resend ${id} failed:`, err.message);
+    return { ok: false, error: err.message };
   }
 }
 
@@ -531,7 +577,7 @@ async function handleReply(lead, { subject, text, sender }) {
 }
 
 module.exports = {
-  PIPELINE, ingestMessage, processPending, analyzeText, analyzeMessage, getById, sendOpportunity, autoSendTick,
+  PIPELINE, ingestMessage, processPending, analyzeText, analyzeMessage, getById, sendOpportunity, resendOpportunity, autoSendTick,
   handleReply, getChosenSender,
   // exported for tests
   _internal: { prefilter, hardSkipReason, extractContacts, normalizePhone, decide, hashText, MONEY_RE },

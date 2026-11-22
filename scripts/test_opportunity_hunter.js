@@ -144,6 +144,26 @@ We saw you need help with a Guideline 2.1 rejection. This is work we do regularl
     const log = (await pool.query(`SELECT * FROM email_logs WHERE lead_id = $1 AND direction = 'out'`, [lead.id])).rows;
     check(log.length === 1 && log[0].error === null, 'one email_logs row');
     check((await hunter.sendOpportunity(o.id)).ok === false, 'cannot send twice');
+    // Resend from another mailbox (first mailbox accepted but never delivered)
+    const sender2 = (await pool.query(
+      `INSERT INTO email_senders (label, provider, from_email, from_name, smtp_config, daily_cap, status)
+       VALUES ($1, 'smtp', 'priya@example.com', 'Priya', '{"host":"x","port":587}', 50, 'active') RETURNING *`, [`opp-test2-${tag}`])).rows[0];
+    const paused = (await pool.query(
+      `INSERT INTO email_senders (label, provider, from_email, from_name, api_key, daily_cap, status)
+       VALUES ($1, 'brevo', 'p@example.com', 'P', 'dry-run', 50, 'paused') RETURNING *`, [`opp-test3-${tag}`])).rows[0];
+    check((await hunter.resendOpportunity(o.id, paused.id)).ok === false, 'resend from a paused mailbox refused');
+    check((await hunter.resendOpportunity(o.id, 999999)).ok === false, 'resend from unknown mailbox refused');
+    const rs = await hunter.resendOpportunity(o.id, sender2.id);
+    check(rs.ok && rs.dryRun, 'resend ok (dry run)', JSON.stringify(rs));
+    const afterRs = await hunter.getById(o.id);
+    check(afterRs.status === 'sent' && afterRs.sender_id === sender2.id, 'after resend: still sent, now from the new mailbox');
+    const logs2 = (await pool.query(`SELECT sender_id FROM email_logs WHERE lead_id = $1 AND direction = 'out' ORDER BY id`, [lead.id])).rows;
+    check(logs2.length === 2 && logs2[1].sender_id === sender2.id, 'resend logged as a second email_logs row from the new mailbox');
+    const act = await pool.query(`SELECT 1 FROM agent_actions WHERE lead_id = $1 AND action = 'opportunity_email_resent'`, [lead.id]);
+    check(act.rows.length === 1, 'resend recorded in agent_actions');
+    await pool.query(`UPDATE opportunities SET sender_id = $2 WHERE id = $1`, [o.id, sender.id]);
+    await pool.query(`DELETE FROM email_logs WHERE lead_id = $1 AND sender_id = $2`, [lead.id, sender2.id]);
+    await pool.query(`DELETE FROM email_senders WHERE id = ANY($1)`, [[sender2.id, paused.id]]);
     const enroll = await require('../services/sequenceService').enrollLeads(
       (await pool.query(`SELECT id FROM sequences ORDER BY id LIMIT 1`)).rows[0]?.id || 0, [lead.id]);
     check(!enroll.enrolled, 'sequence enrollment skips opportunity leads', JSON.stringify(enroll));
@@ -152,6 +172,7 @@ We saw you need help with a Guideline 2.1 rejection. This is work we do regularl
     check(followupPick.rows.length === 0, 'WhatsApp follow-up / campaign filters (pipeline IS NULL) exclude it');
     await hunter.handleReply(lead, { subject: 'Re: App Store', text: 'Yes please share details', sender });
     check((await hunter.getById(o.id)).status === 'replied', 'reply → opportunity replied (owner handles)');
+    check((await hunter.resendOpportunity(o.id, sender.id)).ok === false, 'replied application cannot be resent');
     const aiReplies = await pool.query(`SELECT 1 FROM email_logs WHERE lead_id = $1 AND direction = 'out'`, [lead.id]);
     check(aiReplies.rows.length === 1, 'no automatic reply sent');
   }
