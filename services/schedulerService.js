@@ -3,6 +3,7 @@ const schedule = require('node-schedule');
 const OpenAI = require('openai');
 const pool = require('../config/db');
 const WABAService = require('./wabaService');
+const { whatsappOutreachOn } = require('../utils/whatsappOutreach');
 const LeadService = require('./leadService');
 const { findEmail } = require('./enrichmentService');
 const SequenceService = require('./sequenceService');
@@ -873,6 +874,7 @@ async function sendTask(taskId) {
   const task = taskResult.rows[0];
   if (!task) throw new Error('Task not found');
   if (task.status !== 'preview' && task.status !== 'scheduled_send') throw new Error('Task is not in preview state');
+  if (!(await whatsappOutreachOn())) throw new Error('WhatsApp outreach is switched off (Settings: WHATSAPP_OUTREACH_ENABLED). Nothing was sent.');
 
   // Compare-and-swap, same as runTask's Fix 1 above — without this, the every-minute cron
   // (picking up a due 'scheduled_send' task) and a manual /tasks/:id/send click could both
@@ -1024,6 +1026,10 @@ ${candidates.map(t => `id ${t.id}: ${t.body_text}`).join('\n\n')}` },
 // lead already got. Leads who replied, or a human has flagged, are excluded — those belong
 // to the AI agent / the Inbox, not this job.
 async function runFollowUps(trigger = 'cron') {
+  if (!(await whatsappOutreachOn())) {
+    console.log('[FollowUp] WhatsApp outreach is OFF (WHATSAPP_OUTREACH_ENABLED=false), no follow-ups sent');
+    return { skipped: 'whatsapp_outreach_off', sent: 0 };
+  }
   console.log(`[FollowUp] Checking leads for follow-up... (trigger=${trigger})`);
 
   // Claim a run-level lock first — without it, an overlapping cron tick (e.g. more than one
@@ -1164,7 +1170,8 @@ schedule.scheduleJob('* * * * *', async () => {
       if (result.rows.length > 0) {
         const task = result.rows[0];
         if (task.status === 'scheduled_send') {
-          await sendTask(task.id);
+          // Outreach off: leave the task scheduled (it sends once the switch is back on).
+          if (await whatsappOutreachOn()) await sendTask(task.id);
         } else if (task.channel === 'email') {
           await runEmailTask(task);
         } else {

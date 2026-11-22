@@ -78,6 +78,12 @@ class WABAService {
 
   // template can be a string (template_name) or the full template object from DB
   static async sendPersonalizedTemplate(hotelLead, template) {
+    // Backstop for WHATSAPP_OUTREACH_ENABLED=false: every cold template goes through here. Jobs check
+    // the switch first and skip quietly; this only catches a path that forgot to.
+    if (!(await require('../utils/whatsappOutreach').whatsappOutreachOn())) {
+      console.warn(`[WABA] WhatsApp outreach is OFF, template "${typeof template === 'string' ? template : template?.template_name}" to lead ${hotelLead?.id} not sent`);
+      return { success: false, outreachOff: true, error: 'WhatsApp outreach is switched off (Settings: WHATSAPP_OUTREACH_ENABLED)' };
+    }
     const templateName  = typeof template === 'string' ? template : template.template_name;
     const localImageUrl = typeof template === 'object' ? (template.header_image_url || null) : null;
     const localBodyText = typeof template === 'object' && template?.body_text ? template.body_text : '';

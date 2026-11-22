@@ -78,6 +78,9 @@ router.get('/', async (req, res) => {
 // Launch campaign
 router.post('/:id/launch', async (req, res) => {
   const campaignId = req.params.id;
+  if (!(await require('../utils/whatsappOutreach').whatsappOutreachOn())) {
+    return res.status(409).json({ error: 'WhatsApp outreach is switched off (Settings: WHATSAPP_OUTREACH_ENABLED). Nothing was sent.' });
+  }
 
   if (launchingCampaigns.has(campaignId)) {
     return res.status(409).json({ error: 'This campaign is already sending — please wait for it to finish before launching again.' });

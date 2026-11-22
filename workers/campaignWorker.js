@@ -6,6 +6,7 @@ const { track } = require('../utils/jobTracker');
 
 // Run campaign sends every 5 minutes
 async function runCampaignTick() {
+  if (!(await require('../utils/whatsappOutreach').whatsappOutreachOn())) return { skipped: 'whatsapp_outreach_off' };
   console.log('[WORKER] Checking for scheduled campaigns...');
   const stats = { campaign: null, sent: 0, failed: 0 };
 

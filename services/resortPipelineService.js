@@ -278,6 +278,7 @@ let running = false;
 async function runPipeline(trigger = 'cron') {
   const cfg = await loadConfig();
   if (!cfg.enabled) return { skipped: 'disabled' };
+  if (!(await require('../utils/whatsappOutreach').whatsappOutreachOn())) return { skipped: 'whatsapp_outreach_off' };
   if (trigger !== 'manual') {
     const win = await isWithinSendWindow();
     if (!win.allowed) return { skipped: 'outside_send_window' };
@@ -438,6 +439,7 @@ async function cancelQueue() {
 let queueBusy = false;
 async function runQueueTick() {
   if (queueBusy) return { skipped: 'busy' };
+  if (!(await require('../utils/whatsappOutreach').whatsappOutreachOn())) return { skipped: 'whatsapp_outreach_off' };
   queueBusy = true;
   try {
     const next = (await pool.query(

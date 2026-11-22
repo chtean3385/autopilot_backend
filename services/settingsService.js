@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 
 const SETTINGS_DEFS = [
+  { key: 'WHATSAPP_OUTREACH_ENABLED', category: 'WhatsApp (WABA)', description: 'false = stop ALL WhatsApp we start ourselves (directory templates, 12 pm follow-ups, campaigns, agent-task sends, Dream Stay pipeline). AI/staff replies to people who message you first and owner alerts keep working. Default true' },
   { key: 'WABA_PHONE_ID',            category: 'WhatsApp (WABA)', description: 'WhatsApp Business Phone Number ID' },
   { key: 'WABA_BUSINESS_ACCOUNT_ID', category: 'WhatsApp (WABA)', description: 'WhatsApp Business Account ID (WABA ID)' },
   { key: 'WABA_API_TOKEN',           category: 'WhatsApp (WABA)', description: 'Meta System User Access Token', sensitive: true },
@@ -21,6 +22,11 @@ const SETTINGS_DEFS = [
   { key: 'EMAIL_SIGNATURE',         category: 'Email',           description: 'Fallback email sign-off, used only for a sender with no own Signature (Settings → Email Senders); use \\n for line breaks. Empty = "<sender From name>\\nDreams Technology, Gandhinagar · +91 84607 65785\\nhttps://dreamstechnology.in/"' },
   { key: 'OWN_EMAIL_DOMAINS',        category: 'Email',           description: 'Comma-separated domains that are ours — leads on these are never cold-emailed (default dreamstechnology.in,dreams-technology.com)' },
   { key: 'EMAIL_ROTATION_BATCH',     category: 'Email',           description: 'New leads sent from one sender before rotating to the next active sender (default 10). Follow-ups always stay on the mailbox that sent the first email, and wait if it is full' },
+  { key: 'FRESH_RESEND_ENABLED',     category: 'Email',           description: "true = re-send each lead's ORIGINAL first email (same text, no AI, same mailbox) if it only ever got the SMTP emails that never arrived (Oct 7 to Nov 22, 2026). New first emails wait until these are done" },
+  { key: 'EMAIL_FRESH_START_AT',     category: 'Email',           description: 'Email history before this time (ISO, UTC) is ignored by the AI writer, threading and email analytics. Set 2026-11-22 when the SMTP delivery bug was fixed' },
+  { key: 'EMAIL_SENDER_MIN_GAP_MINUTES', category: 'Email',       description: 'Minimum minutes between two cold emails from the same mailbox (spreads the daily cap across the day). 0 = off' },
+  { key: 'COLD_EMAIL_EXCLUDE_SENDER_IDS', category: 'Email',      description: 'Mailbox ids (comma separated) never used for cold email rotation, e.g. 1 = Brevo' },
+  { key: 'EMAIL_ALLOW_NO_WEBSITE',   category: 'Email',           description: 'true = leads with no website (Gmail/Yahoo address) may get a cold email written from their directory info (name, trade, city). false = no website, no email' },
   { key: 'EMAIL_OPEN_TRACKING',      category: 'Email',           description: 'Hidden open-tracking image in cold/sequence emails, so SMTP senders show open rates (default true). Set false if replies or inbox placement drop — opens are approximate (Apple Mail / scanners auto-open)' },
   { key: 'SEND_WINDOW_START_HOUR',   category: 'Email',           description: 'Cold/follow-up sequence sends start hour, 24h IST (default 9). All leads are India-based, so IST is the one recipient timezone in this system.' },
   { key: 'SEND_WINDOW_END_HOUR',     category: 'Email',           description: 'Cold/follow-up sequence sends end hour, 24h IST (default 18)' },

@@ -12,4 +12,11 @@ async function getFreshStartAt() {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-module.exports = { getFreshStartAt };
+// EMAIL_ALLOW_NO_WEBSITE=true (owner 2026-11-22): a lead with nothing to research (no website and a
+// free-mail address) may still get a cold email, written from its directory/CRM info (name, trade,
+// city) by the composer's no-research branch. A lead whose website research FAILED is still not emailed.
+async function allowNoWebsiteEmail() {
+  return String((await getSetting('EMAIL_ALLOW_NO_WEBSITE')) || '').trim().toLowerCase() === 'true';
+}
+
+module.exports = { getFreshStartAt, allowNoWebsiteEmail };

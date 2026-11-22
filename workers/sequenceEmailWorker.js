@@ -17,7 +17,7 @@ const { checkSpamContent } = require('../utils/spamCheck');
 const { generateTrackingToken, buildClickUrl, buildPixelUrl } = require('../utils/emailTracking');
 const { getThreadHeaders } = require('../utils/emailThreading');
 const { isWithinSendWindow } = require('../utils/sendWindow');
-const { getFreshStartAt } = require('../utils/freshStart');
+const { getFreshStartAt, allowNoWebsiteEmail } = require('../utils/freshStart');
 const FreshResend = require('../services/freshResendService');
 const { getSetting } = require('../services/settingsService');
 
@@ -478,13 +478,14 @@ async function processRow(row, sequenceCapTracker, { manual = false } = {}) {
   // send random email") the same holds for a lead with nothing to research — no website and a
   // free-mail address; with no website but a company-domain email, that domain is researched.
   const site = researchSiteFor({ website: row.website, email: row.lead_email });
-  if (!site) {
+  const noSiteAllowed = !site && await allowNoWebsiteEmail();
+  if (!site && !noSiteAllowed) {
     console.log(`[SequenceEmail] Lead ${leadId} has no website or company domain to research — not sending a generic email, stopping sequence`);
     await killSequence(leadSequenceId, leadId, 'no_research_possible');
     return 'stopped';
   }
-  const research = await getCachedResearch(leadId);
-  if (!research) {
+  const research = site ? await getCachedResearch(leadId) : null;
+  if (!research && !noSiteAllowed) {
     if ((row.research_attempts || 0) < RESEARCH_MAX_ATTEMPTS) {
       console.log(`[SequenceEmail] Lead ${leadId} has a website but research isn't ready yet — waiting for researchWorker`);
       return 'awaiting_research';

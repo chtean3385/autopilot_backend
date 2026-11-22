@@ -8,7 +8,8 @@ const { getCachedResearch, researchSiteFor, RESEARCH_MAX_ATTEMPTS } = require('.
 const { isWithinSendWindow } = require('../utils/sendWindow');
 const { stopCadence } = require('./cadenceReplyService');
 const { WRITING_RULES } = require('../utils/humanTone');
-const { getFreshStartAt } = require('../utils/freshStart');
+const { getFreshStartAt, allowNoWebsiteEmail } = require('../utils/freshStart');
+const { whatsappOutreachOn } = require('../utils/whatsappOutreach');
 
 // Directory outreach step 3 (_docs/directory-outreach-plan.md): the cross-channel cadence. The ONLY
 // thing that sends cold messages to cadence_managed (directory) leads — campaigns, WhatsApp
@@ -115,14 +116,17 @@ async function getOwnDomains() {
   return raw.split(',').map((d) => d.trim().toLowerCase()).filter(Boolean);
 }
 
-async function emailUsable(lead) {
+// strict = research-backed email only (ignores EMAIL_ALLOW_NO_WEBSITE). The "email only, never WhatsApp"
+// rule (CADENCE_EMAIL_ONLY_IF_VERIFIED) uses strict, so allowing no-website email never switches a lead
+// off WhatsApp; it only adds email as an option (owner 2026-11-22: WhatsApp carries on as it is).
+async function emailUsable(lead, { strict = false } = {}) {
   if (!lead.email || lead.email_status !== 'verified') return false; // unverified = never sent
   const domain = String(lead.email).split('@')[1]?.toLowerCase();
   if (domain && (await getOwnDomains()).includes(domain)) return false;
   // Owner's rule: no cold email without research on the lead. No site to research (no website, free-mail
   // address) or research permanently failed → email is not an option; WhatsApp only. Research still
   // pending → usable, the touch waits for it (sendEmailTouch).
-  if (!researchSiteFor(lead)) return false;
+  if (!researchSiteFor(lead)) return !strict && allowNoWebsiteEmail(); // nothing to research: only if the owner allows it
   if (!(await getCachedResearch(lead.id)) && (lead.research_attempts || 0) >= RESEARCH_MAX_ATTEMPTS) return false;
   return true;
 }
@@ -220,13 +224,17 @@ async function enrollNewLeads(cfg) {
     // contacted by email ONLY; no email / not verified (yet) → WhatsApp. If mails.so verifies it later,
     // processRow switches the next touch to email. Off → both channels, balanced by remaining quota.
     let channel;
+    const waOn = await whatsappOutreachOn();
     const emailOk = await emailUsable(lead);
     if (cfg.emailOnlyIfVerified) {
-      if (emailOk && remaining.email <= 0) continue; // today's email intake is full — never falls back to WhatsApp
-      channel = emailOk ? 'email' : (waUsable(lead) && remaining.whatsapp > 0 ? 'whatsapp' : null);
+      const strictOk = emailOk && await emailUsable(lead, { strict: true });
+      if (strictOk && remaining.email <= 0) continue; // today's email intake is full — never falls back to WhatsApp
+      // research-backed email → email only; otherwise WhatsApp first; no WhatsApp → a no-website email if allowed
+      channel = strictOk ? 'email'
+        : (waOn && waUsable(lead) && remaining.whatsapp > 0 ? 'whatsapp' : (emailOk && remaining.email > 0 ? 'email' : null));
     } else {
       const e = emailOk && remaining.email > 0;
-      const w = waUsable(lead) && remaining.whatsapp > 0;
+      const w = waOn && waUsable(lead) && remaining.whatsapp > 0;
       channel = e && w ? (remaining.email >= remaining.whatsapp ? 'email' : 'whatsapp') : (e ? 'email' : (w ? 'whatsapp' : null));
     }
     if (!channel) {
@@ -269,8 +277,10 @@ async function priorMessagesForComposer(leadId) {
 async function sendEmailTouch(lead, row, isFinalTouch) {
   // Never a generic email: wait for researchWorker (website, or the email's company domain). emailUsable()
   // already rules out leads that can't be researched; this guards a lead whose research is still running.
-  const research = await getCachedResearch(lead.id);
-  if (!research) return { wait: 'awaiting_research', hours: 2 };
+  const hasSite = Boolean(researchSiteFor(lead));
+  const research = hasSite ? await getCachedResearch(lead.id) : null;
+  if (!research && hasSite) return { wait: 'awaiting_research', hours: 2 };
+  if (!research && !(await allowNoWebsiteEmail())) return { wait: 'awaiting_research', hours: 24 };
   // Same mailbox as this lead's first email; waits if that mailbox is paused or full today.
   const sender = await EmailSenderService.getSenderForLead(lead.id);
   if (!sender) return { wait: 'no_sender_capacity', hours: 3 };
@@ -391,7 +401,9 @@ async function processRow(row, cfg, budget) {
   // and reused for the send (the picker may make a GPT call when several fit).
   // CADENCE_EMAIL_ONLY_IF_VERIFIED: usable email → email only, never WhatsApp (same rule as intake).
   const usable = { email: await emailUsable(lead) };
-  usable.whatsapp = !(cfg.emailOnlyIfVerified && usable.email) && waUsable(lead, row);
+  const strictEmail = usable.email && await emailUsable(lead, { strict: true });
+  const waOn = await whatsappOutreachOn(); // WHATSAPP_OUTREACH_ENABLED=false: never WhatsApp; email if usable
+  usable.whatsapp = waOn && !(cfg.emailOnlyIfVerified && strictEmail) && waUsable(lead, row);
   const template = usable.whatsapp ? await pickTemplate(lead, await usedTemplateIds(lead.id)) : null;
   if (!template) usable.whatsapp = false;
 
@@ -400,6 +412,7 @@ async function processRow(row, cfg, budget) {
   if (!usable[channel]) {
     if (!usable[other(channel)]) {
       if (lead.email && ['unknown', 'found'].includes(lead.email_status)) return deferTouch(lead.id, 24, 'awaiting_verification');
+      if (!waOn && waUsable(lead, row)) return deferTouch(lead.id, 24, 'whatsapp_outreach_off'); // waits quietly (owner 2026-11-22)
       if (waUsable(lead, row)) return deferTouch(lead.id, 24, 'no_approved_template'); // templates may get approved
       await stopCadence(lead.id, 'stopped', 'no_usable_channel');
       if (lead.phone || lead.whatsapp_number) {
