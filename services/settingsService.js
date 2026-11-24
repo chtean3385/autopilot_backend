@@ -2,7 +2,8 @@ const pool = require('../config/db');
 
 const SETTINGS_DEFS = [
   { key: 'WHATSAPP_OUTREACH_ENABLED', category: 'WhatsApp (WABA)', description: 'false = stop ALL WhatsApp we start ourselves (directory templates, 12 pm follow-ups, campaigns, agent-task sends, Dream Stay pipeline). AI/staff replies to people who message you first and owner alerts keep working. Default true' },
-  { key: 'WABA_PHONE_ID',            category: 'WhatsApp (WABA)', description: 'WhatsApp Business Phone Number ID' },
+  { key: 'WA_COLD_TEMPLATES_PER_LEAD', category: 'WhatsApp (WABA)', description: 'Paid WhatsApp templates we send a lead who never replies (12 pm follow-ups + directory cadence). 1 = first message only, no follow-ups; if they reply the AI carries on for free. Each template costs ~Rs 0.86 + GST. Default 1' },
+  { key: 'WABA_PHONE_ID',           category: 'WhatsApp (WABA)', description: 'WhatsApp Business Phone Number ID' },
   { key: 'WABA_BUSINESS_ACCOUNT_ID', category: 'WhatsApp (WABA)', description: 'WhatsApp Business Account ID (WABA ID)' },
   { key: 'WABA_API_TOKEN',           category: 'WhatsApp (WABA)', description: 'Meta System User Access Token', sensitive: true },
   { key: 'WABA_API_VERSION',         category: 'WhatsApp (WABA)', description: 'Meta Graph API version (e.g. v18.0)' },

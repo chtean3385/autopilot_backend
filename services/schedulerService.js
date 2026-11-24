@@ -3,7 +3,7 @@ const schedule = require('node-schedule');
 const OpenAI = require('openai');
 const pool = require('../config/db');
 const WABAService = require('./wabaService');
-const { whatsappOutreachOn } = require('../utils/whatsappOutreach');
+const { whatsappOutreachOn, coldTemplatesPerLead } = require('../utils/whatsappOutreach');
 const LeadService = require('./leadService');
 const { findEmail } = require('./enrichmentService');
 const SequenceService = require('./sequenceService');
@@ -1053,7 +1053,7 @@ async function runFollowUps(trigger = 'cron') {
     // Cold-template follow-ups go ONLY to leads who have never replied. The moment a lead
     // replies, webhook.js moves them to status 'responded' and the AI agent owns the
     // conversation from then on (Meta forbids free-form follow-ups outside a 24h window, so
-    // these stay templates — kept short: 1 initial + 2 follow-ups). A lead a human has flagged
+    // these stay templates — capped by WA_COLD_TEMPLATES_PER_LEAD, default 1 = no follow-ups). A lead a human has flagged
     // (needs_attention) is off-limits too. NOT EXISTS(...response_received) is the real gate;
     // the status filter is belt-and-suspenders.
     const result = await pool.query(`
@@ -1083,20 +1083,23 @@ async function runFollowUps(trigger = 'cron') {
     `);
 
     stats.due = result.rows.length;
-    console.log(`[FollowUp] ${stats.due} lead(s) due for follow-up or expiry`);
+    // WA_COLD_TEMPLATES_PER_LEAD (default 1, owner 2026-11-24): every template is a paid Meta marketing
+    // message, so by default a non-replier gets the first message only — this job just closes them out.
+    const maxTemplates = await coldTemplatesPerLead();
+    console.log(`[FollowUp] ${stats.due} lead(s) due for follow-up or expiry (max ${maxTemplates} template(s) per lead)`);
 
     for (const lead of result.rows) {
      try {
       const outreachCount = lead.template_count;
 
-      // 1 initial + 2 follow-ups = 3 template touches max, then stop chasing.
-      if (outreachCount >= 3) {
+      // Template cap reached and never replied → stop chasing.
+      if (outreachCount >= maxTemplates) {
         await pool.query(
           `UPDATE hotel_leads SET status='no_response', updated_at=NOW() WHERE id=$1`,
           [lead.id]
         );
         stats.expired++;
-        console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" → no_response (${outreachCount} template sends, never replied)`);
+        if (stats.expired <= 5) console.log(`[FollowUp] Lead ${lead.id} "${lead.hotel_name}" → no_response (${outreachCount} template sends, never replied)`);
         continue;
       }
 

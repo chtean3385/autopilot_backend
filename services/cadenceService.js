@@ -9,7 +9,7 @@ const { isWithinSendWindow } = require('../utils/sendWindow');
 const { stopCadence } = require('./cadenceReplyService');
 const { WRITING_RULES } = require('../utils/humanTone');
 const { getFreshStartAt, allowNoWebsiteEmail } = require('../utils/freshStart');
-const { whatsappOutreachOn } = require('../utils/whatsappOutreach');
+const { whatsappOutreachOn, coldTemplatesPerLead, coldTemplatesSent } = require('../utils/whatsappOutreach');
 
 // Directory outreach step 3 (_docs/directory-outreach-plan.md): the cross-channel cadence. The ONLY
 // thing that sends cold messages to cadence_managed (directory) leads — campaigns, WhatsApp
@@ -424,6 +424,9 @@ async function processRowLocked(row, cfg, budget) {
   const strictEmail = usable.email && await emailUsable(lead, { strict: true });
   const waOn = await whatsappOutreachOn(); // WHATSAPP_OUTREACH_ENABLED=false: never WhatsApp; email if usable
   usable.whatsapp = waOn && !(cfg.emailOnlyIfVerified && strictEmail) && waUsable(lead, row);
+  // WA_COLD_TEMPLATES_PER_LEAD (default 1, owner 2026-11-24): paid templates per lead, all cycles together.
+  const waCapReached = (await coldTemplatesSent(lead.id)) >= (await coldTemplatesPerLead());
+  if (waCapReached) usable.whatsapp = false;
   const template = usable.whatsapp ? await pickTemplate(lead, await usedTemplateIds(lead.id)) : null;
   if (!template) usable.whatsapp = false;
 
@@ -432,6 +435,10 @@ async function processRowLocked(row, cfg, budget) {
   if (!usable[channel]) {
     if (!usable[other(channel)]) {
       if (lead.email && ['unknown', 'found'].includes(lead.email_status)) return deferTouch(lead.id, 24, 'awaiting_verification');
+      if (waCapReached) { // had its one WhatsApp, no email to try → done, nothing more to send
+        await stopCadence(lead.id, 'dead', 'wa_template_cap_reached');
+        return 'stopped';
+      }
       if (!waOn && waUsable(lead, row)) return deferTouch(lead.id, 24, 'whatsapp_outreach_off'); // waits quietly (owner 2026-11-22)
       if (waUsable(lead, row)) return deferTouch(lead.id, 24, 'no_approved_template'); // templates may get approved
       await stopCadence(lead.id, 'stopped', 'no_usable_channel');
