@@ -4,6 +4,7 @@ const { isDryRun, dryRunResult } = require('../utils/dryRun');
 const channelHealth = require('../utils/channelHealth');
 const { isWhatsappPaused, PAUSED_RESULT } = require('../utils/waPause');
 const pool = require('../config/db');
+const { normalizeButtons } = require('../utils/templateButtons');
 
 // Meta error codes that mean the whole WhatsApp account can't send (token, permissions, rate/spam
 // limits, policy block, payment, account locked) — vs. one recipient (not on WhatsApp, outside the
@@ -207,10 +208,11 @@ class WABAService {
         components.push({ type: 'FOOTER', text: templateData.footer_text });
       }
 
-      // Optional quick-reply buttons (labels only, max 25 chars each) — e.g. the Dream Stay utility follow-up.
-      if (Array.isArray(templateData.buttons) && templateData.buttons.length) {
-        components.push({ type: 'BUTTONS', buttons: templateData.buttons.map((text) => ({ type: 'QUICK_REPLY', text })) });
-      }
+      // Optional buttons: quick reply / website link / call (utils/templateButtons.js). Plain strings
+      // (the Dream Stay utility follow-up) are quick replies.
+      const { buttons, error: buttonError } = normalizeButtons(templateData.buttons);
+      if (buttonError) return { success: false, error: buttonError };
+      if (buttons.length) components.push({ type: 'BUTTONS', buttons });
 
       const payload = {
         name: templateData.template_name,

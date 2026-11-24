@@ -619,6 +619,8 @@ async function initDB() {
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS quality_score NUMERIC(2,1);
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS quality_note TEXT;
     ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP;
+    -- Template buttons (migrate_template_buttons.sql): quick reply / website link / call button.
+    ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS buttons JSON;
     -- Directory outreach (migrate_directory_promotion.sql) — lead niche for niche-specific templates.
     -- The niche of the directory a lead came from — picks that niche's WhatsApp templates.
     ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS niche VARCHAR(100);

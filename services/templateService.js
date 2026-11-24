@@ -1,14 +1,17 @@
 const pool = require('../config/db');
+const { normalizeButtons } = require('../utils/templateButtons');
 
 class TemplateService {
   // Create/register template
   static async createTemplate(templateData) {
     const query = `
       INSERT INTO waba_templates
-      (template_name, template_category, body_text, parameters, examples, footer_text, header_image_url, parameter_mapping, status, created_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'draft', $9)
+      (template_name, template_category, body_text, parameters, examples, footer_text, header_image_url, parameter_mapping, buttons, status, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $10, 'draft', $9)
       RETURNING *;
     `;
+    const { buttons, error: buttonError } = normalizeButtons(templateData.buttons);
+    if (buttonError) return { success: false, error: buttonError };
     try {
       const result = await pool.query(query, [
         templateData.template_name,
@@ -19,7 +22,8 @@ class TemplateService {
         templateData.footer_text || null,
         templateData.header_image_url || null,
         JSON.stringify(templateData.parameter_mapping || {}),
-        'admin'
+        'admin',
+        buttons.length ? JSON.stringify(buttons) : null
       ]);
       return { success: true, data: result.rows[0] };
     } catch (error) {

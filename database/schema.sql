@@ -604,6 +604,8 @@ ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS quality_note TEXT;
 -- The niche of the directory a lead came from — picks that niche's WhatsApp templates.
 ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS niche VARCHAR(100);
 ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP;
+-- Template buttons (migrate_template_buttons.sql): [{type: QUICK_REPLY|URL|PHONE_NUMBER, text, url?, phone_number?}]
+ALTER TABLE waba_templates ADD COLUMN IF NOT EXISTS buttons JSON;
 -- Lead completeness score + website email backfill (migrate_lead_scoring.sql)
 ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS lead_score INT NOT NULL DEFAULT 0;
 ALTER TABLE hotel_leads ADD COLUMN IF NOT EXISTS lead_tier VARCHAR(10) NOT NULL DEFAULT 'cold';

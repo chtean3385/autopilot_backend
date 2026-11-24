@@ -5,6 +5,7 @@ const fs = require('fs');
 const TemplateService = require('../services/templateService');
 const WABAService = require('../services/wabaService');
 const pool = require('../config/db');
+const { normalizeButtons } = require('../utils/templateButtons');
 const router = express.Router();
 
 // Template header images. Stored outside git under backend/uploads/ — the deploy does
@@ -262,10 +263,12 @@ router.put('/:id/status', async (req, res) => {
   res.json(result);
 });
 
-// Update local fields only (header_image_url, parameter_mapping) — does NOT re-submit to Meta
+// Update local fields only (header_image_url, parameter_mapping; buttons while draft/rejected) — does NOT re-submit to Meta
 router.put('/:id/local', async (req, res) => {
   try {
     const { header_image_url, parameter_mapping } = req.body;
+    const btn = req.body.buttons !== undefined ? normalizeButtons(req.body.buttons) : null;
+    if (btn?.error) return res.status(400).json({ error: btn.error });
     const result = await pool.query(
       `UPDATE waba_templates
        SET header_image_url = $1,
@@ -276,7 +279,19 @@ router.put('/:id/local', async (req, res) => {
       [header_image_url || null, JSON.stringify(parameter_mapping || {}), req.params.id]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Template not found' });
-    res.json({ success: true, data: result.rows[0] });
+
+    // Buttons can change only while the template is not on Meta yet (draft / rejected) — an approved
+    // template's buttons live on Meta, and a local copy that differs would just be misleading.
+    let row = result.rows[0];
+    if (btn && ['draft', 'rejected'].includes(row.status)) {
+      const { buttons } = btn;
+      const upd = await pool.query(
+        `UPDATE waba_templates SET buttons = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+        [buttons.length ? JSON.stringify(buttons) : null, req.params.id]
+      );
+      row = upd.rows[0];
+    }
+    res.json({ success: true, data: row });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
