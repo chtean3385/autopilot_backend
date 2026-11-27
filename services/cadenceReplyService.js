@@ -143,7 +143,8 @@ async function handleCadenceReply({ lead, channel, text, subject = null, message
 
   if (gate === 'NOT_INTERESTED') {
     await stopCadence(fresh.id, 'stopped', 'not_interested');
-    await pool.query(`UPDATE hotel_leads SET status = 'not_interested', updated_at = NOW() WHERE id = $1`, [fresh.id]);
+    // Not interested → archived in Email Conversations too (un-archived if they ever write again).
+    await pool.query(`UPDATE hotel_leads SET status = 'not_interested', email_archived_at = NOW(), updated_at = NOW() WHERE id = $1`, [fresh.id]);
     await logAgentAction(fresh.id, 'cadence_not_interested', { detail: { channel, message: preview }, decision: 'not_interested' });
     await notifyOwnerBothChannels(fresh, 'Lead not interested', `replied on ${channel}: "${preview}". Outreach stopped for good.`);
     return 'not_interested';

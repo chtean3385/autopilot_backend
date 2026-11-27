@@ -94,7 +94,8 @@ async function classifyIntent({ lead, incomingMessage, conversationHistory }) {
 }
 
 async function handleNotInterested(lead, leadSeq) {
-  await pool.query(`UPDATE hotel_leads SET status = 'not_interested', updated_at = NOW() WHERE id = $1`, [lead.id]);
+  // Not interested → off the queue (below) and out of the Email inbox (archived).
+  await pool.query(`UPDATE hotel_leads SET status = 'not_interested', email_archived_at = NOW(), updated_at = NOW() WHERE id = $1`, [lead.id]);
   if (leadSeq) {
     await pool.query(
       `UPDATE lead_sequences SET status = 'dead', paused_reason = 'not_interested', updated_at = NOW() WHERE id = $1`,
@@ -175,6 +176,8 @@ async function handleIncomingMessage(sender, { fromAddress, subject, text, messa
      VALUES ($1, $2, $3, 'in', $4, $5, $6, $7)`,
     [lead.id, sender.id, leadSeq?.sequence_id || null, subject, text, messageId, date || new Date()]
   );
+  // A new message brings an archived thread back to the main list (a "no" reply re-archives it below).
+  await pool.query('UPDATE hotel_leads SET email_archived_at = NULL WHERE id = $1 AND email_archived_at IS NOT NULL', [lead.id]);
 
   // Opportunity Hunter leads (one application email each): the owner handles every reply personally —
   // mark the opportunity replied, alert the owner, never let the AI answer.

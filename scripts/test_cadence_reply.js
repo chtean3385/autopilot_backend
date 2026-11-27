@@ -58,7 +58,11 @@ const cases = [
     draftQueue = draft ? [draft] : [];
     const outcome = await handleCadenceReply({ lead, channel, text: 'test message', subject: 'quick question', messageId: `<t${i}@x>` });
     const s = await state(lead.id);
-    const ok = s.cadence.startsWith(expect.cadence) && s.approvals.length === expect.approvals && s.sentToLead === expect.sent;
+    // "No"/not interested → archived in Email Conversations; every other outcome stays in the inbox.
+    const archived = !!(await pool.query('SELECT email_archived_at FROM hotel_leads WHERE id=$1', [lead.id])).rows[0].email_archived_at;
+    s.archived = archived;
+    const ok = s.cadence.startsWith(expect.cadence) && s.approvals.length === expect.approvals && s.sentToLead === expect.sent
+      && archived === (gate.gate === 'NOT_INTERESTED');
     if (!ok) failures++;
     console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(36)} → ${outcome.padEnd(14)} ${JSON.stringify(s)}`);
   }

@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS hotel_leads (
     archived_at TIMESTAMP, -- inbox conversation archived (hidden from main list); NULL = not archived
     inbox_last_read_at TIMESTAMP, -- WhatsApp Inbox: stamped when the admin opens the thread, drives the unread badge
     email_last_read_at TIMESTAMP, -- Email Conversations: stamped when the admin opens the thread, drives the unread badge
+    email_archived_at TIMESTAMP, -- Email Conversations archive: set on a "no"/not-interested reply or by hand; cleared when the lead writes again
     needs_attention BOOLEAN DEFAULT FALSE, -- flagged for a human's eyes; surfaced in the Inbox "Needs Attention" filter (does NOT by itself silence the AI)
     needs_attention_reason TEXT, -- why (e.g. "Asked for a callback", "Pricing question", "Qualified for demo")
     ai_paused BOOLEAN DEFAULT FALSE, -- a human explicitly took over (Inbox "Take over"); the AI stays silent until "Return to AI"

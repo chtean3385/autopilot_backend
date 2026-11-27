@@ -39,12 +39,13 @@ router.get('/count', async (req, res) => {
     const result = await pool.query(`
       SELECT COUNT(*) AS count FROM (
         SELECT DISTINCT ON (el.lead_id) el.lead_id, el.direction,
-               COALESCE(el.sent_at, el.created_at) AS last_at, hl.email_last_read_at
+               COALESCE(el.sent_at, el.created_at) AS last_at, hl.email_last_read_at, hl.email_archived_at
         FROM email_logs el
         JOIN hotel_leads hl ON hl.id = el.lead_id
         ORDER BY el.lead_id, COALESCE(el.sent_at, el.created_at) DESC
       ) latest
       WHERE direction = 'in'
+        AND email_archived_at IS NULL
         AND last_at > COALESCE(email_last_read_at, '-infinity'::timestamp)
     `);
     res.json({ count: parseInt(result.rows[0].count, 10) });
@@ -61,7 +62,7 @@ router.get('/', async (req, res) => {
         SELECT DISTINCT ON (el.lead_id)
           el.lead_id, el.direction, el.subject, el.body,
           COALESCE(el.sent_at, el.created_at) AS last_at,
-          hl.hotel_name, hl.email, hl.city, hl.email_status
+          hl.hotel_name, hl.email, hl.city, hl.email_status, hl.email_archived_at, hl.status AS lead_status
         FROM email_logs el
         JOIN hotel_leads hl ON hl.id = el.lead_id
         ORDER BY el.lead_id, COALESCE(el.sent_at, el.created_at) DESC
@@ -147,6 +148,22 @@ router.get('/thread/:leadId', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/email-conversations/:leadId/archive { archived: true|false } — UI organization only:
+// moves the thread to/from the Archived box. Never changes lead status or what gets sent.
+router.post('/:leadId/archive', async (req, res) => {
+  try {
+    const archived = req.body?.archived !== false;
+    const result = await pool.query(
+      `UPDATE hotel_leads SET email_archived_at = ${archived ? 'NOW()' : 'NULL'} WHERE id = $1 RETURNING id, email_archived_at`,
+      [req.params.leadId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ success: false, error: 'Lead not found' });
+    res.json({ success: true, email_archived_at: result.rows[0].email_archived_at });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
